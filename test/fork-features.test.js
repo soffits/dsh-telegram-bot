@@ -10,7 +10,7 @@ import { STATUS_DIR } from '../src/constants.js'
 import { followupThroughGate, makeAgentModel, makeTitleService } from './fake-dsh.js'
 import { senderLabel } from '../src/message-context.js'
 import { enqueue, waitForResult } from '../src/outbox.js'
-import { isAutoCommandTopic, isPlaceholderTitle, isTopicGone, resolveThreadTarget, topicNameOf, topicTask, topicTitle } from '../src/topics.js'
+import { isAutoCommandTopic, isPlaceholderTitle, isTopicGone, resolveSendTarget, topicNameOf, topicTask, topicTitle } from '../src/topics.js'
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -747,12 +747,12 @@ test('a message falls back to the bot queue when this DSH cannot steer', async (
 })
 
 test('send targets are thread ids the bot knows; names are not addresses', () => {
-  const known = new Set([7001, 7002])
-  assert.equal(resolveThreadTarget(known, '7002'), 7002)
-  assert.equal(resolveThreadTarget(known, 7001), 7001)
-  assert.throws(() => resolveThreadTarget(known, 'Notify'), /"Notify" is not a Telegram thread id/)
-  assert.throws(() => resolveThreadTarget(known, 4242), /Unknown thread id 4242/)
-  assert.throws(() => resolveThreadTarget(known, ' '), /thread id is required/)
+  const known = ['100:7001', '100:7002']
+  assert.deepEqual(resolveSendTarget(known, undefined, '7002'), { chatId: 100, threadId: 7002 })
+  assert.deepEqual(resolveSendTarget(known, undefined, 7001), { chatId: 100, threadId: 7001 })
+  assert.throws(() => resolveSendTarget(known, undefined, 'Notify'), /"Notify" is not a Telegram thread id/)
+  assert.throws(() => resolveSendTarget(known, undefined, 4242), /Unknown thread id 4242/)
+  assert.throws(() => resolveSendTarget(known, undefined, ' '), /thread id is required/)
   assert.equal(topicNameOf({ forum_topic_edited: { name: 'Alerts' } }).name, 'Alerts')
   assert.equal(topicNameOf({ reply_to_message: { forum_topic_created: { name: 'Old' } } }).authoritative, false)
   assert.equal(isTopicGone('Bad Request: message thread not found'), true)
@@ -793,6 +793,55 @@ test('the Host service posts into a topic by thread id and records it in the bou
   }
 })
 
+test('a thread-id send goes to the chat that owns the thread, not the chat that spoke last', async () => {
+  // Two private chats with their own topics: 100 owns 7100, 200 owns 8100.
+  const twoChats = {
+    sessions: {
+      ...notifyState.sessions,
+      'session-other': { sessionId: 'session-other', chatId: 200, threadId: 8100, title: 'Other', cwd: '/tmp/default-workspace', updatedAt: 1 },
+    },
+    threads: { ...notifyState.threads, '200:8100': 'session-other' },
+  }
+  const run = await start({ allowedUsers: ['42', '43'], allowedChats: ['100', '200'] }, twoChats)
+  try {
+    run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    run.host.makeAgent('session-other', '/tmp/default-workspace')
+    // Chat 200 writes last; the control chat follows it.
+    run.telegram.push({ chat: { id: 200, type: 'private' }, from: { id: 43 }, text: '/id' })
+    await wait(150)
+    const before = run.telegram.calls.length
+    const toFirst = await run.host.provided.telegramTopics.send({ to: 7100, text: 'for chat 100' })
+    assert.equal(toFirst.chatId, 100)
+    const toSecond = await run.host.provided.telegramTopics.send({ to: '8100', text: 'for chat 200' })
+    assert.equal(toSecond.chatId, 200)
+    const sends = run.telegram.calls.slice(before).filter((call) => call.method === 'sendMessage')
+    assert.deepEqual(sends.map((call) => [Number(call.body.chat_id), call.body.message_thread_id, call.body.text.trim()]), [[100, 7100, 'for chat 100'], [200, 8100, 'for chat 200']])
+    // The chat a caller names is kept, and must own the thread.
+    assert.equal((await run.host.provided.telegramTopics.send({ to: 8100, chat: '200', text: 'named' })).chatId, 200)
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 8100, chat: 100, text: 'x' }), (error) => /Unknown thread id 8100 in chat 100/.test(error.message) && error.retryable === false)
+    // Unknown anywhere: fail, never guess a chat.
+    const count = run.telegram.calls.length
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 9999, text: 'x' }), (error) => /Unknown thread id 9999: the bot knows no topic with that id in any chat/.test(error.message) && error.retryable === false)
+    assert.equal(run.telegram.calls.slice(count).filter((call) => call.method === 'sendMessage').length, 0)
+    assert.deepEqual(run.host.provided.telegramTopics.topics().map((topic) => [topic.chatId, topic.threadId]), [[100, 7100], [200, 8100]])
+  } finally {
+    run.stop()
+  }
+})
+
+test('a thread id shared by two chats needs the chat named', async () => {
+  const shared = { sessions: notifyState.sessions, threads: { ...notifyState.threads, '200:7100': 'session-other' } }
+  const run = await start({ allowedUsers: ['42', '43'], allowedChats: ['100', '200'] }, shared)
+  try {
+    run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    run.host.makeAgent('session-other', '/tmp/default-workspace')
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 7100, text: 'x' }), (error) => /exists in several chats \(100, 200\)/.test(error.message) && error.retryable === false)
+    assert.equal((await run.host.provided.telegramTopics.send({ to: 7100, chat: 200, text: 'y' })).chatId, 200)
+  } finally {
+    run.stop()
+  }
+})
+
 test('send({ to, text, files, from }) takes a thread id and names the job and its session as the sender', async () => {
   const run = await start({}, notifyState)
   try {
@@ -818,7 +867,7 @@ test('a renamed topic keeps its thread id after /new, and the name only labels i
     assert.equal(result.threadId, 7100)
     assert.equal(result.sessionId, 'session-1')
     assert.match(run.host.live.get('session-1').injected[0].content[0].text, /^\[Sent to the Telegram topic "Alerts"\]/u)
-    assert.deepEqual(run.host.provided.telegramTopics.topics(), [{ threadId: 7100, name: 'Alerts', sessionId: 'session-1' }])
+    assert.deepEqual(run.host.provided.telegramTopics.topics(), [{ chatId: 100, threadId: 7100, name: 'Alerts', sessionId: 'session-1' }])
   } finally {
     run.stop()
   }

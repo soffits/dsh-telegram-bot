@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { enqueue, waitForResult } from '../src/outbox.js'
-import { deliveredToTopic, isAutoCommandTopic, isTopicGone, resolveThreadTarget, resolveTopicTarget, topicNameOf, topicTargetFor } from '../src/topics.js'
+import { deliveredToTopic, isAutoCommandTopic, isTopicGone, resolveSendTarget, resolveTopicTarget, topicNameOf, topicTargetFor } from '../src/topics.js'
 
 test('topic names are learned from creation and rename messages', () => {
   assert.deepEqual(topicNameOf({ forum_topic_created: { name: 'Build' } }), { name: 'Build', authoritative: true })
@@ -15,11 +15,15 @@ test('topic names are learned from creation and rename messages', () => {
 })
 
 test('send targets are numeric thread ids the bot knows', () => {
-  const known = new Set([10, 11])
-  assert.equal(resolveThreadTarget(known, 10), 10)
-  assert.equal(resolveThreadTarget(known, '11'), 11)
-  assert.throws(() => resolveThreadTarget(known, 'Build'), /not a Telegram thread id/)
-  assert.throws(() => resolveThreadTarget(known, 99), /Unknown thread id/)
+  const known = ['5:10', '5:11', '-1007:11', '6:12']
+  assert.deepEqual(resolveSendTarget(known, undefined, 10), { chatId: 5, threadId: 10 })
+  assert.deepEqual(resolveSendTarget(known, undefined, '12'), { chatId: 6, threadId: 12 })
+  assert.throws(() => resolveSendTarget(known, undefined, 'Build'), /not a Telegram thread id/)
+  assert.throws(() => resolveSendTarget(known, undefined, 99), /Unknown thread id 99: .* in any chat/)
+  assert.throws(() => resolveSendTarget(known, undefined, 11), /several chats \(5, -1007\)/)
+  assert.deepEqual(resolveSendTarget(known, '-1007', 11), { chatId: -1007, threadId: 11 })
+  assert.throws(() => resolveSendTarget(known, 6, 10), /Unknown thread id 10 in chat 6/)
+  assert.throws(() => resolveSendTarget(known, 'me', 10), /not a Telegram chat id/)
 })
 
 test('/topic delete targets resolve by thread id or case-insensitive unique name', () => {

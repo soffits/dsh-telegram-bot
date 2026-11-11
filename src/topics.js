@@ -147,25 +147,40 @@ export function deliveredToTopic(directChats, directTopics, chatId, threadId, de
 }
 
 /**
- * Resolve a send target to a thread the bot knows in this chat. Only numeric
- * thread ids are accepted; topic names are display text, not addresses.
- * @param known - thread ids the bot knows in the chat.
+ * Resolve a programmatic send target to the chat that owns the thread.
+ * Thread ids belong to one chat (each private chat has its own topics), so
+ * the chat comes from where the bot saw the thread, never from whichever chat
+ * spoke last. Only numeric thread ids are accepted; topic names are display
+ * text, not addresses.
+ * @param keys - known `"<chatId>:<threadId>"` topic keys.
+ * @param chat - chat id the caller names, or undefined to use the owner.
  * @param target - thread id, as a number or a string of digits.
- * @returns the thread id.
+ * @returns `{ chatId, threadId }`.
  */
-export function resolveThreadTarget(known, target) {
+export function resolveSendTarget(keys, chat, target) {
   const raw = typeof target === 'number' ? String(target) : String(target ?? '').trim()
   if (raw.length === 0) throw new Error('A Telegram thread id is required.')
   if (!/^\d+$/u.test(raw)) throw new Error(`"${raw}" is not a Telegram thread id. Topics are addressed by their numeric thread id; /id in a topic shows it.`)
   const threadId = Number(raw)
-  if (!known.has(threadId)) throw new Error(`Unknown thread id ${threadId}: the bot knows no topic with that id in its chat. /id in a topic shows its thread id.`)
-  return threadId
+  const owners = [...new Set([...keys]
+    .map((key) => String(key).match(/^(-?\d+):(\d+)$/u))
+    .filter((match) => match !== null && Number(match[2]) === threadId)
+    .map((match) => match[1]))]
+  const wanted = typeof chat === 'number' ? String(chat) : String(chat ?? '').trim()
+  if (wanted.length > 0) {
+    if (!/^-?\d+$/u.test(wanted)) throw new Error(`"${wanted}" is not a Telegram chat id.`)
+    if (!owners.includes(wanted)) throw new Error(`Unknown thread id ${threadId} in chat ${wanted}: the bot knows no topic with that id there. /id in a topic shows its thread id.`)
+    return { chatId: Number(wanted), threadId }
+  }
+  if (owners.length === 0) throw new Error(`Unknown thread id ${threadId}: the bot knows no topic with that id in any chat. /id in a topic shows its thread id.`)
+  if (owners.length > 1) throw new Error(`Thread id ${threadId} exists in several chats (${owners.join(', ')}); name the chat to send to.`)
+  return { chatId: Number(owners[0]), threadId }
 }
 
 /**
  * Resolve a `/topic delete` target typed by a person: a topic thread id, or a
  * known topic name compared without regard to case. Programmatic sends use
- * `resolveThreadTarget`, since names can change.
+ * `resolveSendTarget`, since names can change.
  * @param names - `{ "<chatId>:<threadId>": name }`.
  * @param chatId - chat the topics live in.
  * @param target - topic name or thread id.

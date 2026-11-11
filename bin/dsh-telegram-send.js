@@ -10,7 +10,7 @@ import { resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { enqueue, waitForResult } from '../src/outbox.js'
 
-const usage = `Usage: dsh-telegram-send --thread <thread-id> [--file <path>]...
+const usage = `Usage: dsh-telegram-send --thread <thread-id> [--chat <chat-id>] [--file <path>]...
                          [--job <name>] [--from-session <id>] [--from <label>]
                          [--no-wait] [--timeout <seconds>] [text...]
 
@@ -20,6 +20,9 @@ id (/id in the topic shows it). The message is also recorded in the session
 bound to that topic, without starting a turn. Long text is split into several
 Telegram messages.
 
+  --chat <id>            chat to send to; only needed when several chats have a
+                         topic with that thread id (the bot otherwise uses the
+                         chat it saw the thread in)
   --job <name>           name of the job or script sending it
   --from-session <id>    DSH session sending it; defaults to $DSH_SESSION_ID
                          (set inside DSH sessions), --from-session '' for none
@@ -34,6 +37,7 @@ try {
     allowPositionals: true,
     options: {
       thread: { type: 'string', short: 't' },
+      chat: { type: 'string', short: 'c' },
       file: { type: 'string', short: 'f', multiple: true },
       from: { type: 'string' },
       job: { type: 'string', short: 'j' },
@@ -54,6 +58,10 @@ if (values.help) {
 }
 if (values.thread === undefined || !/^\d+$/u.test(values.thread.trim())) {
   process.stderr.write(`--thread takes the topic's numeric thread id.\n\n${usage}\n`)
+  process.exit(2)
+}
+if (values.chat !== undefined && !/^-?\d+$/u.test(values.chat.trim())) {
+  process.stderr.write(`--chat takes a numeric chat id.\n\n${usage}\n`)
   process.exit(2)
 }
 
@@ -80,6 +88,7 @@ if (sessionId !== undefined) from.sessionId = sessionId
 
 const id = await enqueue({
   to: values.thread.trim(),
+  ...(values.chat === undefined ? {} : { chat: values.chat.trim() }),
   text,
   files,
   ...(Object.keys(from).length === 0 ? {} : { from }),

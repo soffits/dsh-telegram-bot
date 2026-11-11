@@ -39,7 +39,7 @@ import { loadState, loadTopics, STATE_PATH, TOPICS_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
 import { createOutbox } from './outbox.js'
-import { deliveredToTopic, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, resolveThreadTarget, topicNameOf, topicTargetFor, topicTask, topicTitle } from './topics.js'
+import { deliveredToTopic, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, resolveSendTarget, topicNameOf, topicTargetFor, topicTask, topicTitle } from './topics.js'
 import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.js'
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference, senderLabel } from './message-context.js'
@@ -3657,14 +3657,15 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Thread ids the bot knows in a chat: bound topics and named ones.
-   * @param chatId - chat to list.
-   * @returns the thread ids.
+   * Topics the bot knows in every chat: bound topics and named ones.
+   * @returns `"<chatId>:<threadId>"` keys, without the All view.
    */
-  function knownThreads(chatId) {
-    const prefix = `${chatId}:`
-    const keys = [...Object.keys(state.threads), ...Object.keys(state.topicNames ?? {})]
-    return new Set(keys.filter((key) => key.startsWith(prefix)).map((key) => Number(key.slice(prefix.length))).filter((id) => !isAllThread(id)))
+  function knownTopicKeys() {
+    const keys = new Set([...Object.keys(state.threads), ...Object.keys(state.topicNames ?? {})])
+    return [...keys].filter((key) => {
+      const threadId = Number(key.slice(key.lastIndexOf(':') + 1))
+      return Number.isSafeInteger(threadId) && !isAllThread(threadId)
+    })
   }
 
   /**
@@ -3673,8 +3674,10 @@ export function apply(ctx, config) {
    * The Host service, the agent tool and the file spool all use this.
    * Errors a retry cannot fix (an unknown thread id, a bad file, a send that
    * already reached Telegram in part) carry `retryable: false`.
-   * @param request - `{ to, text, files, from }`; `to` is the topic's
-   *   thread id; `from` may hold `label` (who sent it), `job` (a job name)
+   * @param request - `{ to, chat, text, files, from }`; `to` is the topic's
+   *   thread id; the message goes to the chat the bot saw that thread in,
+   *   or to `chat` when given (needed only when two chats share the id);
+   *   `from` may hold `label` (who sent it), `job` (a job name)
    *   and `sessionId` (the sender session; when it is the bound session
    *   itself, no copy is recorded).
    * @param signal - request lifetime.
@@ -3683,16 +3686,15 @@ export function apply(ctx, config) {
   async function sendToTopic(request, signal = bridgeAbort.signal) {
     await stateReady
     if (lifetime === undefined) throw new Error('The Telegram bot is not running.')
-    if (topics.chatId === 0) throw new Error('The bot has no chat yet. Send /start to the bot first.')
     const text = typeof request?.text === 'string' ? request.text : ''
     const paths = Array.isArray(request?.files) ? request.files.map(String) : []
     // A sticker library entry (`{ id, fileId, emoji, setName }`).
     const sticker = typeof request?.sticker?.fileId === 'string' ? request.sticker : undefined
     if (text.trim().length === 0 && paths.length === 0 && sticker === undefined) throw finalError('Nothing to send: give text, files or a sticker.')
-    const chatId = topics.chatId
+    let chatId
     let threadId
     try {
-      threadId = resolveThreadTarget(knownThreads(chatId), request?.to)
+      ({ chatId, threadId } = resolveSendTarget(knownTopicKeys(), request?.chat, request?.to))
     } catch (error) {
       throw finalError(error)
     }
@@ -6058,29 +6060,31 @@ export function apply(ctx, config) {
   /** Topic sending for other plugins: `ctx.get('telegramTopics').send(...)`. */
   const topicService = {
     /**
-     * @param request - `{ to, text, files, from }`: `to` is the topic's
-     *   thread id, `text` Markdown, `files` absolute paths, `from`
+     * @param request - `{ to, chat, text, files, from }`: `to` is the topic's
+     *   thread id, sent to the chat that owns it (`chat` picks one when
+     *   several chats share the id), `text` Markdown, `files` absolute paths, `from`
      *   `{ job, sessionId, label }` naming the sender.
      */
-    send: ({ to, text, files = [], from } = {}) => sendToTopic({ to, text, files, from }),
-    /** @returns the topics the bot knows in its chat: thread id, last known name, bound session. */
-    topics: () => [...knownThreads(topics.chatId)]
-      .sort((left, right) => left - right)
-      .map((threadId) => {
-        const key = `${topics.chatId}:${threadId}`
-        return { threadId, name: state.topicNames?.[key] ?? null, sessionId: state.threads[key] ?? null }
-      }),
+    send: ({ to, chat, text, files = [], from } = {}) => sendToTopic({ to, chat, text, files, from }),
+    /** @returns the topics the bot knows in every chat: chat id, thread id, last known name, bound session. */
+    topics: () => knownTopicKeys()
+      .map((key) => {
+        const split = key.lastIndexOf(':')
+        return { chatId: Number(key.slice(0, split)), threadId: Number(key.slice(split + 1)), name: state.topicNames?.[key] ?? null, sessionId: state.threads[key] ?? null }
+      })
+      .sort((left, right) => left.chatId - right.chatId || left.threadId - right.threadId),
   }
   if (typeof ctx.provide === 'function') ctx.provide('telegramTopics', topicService)
 
   /** Model-facing tool for sending into a topic; see sendToTopic. */
   const sendTool = {
     name: 'telegram_send',
-    description: 'Send a message, and optionally files, into a Telegram topic of the DSH Telegram bot, addressed by its numeric thread id. The message appears in the topic and is recorded in the session bound to that topic, which sees it on its next turn; no turn is started. Use it to notify the user on Telegram. Fails on a thread id the bot does not know.',
+    description: 'Send a message, and optionally files, into a Telegram topic of the DSH Telegram bot, addressed by its numeric thread id. The message appears in the topic and is recorded in the session bound to that topic, which sees it on its next turn; no turn is started. Use it to notify the user on Telegram. It goes to the chat that owns the thread; fails on a thread id the bot does not know.',
     parameters: {
       type: 'object',
       properties: {
         thread: { type: 'string', description: 'Numeric Telegram thread id of the topic (/id in the topic shows it).' },
+        chat: { type: 'string', description: 'Numeric chat id; only needed when the error says several chats share the thread id.' },
         text: { type: 'string', description: 'Message text; Markdown is converted for Telegram.' },
         files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of files to attach.' },
       },
@@ -6095,6 +6099,7 @@ export function apply(ctx, config) {
       const sessionId = exec?.agent?.id ?? exec?.agent?.session?.id
       return sendToTopic({
         to: args.thread,
+        chat: args.chat,
         text: typeof args.text === 'string' ? args.text : '',
         files: Array.isArray(args.files) ? args.files : [],
         from: typeof sessionId === 'string' ? { label: `session ${sessionId}`, sessionId } : undefined,
@@ -6118,6 +6123,7 @@ export function apply(ctx, config) {
         set: { type: 'string', description: 'find: only this set. add_set: the set name.' },
         meaning: { type: 'string', description: 'note: what the sticker shows or says and when to use it; empty clears it.' },
         thread: { type: 'string', description: 'send: numeric Telegram thread id of the topic.' },
+        chat: { type: 'string', description: 'send: numeric chat id; only needed when several chats share the thread id.' },
         limit: { type: 'number', description: 'find: most results (default 20, max 100).' },
       },
       required: ['action'],
@@ -6168,6 +6174,7 @@ export function apply(ctx, config) {
         const sessionId = exec?.agent?.id ?? exec?.agent?.session?.id
         return sendToTopic({
           to: args.thread,
+          chat: args.chat,
           sticker: entry,
           from: typeof sessionId === 'string' ? { label: `session ${sessionId}`, sessionId } : undefined,
         }, signal)
@@ -6191,7 +6198,7 @@ export function apply(ctx, config) {
   /** Requests written by `dsh-telegram-send` or any process with DSH home access. */
   const outbox = createOutbox({
     handle: (request) => sendToTopic(request),
-    ready: () => lifetime !== undefined && topics.chatId !== 0 && !bridgeAbort.signal.aborted,
+    ready: () => lifetime !== undefined && !bridgeAbort.signal.aborted,
     onError: (error) => reportError('outbox', error),
   })
   ctx.effect(() => {

@@ -143,7 +143,7 @@ Private-chat topics send with `message_thread_id`. If Telegram answers `message 
 
 ## Send to a topic
 
-Scripts, scheduled jobs, other plugins and agents can post into a topic by its numeric thread id (`/id` in the topic shows it). The message (text and files) appears in the topic and is also recorded in the session bound to that topic, without starting a turn: it is queued as context for that session's next turn, labelled with who sent it. A thread id the bot does not know (no binding and no known name in its chat) is an error; nothing is created. Topic names are only labels, never addresses. A known topic with no session gets a new one first, made the way `/new` makes it (the configured working directory and preset, titled after the topic), so the message is recorded; only a topic whose user is still choosing its session just shows the message, and the result says so (`note`). If no session can take the record, the message is still sent and the result carries `recordError`.
+Scripts, scheduled jobs, other plugins and agents can post into a topic by its numeric thread id (`/id` in the topic shows it). The message (text and files) appears in the topic and is also recorded in the session bound to that topic, without starting a turn: it is queued as context for that session's next turn, labelled with who sent it. Thread ids belong to one chat, so the message goes to the chat the bot saw that thread in (its binding or known name), not the chat that last wrote to the bot. A thread id the bot does not know in any chat is an error; nothing is created. In the rare case two chats have a topic with the same thread id, the send fails until the caller names the chat (`chat`, `--chat`). Topic names are only labels, never addresses. A known topic with no session gets a new one first, made the way `/new` makes it (the configured working directory and preset, titled after the topic), so the message is recorded; only a topic whose user is still choosing its session just shows the message, and the result says so (`note`). If no session can take the record, the message is still sent and the result carries `recordError`.
 
 The bot also remembers each such send (`$DSH_HOME/telegram/sent-messages.json`: the last 1,000 sends from the past 180 days, text up to 20,000 characters). When someone replies to or quotes one of those messages, the agent gets the whole original text, however many Telegram messages it was split into, with its send time, job name and sending session, and a hint to open that session for more context. This works after `/new` too, when the current session never saw the message.
 
@@ -173,12 +173,12 @@ const result = await ctx.get('telegramTopics').send({
   from: { job: 'backup', sessionId: 'session-…' }, // optional; `label` for other senders
 })
 // { chatId, threadId, topic, sessionId, recorded, messageIds }, plus note or recordError when it was not recorded
-ctx.get('telegramTopics').topics() // [{ threadId, name, sessionId }]: known topics, name may be null
+ctx.get('telegramTopics').topics() // [{ chatId, threadId, name, sessionId }]: known topics in every chat, name may be null
 ```
 
 `send` rejects when the message was not sent. Errors that a retry cannot fix (an unknown thread id, a topic that was deleted, a missing or oversized file, nothing to send, or a failure after part of a long message already went out) carry `retryable: false`; others, such as the bot not running yet, are worth trying again. This is the shape [dsh-cron-jobs](https://github.com/soffits/dsh-cron-jobs) expects from a delivery channel, so `deliver: { via: telegramTopics, to: 12345 }` sends scheduled job results into the topic, with the job and its session named as the sender.
 
-From an agent: the `telegram_send` tool takes `thread` (the thread id), `text` and `files` (absolute paths). The calling session is named as the sender and does not get a copy of its own message.
+From an agent: the `telegram_send` tool takes `thread` (the thread id), `text`, `files` (absolute paths) and, only when two chats share the thread id, `chat`. The calling session is named as the sender and does not get a copy of its own message.
 
 Text is Markdown, converted for Telegram like assistant answers. JPEG, PNG and WebP files up to 10 MB are sent as photos, other files as documents (up to 50 MB).
 

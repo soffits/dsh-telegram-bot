@@ -7,10 +7,8 @@ import { basename, extname, isAbsolute, join, resolve } from 'node:path'
 import {
   BOT_COMMANDS,
   BOT_COMMANDS_RU,
-  EFFORT_CHOICES,
   FORWARD_BATCH_MS,
   MAX_TELEGRAM_TEXT,
-  MODEL_CHOICES,
   POLL_TIMEOUT_SECONDS,
   RESTART_DEBOUNCE_MS,
   RETRY_DELAY_MS,
@@ -46,6 +44,7 @@ import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.j
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference, senderLabel } from './message-context.js'
 import { createSentLog } from './sent-log.js'
+import { catalogKey, createModelCatalog, defaultModelOf, effortChoices, effortName, findModel, modelByKey, modelName, pageOf, pickedSelection, providerByKey, sameSelection, sessionModelOf } from './models.js'
 import {
   allowedChatsOf,
   allowedUsersOf,
@@ -185,7 +184,6 @@ export function apply(ctx, config) {
         threadId,
         sessionId: boundSession,
         cwd: boundSession === undefined ? undefined : state.sessions[boundSession]?.cwd,
-        selection: undefined,
         permission: boundSession === undefined ? undefined : state.sessions[boundSession]?.permission,
         busy: false,
         done: true,
@@ -244,8 +242,6 @@ export function apply(ctx, config) {
       title: title ?? state.sessions[sessionId]?.title ?? '',
       ...(state.sessions[sessionId]?.titleLocked === true ? { titleLocked: true } : {}),
       ...(chat.cwd === undefined ? {} : { cwd: chat.cwd }),
-      ...(chat.selection?.current?.model === undefined ? {} : { model: chat.selection.current.model }),
-      ...(chat.selection?.current?.reasoningEffort === undefined ? {} : { effort: chat.selection.current.reasoningEffort }),
       ...(chat.permission === undefined ? {} : { permission: chat.permission }),
       updatedAt: Date.now(),
     }
@@ -276,115 +272,23 @@ export function apply(ctx, config) {
     return typeof preset === 'string' && preset.trim().length > 0 ? preset.trim() : undefined
   }
 
-  /** @returns the current default model selection, when the service exists. */
-  function modelSelection() {
-    const service = ctx.get('agentDefaultModel')
-    if (service === undefined) return undefined
-    try {
-      const selection = service.currentSelection()
-      if (selection !== undefined && typeof selection.provider === 'string' && typeof selection.model === 'string') return selection
-    } catch {
-      // A deployment without a default-model service creates a plain agent.
-    }
-    return undefined
-  }
+  /** The Web model picker's catalog, read through the session controller. */
+  const modelCatalog = createModelCatalog(ctx)
 
   /**
-   * Resolve the preferred model state for one chat from durable prefs or defaults.
+   * Read the model a topic's session runs now. The live agent owns it
+   * (fallback switches, Web UI picks and restores all land there), so the
+   * bot never keeps its own copy.
    * @param chat - chat bridge state.
-   * @returns mutable selection state used by the model-selection listener.
+   * @returns the session's selection, or the deployment default.
    */
-  function selectionForChat(chat) {
-    if (chat.selection !== undefined) return chat.selection
-    const record = typeof chat.sessionId === 'string' ? state.sessions[chat.sessionId] : undefined
-    const fallback = modelSelection()
-    const provider = record?.provider ?? fallback?.provider ?? 'deepseek-official'
-    const model = record?.model ?? fallback?.model ?? 'deepseek-flash'
-    // No forced effort: without a saved or default choice the model's own default applies.
-    const effort = record?.effort ?? fallback?.reasoningEffort
-    chat.selection = {
-      current: {
-        provider,
-        model,
-        reasoningEffort: effort,
-      },
-      assembled: undefined,
-    }
-    return chat.selection
+  async function currentModel(chat) {
+    return await sessionModelOf(ctx, chat.sessionId) ?? defaultModelOf(ctx)
   }
 
-  /**
-   * Recover the current model/effort for a selected session when state has no override.
-   * @param chat - chat bridge state.
-   */
-  async function hydrateSelection(chat) {
-    if (chat.selection !== undefined) return
-    const record = typeof chat.sessionId === 'string' ? state.sessions[chat.sessionId] : undefined
-    let provider = record?.provider
-    let model = record?.model
-    let effort = record?.effort
-    if ((model === undefined || provider === undefined) && typeof chat.sessionId === 'string') {
-      try {
-        const snapshot = await ctx.get('sessionQuery')?.readSession(chat.sessionId)
-        const events = snapshot?.events ?? []
-        for (let index = events.length - 1; index >= 0; index -= 1) {
-          const event = events[index]
-          if (event?.type !== 'request/header') continue
-          const config = event.data?.header?.config
-          if (typeof config?.provider === 'string') provider = config.provider
-          if (typeof config?.model === 'string') model = config.model
-          if (typeof config?.reasoningEffort === 'string') effort = config.reasoningEffort
-          break
-        }
-      } catch {
-        // A corrupt or empty session falls back to the default selection.
-      }
-    }
-    chat.selection = selectionForChat({
-      ...chat,
-      selection: {
-        current: {
-          provider: provider ?? modelSelection()?.provider ?? 'deepseek-official',
-          model: model ?? modelSelection()?.model ?? 'deepseek-flash',
-          reasoningEffort: effort ?? modelSelection()?.reasoningEffort,
-        },
-        assembled: undefined,
-      },
-    })
-  }
-
-  /** Cached provider model names, populated from the live catalog. */
-  let modelChoicesCache
-
-  /**
-   * Load model ids and the exact display names used by the Web model picker.
-   * @returns model choices.
-   */
-  async function loadModelChoices() {
-    if (modelChoicesCache !== undefined) return modelChoicesCache
-    try {
-      const models = await ctx.get('llm')?.listModels('deepseek-official')
-      const choices = []
-      for (const wanted of MODEL_CHOICES) {
-        const found = models?.find((entry) => entry.id === wanted.id)
-        choices.push({ id: wanted.id, label: found?.name ?? wanted.label })
-      }
-      modelChoicesCache = choices
-    } catch {
-      modelChoicesCache = MODEL_CHOICES
-    }
-    return modelChoicesCache
-  }
-
-  /** @returns the display label for a model id. */
-  function modelLabel(model) {
-    return (modelChoicesCache ?? MODEL_CHOICES).find((choice) => choice.id === model)?.label ?? String(model ?? '?')
-  }
-
-  /** @returns the display label for an effort id. */
-  function effortLabel(effort) {
-    if (effort === undefined) return tr('Default', 'По умолчанию')
-    return EFFORT_CHOICES.find((choice) => choice.id === effort)?.label ?? String(effort)
+  /** @returns the label for the provider's own default effort. */
+  function defaultEffortLabel() {
+    return tr('Default', 'По умолчанию')
   }
 
   /**
@@ -520,19 +424,14 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Persist the selected model/effort and permission on the session record.
+   * Persist the permission preset on the session record. The model is not
+   * stored: the session itself records it.
    * @param chat - chat bridge state.
    */
-  async function persistPreferences(chat) {
+  async function persistPermission(chat) {
     if (typeof chat.sessionId !== 'string') return
     const record = state.sessions[chat.sessionId]
     if (record === undefined) return
-    const current = chat.selection?.current
-    if (current !== undefined) {
-      record.provider = current.provider
-      record.model = current.model
-      record.effort = current.reasoningEffort
-    }
     if (chat.permission !== undefined) record.permission = chat.permission
     await persistState()
   }
@@ -597,7 +496,7 @@ export function apply(ctx, config) {
         : chat.permission ?? service.defaultPreset
       if (current === undefined || current === chat.permission) return
       chat.permission = current
-      await persistPreferences(chat)
+      await persistPermission(chat)
     } catch (error) {
       warn(`permission read failed: ${messageOf(error)}`)
     }
@@ -617,10 +516,10 @@ export function apply(ctx, config) {
    * @returns display summary.
    */
   async function contextSummary(chat) {
-    const current = selectionForChat(chat).current
+    const current = await currentModel(chat)
     let windowSize
     try {
-      const info = await ctx.get('llm')?.resolveModel(current.provider, current.model)
+      const info = current === undefined ? undefined : await ctx.get('llm')?.resolveModel(current.provider, current.model)
       windowSize = info?.context?.contextWindow
     } catch {
       // Capacity is optional.
@@ -1930,49 +1829,15 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Install the selected provider/model on one agent, mirroring the Web session
-   * controller. Without this the loop can assemble a request without the
-   * caller's model selection.
-   * @param agentCtx - unpublished agent scope.
-   * @param selection - mutable selection state.
-   */
-  function installAgentSelection(agentCtx, selection) {
-    agentCtx.on('system-prompt/assemble', async (_assembly, _context, next) => {
-      const selected = selection.current
-      const assembled = await next()
-      if (selected === undefined) return assembled
-      return {
-        ...assembled,
-        variables: {
-          ...assembled.variables,
-          provider: selected.provider,
-          model: selected.model,
-        },
-      }
-    })
-    agentCtx.on('agent/request', async (_payload, next) => {
-      const resolved = await next()
-      const selected = selection.assembled
-      if (selected === undefined) return resolved
-      const { reasoningEffort: _inherited, ...rest } = resolved
-      return {
-        ...rest,
-        provider: selected.provider,
-        model: selected.model,
-        ...(selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort }),
-      }
-    })
-  }
-
-  /**
-   * Compose one agent's scoped world and attach the Telegram stream.
+   * Compose one agent's scoped world on the headless path (no session
+   * controller) and attach the Telegram stream. The model is not touched
+   * here: DSH registers the `provider` and `model` prompt variables from the
+   * step's own model selection.
    * @param agentCtx - unpublished agent scope.
    * @param agent - unpublished agent.
    * @param chat - chat bridge state.
    */
   async function setupAgent(agentCtx, agent, chat) {
-    const selection = selectionForChat(chat)
-    installAgentSelection(agentCtx, selection)
     const preset = presetOf()
     const presets = ctx.get('agentPresets')
     if (preset !== undefined && presets !== undefined) {
@@ -1983,6 +1848,40 @@ export function apply(ctx, config) {
       }
     }
     attachAgent(agent, chat)
+  }
+
+  /**
+   * Agent options for the headless path, read from the deployment default at
+   * each access like the Web session controller's, so a session that has not
+   * recorded a model follows the current default.
+   * @returns live agent options.
+   */
+  function defaultAgentOptions() {
+    return {
+      get provider() { return defaultModelOf(ctx)?.provider },
+      get model() { return defaultModelOf(ctx)?.model },
+      get reasoningEffort() { return defaultModelOf(ctx)?.reasoningEffort },
+    }
+  }
+
+  /** @returns the Web session controller, when this deployment mounts it. */
+  function sessionControllerOf() {
+    const controller = ctx.get('sessionController')
+    return typeof controller?.create === 'function' && typeof controller?.resolveAgent === 'function' ? controller : undefined
+  }
+
+  /**
+   * Resume or find one session through the Web session controller.
+   * @param controller - session controller.
+   * @param sessionId - session id.
+   * @returns the live agent.
+   */
+  async function resolveThroughController(controller, sessionId) {
+    const found = await controller.resolveAgent(sessionId)
+    if (found?.error !== undefined) throw found.error
+    const agent = found?.agent ?? ctx.get('agents')?.get(sessionId)
+    if (agent === undefined) throw new Error(`session ${sessionId} has no live agent`)
+    return agent
   }
 
   /**
@@ -2059,25 +1958,19 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Create or resume the DSH agent for one Telegram chat.
+   * Create or resume the DSH agent for one Telegram chat. Sessions are created
+   * and resumed through the Web session controller, so they are composed the
+   * way the Web UI composes them (preset, model-switch notices, the default
+   * model); the raw agent registry is the headless fallback.
    * @param chat - chat bridge state.
+   * @param options - `model`: selection a newly created session starts with
+   *   (`/new` carries the previous session's model); ignored on resume.
    * @returns the live agent.
    */
-  async function ensureAgent(chat) {
+  async function ensureAgent(chat, options = {}) {
     const agents = ctx.get('agents')
     if (agents === undefined) throw new Error('dsh-agent is not mounted in this profile')
-    const controllerService = ctx.get('sessionController')
-    const controller = controllerService !== null && typeof controllerService?.createSession === 'function' ? controllerService : undefined
-    await hydrateSelection(chat)
-    const selection = selectionForChat(chat)
-    const chosen = selection.current
-    const agentOptions = {
-      agentOptions: {
-        provider: chosen.provider,
-        model: chosen.model,
-        ...(chosen.reasoningEffort === undefined ? {} : { reasoningEffort: chosen.reasoningEffort }),
-      },
-    }
+    const controller = sessionControllerOf()
     const setup = (agentCtx, agent) => setupAgent(agentCtx, agent, chat)
     const targetCwd = chat.cwd
       ?? (typeof chat.sessionId === 'string' ? state.sessions[chat.sessionId]?.cwd : undefined)
@@ -2092,13 +1985,9 @@ export function apply(ctx, config) {
         return live
       }
       try {
-        // The Web session controller composes the same scoped services the GUI
-        // uses (model selection, preset, provider connection). Prefer it when
-        // present; the raw registry path is the headless fallback.
-        const resumed = controller === undefined
-          ? await agents.resume({ resumeSessionId: chat.sessionId, ...agentOptions, setup })
-          : await controller.resume(chat.sessionId)
-        const agent = resumed?.agent ?? resumed
+        const agent = controller === undefined
+          ? (await agents.resume({ resumeSessionId: chat.sessionId, agentOptions: defaultAgentOptions(), setup }))?.agent
+          : await resolveThroughController(controller, chat.sessionId)
         if (typeof agent?.session?.header?.cwd === 'string') chat.cwd = agent.session.header.cwd
         attachAgent(agent, chat)
         await syncPermission(chat, agent)
@@ -2115,37 +2004,54 @@ export function apply(ctx, config) {
     }
 
     const preset = presetOf()
+    let agent
     if (controller !== undefined) {
       try {
-        const created = await controller.createSession({
+        const created = await controller.create({
           cwd: targetCwd,
           ...(preset === undefined ? {} : { agentPreset: preset }),
         })
-        const agent = created?.agent ?? created
-        const sessionId = agent.session?.id ?? agent.id
-        await claimForTopic(agent, chat)
-        await bindSession(chat, sessionId, '', targetCwd)
-        await attachToWorkspace(sessionId, targetCwd)
-        attachAgent(agent, chat)
-        await syncPermission(chat, agent)
-        info(`created Telegram session ${sessionId} via sessionController`)
-        return agent
+        agent = await resolveThroughController(controller, created.sessionId)
       } catch (error) {
         warn(`sessionController create failed, using raw agent: ${messageOf(error)}`)
       }
     }
-
-    const sessionId = `session-${randomUUID()}`
-    const meta = { cwd: targetCwd }
-    if (preset !== undefined && ctx.get('agentPresets') !== undefined) meta.agentPreset = preset
-    const handle = await agents.create({ sessionId, meta, ...agentOptions, setup })
-    await claimForTopic(handle.agent, chat)
+    if (agent === undefined) {
+      const meta = { cwd: targetCwd }
+      if (preset !== undefined && ctx.get('agentPresets') !== undefined) meta.agentPreset = preset
+      agent = (await agents.create({ sessionId: `session-${randomUUID()}`, meta, agentOptions: defaultAgentOptions(), setup })).agent
+    }
+    const sessionId = agent.session?.id ?? agent.id
+    await startModel(agent, options.model)
+    await claimForTopic(agent, chat)
     await bindSession(chat, sessionId, '', targetCwd)
-    await attachToWorkspace(sessionId, meta.cwd)
-    attachAgent(handle.agent, chat)
-    await syncPermission(chat, handle.agent)
-    info(`created Telegram session ${sessionId}`)
-    return handle.agent
+    await attachToWorkspace(sessionId, targetCwd)
+    attachAgent(agent, chat)
+    await syncPermission(chat, agent)
+    info(`created Telegram session ${sessionId}${controller === undefined ? '' : ' via sessionController'}`)
+    return agent
+  }
+
+  /**
+   * Start a new session on a carried-over model. A model equal to the
+   * default is left unrecorded, so the session follows the default like a new
+   * Web session until its first request; a model the catalog no longer
+   * offers is skipped, so the session is not born unable to answer.
+   * @param agent - the new session's agent.
+   * @param selection - model to start with, or undefined for the default.
+   */
+  async function startModel(agent, selection) {
+    if (selection === undefined || sameSelection(selection, defaultModelOf(ctx))) return
+    const catalog = await modelCatalog.load()
+    if (catalog !== undefined && findModel(catalog, selection) === undefined) {
+      warn(`${selection.provider}/${selection.model} is not offered any more; the new session uses the default model`)
+      return
+    }
+    try {
+      agent.model.select(selection)
+    } catch (error) {
+      warn(`could not start ${agent.session?.id ?? agent.id} on ${selection.provider}/${selection.model}: ${messageOf(error)}`)
+    }
   }
 
   /** Stop a pending stream edit timer. */
@@ -3100,8 +3006,8 @@ export function apply(ctx, config) {
    * @returns inline-keyboard rows.
    */
   async function controlKeyboard(chat) {
-    await loadModelChoices()
-    const current = selectionForChat(chat).current
+    const catalog = await modelCatalog.load()
+    const current = await currentModel(chat)
     const permission = currentPermission(chat)
     const context = await contextSummary(chat)
     const contextLabel = context.used === undefined
@@ -3109,8 +3015,8 @@ export function apply(ctx, config) {
       : `${formatTokens(context.used)}/${formatTokens(context.windowSize)}`
     return [
       [
-        { text: `🤖 ${modelLabel(current.model)}`, callback_data: 'o:model' },
-        { text: `🧠 ${tr('Effort', 'Усилие')}: ${effortLabel(current.reasoningEffort)}`, callback_data: 'o:effort' },
+        { text: `🤖 ${modelName(catalog, current)}`, callback_data: 'o:model' },
+        { text: `🧠 ${tr('Effort', 'Усилие')}: ${effortName(catalog, current, defaultEffortLabel())}`, callback_data: 'o:effort' },
       ],
       [
         { text: `🛡 ${permissionLabel(permission)}`, callback_data: 'o:mode' },
@@ -3129,7 +3035,6 @@ export function apply(ctx, config) {
    */
   async function sendMenu(chatId, threadId, chat, signal, messageId) {
     try {
-      await hydrateSelection(chat)
       const keyboard = await controlKeyboard(chat)
       const target = messageId ?? chat.panelMessageId
       if (target !== undefined && await editKeyboard(chatId, threadId, target, `<b>${tr('Session controls', 'Управление сессией')}</b>`, keyboard, signal)) {
@@ -3144,36 +3049,111 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Show the model picker.
+   * Show the first level of the model picker: the providers of the Web model
+   * catalog, the current one checked.
    * @param chat - chat bridge state.
    * @param signal - request lifetime.
+   * @param messageId - panel message to edit.
+   * @param page - provider page.
    */
-  async function showModelMenu(chat, signal, messageId) {
-    await hydrateSelection(chat)
-    const choices = await loadModelChoices()
-    const current = selectionForChat(chat).current
-    const rows = choices.map((choice) => [{
-      text: `${choice.id === current.model ? '✅ ' : ''}${choice.label} · ${choice.id}`,
-      callback_data: `m:${choice.id}`,
+  async function showModelMenu(chat, signal, messageId, page = 0) {
+    const catalog = await modelCatalog.load()
+    const target = messageId ?? chat.panelMessageId
+    const back = [{ text: tr('⬅️ Back', '⬅️ Назад'), callback_data: 'b:menu' }]
+    if (catalog === undefined || catalog.groups.length === 0) {
+      await renderMenu(chat.chatId, chat.threadId, target, `<b>${tr('Model', 'Модель')}</b>\n\n${tr('No models are available right now.', 'Сейчас нет доступных моделей.')}`, [back], signal)
+      return
+    }
+    const current = await currentModel(chat)
+    const shown = pageOf(catalog.groups, page)
+    const rows = shown.items.map((group) => [{
+      text: `${group.id === current?.provider ? '✅ ' : ''}${group.name ?? group.id} (${group.models.length})`,
+      callback_data: `mp:${catalogKey(group.id)}:0`,
     }])
-    rows.push([{ text: tr('⬅️ Back', '⬅️ Назад'), callback_data: 'b:menu' }])
-    await renderMenu(chat.chatId, chat.threadId, messageId ?? chat.panelMessageId, `<b>${tr('Model', 'Модель')}</b>\n\n${tr('Choose a model for this session.', 'Выбери модель для этой сессии.')}`, rows, signal)
+    const nav = pagerRow(shown, (index) => `pp:${index}`)
+    if (nav.length > 0) rows.push(nav)
+    rows.push(back)
+    const failed = catalog.failures.length === 0
+      ? ''
+      : `\n${tr('Unavailable', 'Недоступно')}: ${catalog.failures.map((failure) => escapeHtml(failure.name ?? failure.id)).join(', ')}`
+    await renderMenu(
+      chat.chatId,
+      chat.threadId,
+      target,
+      `<b>${tr('Model', 'Модель')}</b>\n\n${tr('Now', 'Сейчас')}: ${escapeHtml(modelName(catalog, current))}\n${tr('Choose a provider.', 'Выбери провайдера.')}${failed}`,
+      rows,
+      signal,
+    )
   }
 
   /**
-   * Show the reasoning-effort picker.
+   * Show the second level of the model picker: one provider's models.
+   * @param chat - chat bridge state.
+   * @param providerKey - `catalogKey(provider)`.
+   * @param page - model page.
+   * @param signal - request lifetime.
+   * @param messageId - panel message to edit.
+   */
+  async function showProviderModels(chat, providerKey, page, signal, messageId) {
+    const catalog = await modelCatalog.load()
+    const group = providerByKey(catalog, providerKey)
+    if (group === undefined) {
+      await showModelMenu(chat, signal, messageId)
+      return
+    }
+    const current = await currentModel(chat)
+    const shown = pageOf(group.models, page)
+    const rows = shown.items.map((model) => [{
+      text: `${group.id === current?.provider && model.id === current?.model ? '✅ ' : ''}${model.name ?? model.id}`,
+      callback_data: `ms:${catalogKey(group.id, model.id)}`,
+    }])
+    const nav = pagerRow(shown, (index) => `mp:${providerKey}:${index}`)
+    if (nav.length > 0) rows.push(nav)
+    rows.push([{ text: tr('⬅️ Providers', '⬅️ Провайдеры'), callback_data: 'o:model' }])
+    await renderMenu(
+      chat.chatId,
+      chat.threadId,
+      messageId ?? chat.panelMessageId,
+      `<b>${escapeHtml(group.name ?? group.id)}</b>\n\n${tr('Choose a model for this session.', 'Выбери модель для этой сессии.')}`,
+      rows,
+      signal,
+    )
+  }
+
+  /**
+   * Previous/next buttons for a paged picker.
+   * @param shown - `pageOf` result.
+   * @param callback - callback data for a page index.
+   * @returns the row, empty for a single page.
+   */
+  function pagerRow(shown, callback) {
+    if (shown.pages <= 1) return []
+    const row = []
+    if (shown.page > 0) row.push({ text: '◀️', callback_data: callback(shown.page - 1) })
+    row.push({ text: `${shown.page + 1}/${shown.pages}`, callback_data: callback(shown.page) })
+    if (shown.page < shown.pages - 1) row.push({ text: '▶️', callback_data: callback(shown.page + 1) })
+    return row
+  }
+
+  /**
+   * Show the reasoning-effort picker: the current model's efforts from the
+   * Web model catalog.
    * @param chat - chat bridge state.
    * @param signal - request lifetime.
+   * @param messageId - panel message to edit.
    */
   async function showEffortMenu(chat, signal, messageId) {
-    await hydrateSelection(chat)
-    const current = selectionForChat(chat).current
+    const catalog = await modelCatalog.load()
+    const current = await currentModel(chat)
+    const model = findModel(catalog, current)?.model
+    const choices = effortChoices(model, defaultEffortLabel())
+    const effective = current?.reasoningEffort ?? model?.reasoning?.defaultEffort
     const rows = []
     let row = []
-    for (const choice of EFFORT_CHOICES) {
+    for (const choice of choices) {
       row.push({
-        text: `${choice.id === current.reasoningEffort ? '✅ ' : ''}${choice.label}`,
-        callback_data: `e:${choice.id}`,
+        text: `${choice.id === effective ? '✅ ' : ''}${choice.name}`,
+        callback_data: `e:${choice.id ?? '-'}`,
       })
       if (row.length === 2) {
         rows.push(row)
@@ -3182,7 +3162,10 @@ export function apply(ctx, config) {
     }
     if (row.length > 0) rows.push(row)
     rows.push([{ text: tr('⬅️ Back', '⬅️ Назад'), callback_data: 'b:menu' }])
-    await renderMenu(chat.chatId, chat.threadId, messageId ?? chat.panelMessageId, `<b>${tr('Reasoning effort', 'Уровень effort')}</b>\n\n${tr('Choose the effort level.', 'Выбери уровень effort.')}`, rows, signal)
+    const text = choices.length === 0
+      ? tr('This model has no effort setting.', 'У этой модели нет настройки effort.')
+      : tr('Choose the effort level.', 'Выбери уровень effort.')
+    await renderMenu(chat.chatId, chat.threadId, messageId ?? chat.panelMessageId, `<b>${tr('Reasoning effort', 'Уровень effort')}</b>\n\n${text}`, rows, signal)
   }
 
   /**
@@ -3226,20 +3209,19 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    */
   async function showContext(chat, signal, messageId) {
-    await hydrateSelection(chat)
-    await loadModelChoices()
-    const current = selectionForChat(chat).current
+    const catalog = await modelCatalog.load()
+    const current = await currentModel(chat)
     const context = await contextSummary(chat)
     const cacheHit = context.cacheRead !== undefined && context.inputTokens !== undefined
       ? `${Math.round((context.cacheRead / Math.max(1, context.inputTokens + context.cacheRead)) * 1000) / 10}%`
       : 'n/a'
     const lines = [
       `<b>${tr('Context', 'Контекст')}</b>`,
-      `${tr('Model', 'Модель')}: ${escapeHtml(modelLabel(current.model))} (<code>${escapeHtml(current.model)}</code>)`,
+      `${tr('Model', 'Модель')}: ${escapeHtml(modelName(catalog, current))} (<code>${escapeHtml(current === undefined ? '?' : `${current.provider}/${current.model}`)}</code>)`,
       `${tr('Window', 'Окно')}: ${formatTokens(context.windowSize)}`,
       `${tr('Last request', 'Последний запрос')}: ${context.used === undefined ? tr('unknown', 'неизвестно') : formatTokens(context.used)}`,
       `${tr('Cache hit', 'Попадание в кэш')}: ${cacheHit}`,
-      `${tr('Effort', 'Effort')}: ${effortLabel(current.reasoningEffort)}`,
+      `${tr('Effort', 'Effort')}: ${escapeHtml(effortName(catalog, current, defaultEffortLabel()))}`,
       `${tr('Mode', 'Режим')}: ${escapeHtml(permissionLabel(currentPermission(chat)))}`,
     ]
     await renderMenu(
@@ -3253,25 +3235,21 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Apply one model/effort selection to a chat.
+   * Switch a topic's session to one model selection the way the Web model
+   * picker does: `sessionController.selectModel` checks the model is
+   * available, records it on the session's agent and saves it as the default
+   * for new sessions. A failure reaches the caller, so the user sees it.
    * @param chat - chat bridge state.
-   * @param next - partial selection.
-   * @param signal - request lifetime.
+   * @param selection - provider, model and optional effort.
    */
-  async function applySelection(chat, next, signal) {
-    const current = selectionForChat(chat).current
-    chat.selection.current = {
-      ...current,
-      ...next,
-      provider: 'deepseek-official',
+  async function selectModel(chat, selection) {
+    const agent = await ensureAgent(chat)
+    const controller = ctx.get('sessionController')
+    if (typeof controller?.selectModel === 'function') {
+      await controller.selectModel({ sessionId: agent.session?.id ?? chat.sessionId, ...selection })
+      return
     }
-    await persistPreferences(chat)
-    try {
-      const agent = await ensureAgent(chat)
-      agent.session.append('model/selection', chat.selection.current)
-    } catch (error) {
-      if (!signal.aborted) warn(`model selection apply failed: ${messageOf(error)}`)
-    }
+    agent.model.select(selection)
   }
 
   /**
@@ -4304,24 +4282,45 @@ export function apply(ctx, config) {
         await sendMenu(chat.id, threadId, chatState, signal, query.message.message_id)
         return
       }
-      if (prefix === 'm' || prefix === 'e' || prefix === 'p') {
+      if (prefix === 'pp' || prefix === 'mp') {
         const chatState = await chatFor(chat.id, threadId)
         if (typeof chatState.sessionId !== 'string') {
           await send(chat.id, tr('This topic is not bound to a session.', 'Этот topic не привязан к сессии.'), signal, threadId)
           return
         }
-        if (prefix === 'm') {
-          if (!MODEL_CHOICES.some((choice) => choice.id === ref)) {
-            await send(chat.id, tr('Unknown model.', 'Неизвестная модель.'), signal, threadId)
+        if (prefix === 'pp') {
+          await showModelMenu(chatState, signal, query.message.message_id, Number(ref))
+        } else {
+          const [providerKey, page] = ref.split(':')
+          await showProviderModels(chatState, providerKey, Number(page), signal, query.message.message_id)
+        }
+        return
+      }
+      if (prefix === 'ms' || prefix === 'e' || prefix === 'p') {
+        const chatState = await chatFor(chat.id, threadId)
+        if (typeof chatState.sessionId !== 'string') {
+          await send(chat.id, tr('This topic is not bound to a session.', 'Этот topic не привязан к сессии.'), signal, threadId)
+          return
+        }
+        if (prefix === 'ms') {
+          // Resolve against a fresh catalog: a key only names a model that is
+          // still offered, never a stale or guessed one.
+          const found = modelByKey(await modelCatalog.load(true), ref)
+          if (found === undefined) {
+            await send(chat.id, tr('That model is no longer available. Open the model menu again.', 'Эта модель больше недоступна. Открой меню моделей заново.'), signal, threadId)
             return
           }
-          await applySelection(chatState, { model: ref }, signal)
+          await selectModel(chatState, pickedSelection(await currentModel(chatState), found.group.id, found.model))
         } else if (prefix === 'e') {
-          if (!EFFORT_CHOICES.some((choice) => choice.id === ref)) {
+          const catalog = await modelCatalog.load()
+          const current = await currentModel(chatState)
+          const model = findModel(catalog, current)?.model
+          const choice = effortChoices(model, defaultEffortLabel()).find((entry) => (entry.id ?? '-') === ref)
+          if (current === undefined || choice === undefined) {
             await send(chat.id, tr('Unknown effort.', 'Неизвестный effort.'), signal, threadId)
             return
           }
-          await applySelection(chatState, { reasoningEffort: ref }, signal)
+          await selectModel(chatState, { provider: current.provider, model: current.model, ...(choice.id === undefined ? {} : { reasoningEffort: choice.id }) })
         } else {
           const service = ctx.get('permissionPresets')
           const agent = await ensureAgent(chatState)
@@ -4332,7 +4331,7 @@ export function apply(ctx, config) {
             await send(chat.id, tr('Failed to apply the access mode.', 'Не удалось применить режим доступа.'), signal, threadId)
             return
           }
-          await persistPreferences(chatState)
+          await persistPermission(chatState)
         }
         await sendMenu(chat.id, threadId, chatState, signal, query.message.message_id)
         return
@@ -4500,10 +4499,10 @@ export function apply(ctx, config) {
    * Detach the current session from a topic. The session stays in DSH and can
    * be bound again later from the session picker.
    * @param chatState - topic state.
-   * @param keepSelection - keep the model/effort/access choice for the next session.
+   * @param keepPermission - keep the access choice for the next session.
    * @returns the detached session id, if any.
    */
-  function releaseTopic(chatState, keepSelection) {
+  function releaseTopic(chatState, keepPermission) {
     const previousId = chatState.sessionId
     cancelQuestionsForChat(chatState)
     chatState.pendingPrompts = []
@@ -4512,13 +4511,7 @@ export function apply(ctx, config) {
     chatState.boundAgent = undefined
     chatState.sessionId = undefined
     chatState.panelMessageId = undefined
-    if (keepSelection && chatState.selection !== undefined) {
-      // Keep the choice, but not the object the old agent still reads.
-      chatState.selection = { current: { ...chatState.selection.current }, assembled: undefined }
-    } else {
-      chatState.selection = undefined
-      chatState.permission = undefined
-    }
+    if (!keepPermission) chatState.permission = undefined
     delete state.threads[chatState.key]
     // The old record would otherwise still point at this topic, and
     // "Continue in Telegram" would reopen it here.
@@ -4542,7 +4535,6 @@ export function apply(ctx, config) {
       if (other !== undefined) {
         other.sessionId = undefined
         other.boundAgent = undefined
-        other.selection = undefined
         other.permission = undefined
       }
     }
@@ -4591,10 +4583,15 @@ export function apply(ctx, config) {
     const previous = typeof chatState.sessionId === 'string' ? state.sessions[chatState.sessionId] : undefined
     const cwd = chatState.cwd ?? previous?.cwd ?? defaultWorkspaceCwd()
     const title = previous?.title
+    // The new session starts on the model the old one runs now, read from its
+    // agent. /new waits for the topic's turn to end, and a fallback plugin's
+    // temporary switch is undone at turn end, so this is the user's choice
+    // (made here or in the Web UI), not a cached copy.
+    const model = await sessionModelOf(ctx, chatState.sessionId)
     const previousId = releaseTopic(chatState, true)
     chatState.cwd = cwd
     await persistState()
-    await ensureAgent(chatState)
+    await ensureAgent(chatState, { model })
     const record = state.sessions[chatState.sessionId]
     if (record !== undefined && typeof title === 'string' && title.length > 0) {
       record.title = title

@@ -56,3 +56,43 @@ export function makeTitleService() {
   }
   return service
 }
+
+/**
+ * Fake `agent.model`, folding the session log the way DSH's modelSelection
+ * projection does: a `model/selection` event is the pending choice, a
+ * `request/header` is the last route used and retires a matching pending
+ * choice; with neither, the agent's options apply.
+ * @param session - fake session with `events` and `append`.
+ * @param options - agent options (`provider`, `model`, `reasoningEffort`), may be getters.
+ * @returns the model handle.
+ */
+export function makeAgentModel(session, options = {}) {
+  const same = (left, right) => left !== null && right !== null
+    && left.provider === right.provider && left.model === right.model && left.reasoningEffort === right.reasoningEffort
+  const recorded = () => {
+    let lastUsed = null
+    let pending = null
+    for (const event of session.events) {
+      if (event.type === 'model/selection') pending = { ...event.data }
+      if (event.type === 'request/header') {
+        const { provider, model, reasoningEffort } = event.data.header.config
+        lastUsed = { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }
+        if (same(pending, lastUsed)) pending = null
+      }
+    }
+    return pending ?? lastUsed
+  }
+  return {
+    current() {
+      const found = recorded()
+      if (found !== null) return { ...found }
+      const { provider, model, reasoningEffort } = options
+      return provider && model ? { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) } : undefined
+    },
+    select(selection) {
+      const next = { provider: selection.provider, model: selection.model, ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }) }
+      if (same(recorded(), next)) return
+      session.append('model/selection', next)
+    },
+  }
+}

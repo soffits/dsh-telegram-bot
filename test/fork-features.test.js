@@ -7,12 +7,37 @@ import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
-import { followupThroughGate, makeTitleService } from './fake-dsh.js'
+import { followupThroughGate, makeAgentModel, makeTitleService } from './fake-dsh.js'
 import { senderLabel } from '../src/message-context.js'
 import { enqueue, waitForResult } from '../src/outbox.js'
 import { isAutoCommandTopic, isPlaceholderTitle, isTopicGone, resolveThreadTarget, topicNameOf, topicTask, topicTitle } from '../src/topics.js'
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** The Web model catalog the fake session controller offers. */
+const CATALOG_GROUPS = [
+  {
+    id: 'anthropic',
+    name: 'Anthropic',
+    models: [
+      { id: 'claude-opus-5-5', name: 'Claude Opus 5.5', reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'medium', name: 'Medium' }, { id: 'high', name: 'High' }], defaultEffort: 'medium' } },
+      { id: 'claude-sonnet-5', name: 'Claude Sonnet 5', reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], defaultEffort: 'high' } },
+    ],
+  },
+  { id: 'aocro-antigravity', name: 'Antigravity', models: [{ id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)' }] },
+  {
+    id: 'deepseek-official',
+    name: 'DeepSeek',
+    models: [{ id: 'deepseek-flash', name: 'DeepSeek V4.1 Flash', reasoning: { efforts: [{ id: 'off', name: 'Off' }, { id: 'high', name: 'High' }, { id: 'max', name: 'Max' }] } }],
+  },
+  {
+    id: 'openrouter',
+    name: 'OpenRouter',
+    models: Array.from({ length: 11 }, (_, index) => ({ id: `vendor/model-${index + 1}`, name: `Router Model ${index + 1}` })),
+  },
+]
+const OPUS = { provider: 'anthropic', model: 'claude-opus-5-5', reasoningEffort: 'medium' }
+const GEMINI = { provider: 'aocro-antigravity', model: 'gemini-4-argon-high' }
 
 /**
  * Fake Host with live agents. Agent-scoped events also reach listeners that
@@ -32,7 +57,7 @@ function makeHost() {
     { id: 'workspace-notes', path: '/tmp/notes', title: 'notes', sessionIds: [], attachSession() {} },
   ]
 
-  function makeAgent(id, cwd) {
+  function makeAgent(id, cwd, options = defaultOptions) {
     const events = new EventEmitter()
     events.setMaxListeners(100)
     const session = {
@@ -51,6 +76,7 @@ function makeHost() {
     const agent = {
       id,
       session,
+      model: makeAgentModel(session, options),
       ctx: { on: (name, fn) => { events.on(name, fn); return () => events.off(name, fn) } },
       status: 'idle',
       received: [],
@@ -87,21 +113,50 @@ function makeHost() {
     return agent
   }
 
+  /** Saved default model, as the Web UI's model picker saves it. */
+  const defaults = {
+    selection: { ...OPUS },
+    saved: [],
+    currentSelection() { return { ...this.selection } },
+    async saveSelection(selection) {
+      this.selection = { ...selection }
+      this.saved.push({ ...selection })
+    },
+  }
+  /** Agent options that follow the default, like the session controller's. */
+  const defaultOptions = {
+    get provider() { return defaults.selection.provider },
+    get model() { return defaults.selection.model },
+    get reasoningEffort() { return defaults.selection.reasoningEffort },
+  }
+  const modelSelections = []
   const services = {
     credentials: { resolve: async () => ({ value: 'TEST_TOKEN' }) },
+    agentDefaultModel: defaults,
     agents: {
       get: (id) => live.get(id),
-      create: async ({ sessionId, meta }) => ({ agent: makeAgent(sessionId, meta?.cwd) }),
-      resume: async ({ resumeSessionId }) => ({ agent: live.get(resumeSessionId) ?? makeAgent(resumeSessionId, undefined) }),
+      create: async ({ sessionId, meta, agentOptions }) => ({ agent: makeAgent(sessionId, meta?.cwd, agentOptions) }),
+      resume: async ({ resumeSessionId, agentOptions }) => ({ agent: live.get(resumeSessionId) ?? makeAgent(resumeSessionId, undefined, agentOptions) }),
     },
     sessionController: {
-      createSession: async (options) => {
+      create: async (options) => {
         sequence += 1
         created.push(options)
-        return { agent: makeAgent(`session-${sequence}`, options.cwd) }
+        return { sessionId: makeAgent(`session-${sequence}`, options.cwd).id }
       },
-      resume: async (id) => ({ agent: live.get(id) ?? makeAgent(id, undefined) }),
+      resolveAgent: async (id) => ({ agent: live.get(id) ?? makeAgent(id, undefined) }),
       fork: async () => ({ sessionId: 'session-fork' }),
+      modelCatalog: async () => ({ default: defaults.currentSelection(), groups: CATALOG_GROUPS, failures: [] }),
+      /** The Web UI's model switch: check, record on the agent, save the default. */
+      selectModel: async (request) => {
+        const { sessionId, ...selection } = request
+        const offered = CATALOG_GROUPS.find((group) => group.id === selection.provider)?.models.some((model) => model.id === selection.model)
+        if (!offered) throw new Error(`model ${selection.provider}/${selection.model} is unavailable`)
+        modelSelections.push(request)
+        live.get(sessionId).model.select(selection)
+        await defaults.saveSelection(selection)
+        return { selected: selection }
+      },
     },
     sessionQuery: {
       listSessions: async () => sessionRecords,
@@ -131,7 +186,7 @@ function makeHost() {
     on(name, fn) { hostEvents.on(name, fn); return () => hostEvents.off(name, fn) },
     effect(fn) { cleanups.push(fn()) },
   }
-  return { ctx, services, live, created, logs, makeAgent, sessionRecords, provided, tools, cleanup: () => { for (const fn of cleanups) fn?.() } }
+  return { ctx, services, live, created, logs, makeAgent, sessionRecords, provided, tools, defaults, modelSelections, cleanup: () => { for (const fn of cleanups) fn?.() } }
 }
 
 /**
@@ -1647,6 +1702,149 @@ test('a [SILENT] message after real text in the same turn is cut, and the text i
     const shown = texts(run.telegram.calls.slice(before), 7001)
     assert.ok(shown.some((text) => text.includes('the long report')), shown.join('\n---\n'))
     assert.ok(!shown.some((text) => (text ?? '').includes('SILENT')), shown.join('\n---\n'))
+  } finally {
+    run.stop()
+  }
+})
+
+/** Record a model request on a fake session, as DSH does before each model call. */
+function requestOn(agent, selection) {
+  agent.session.append('request/header', { header: { config: { ...selection } } })
+}
+
+/** The latest control panel: its model and effort button labels. */
+function panelOf(calls) {
+  const panel = picker(calls, 'o:model')
+  if (panel === undefined) return undefined
+  return {
+    messageId: panel.messageId,
+    model: panel.buttons.find((button) => button.callback_data === 'o:model').text,
+    effort: panel.buttons.find((button) => button.callback_data === 'o:effort').text,
+  }
+}
+
+test('a fallback switch that was undone does not leak into the menu or into /new', async () => {
+  // A stale model copy left in state.json by an older version is ignored.
+  const run = await start({}, {
+    sessions: { 'session-old': { sessionId: 'session-old', chatId: 100, threadId: 7001, title: 'Chat-1', model: 'gemini-4-argon-high', provider: 'aocro-antigravity', effort: 'high' } },
+    threads: { '100:7001': 'session-old' },
+  })
+  try {
+    const old = run.host.makeAgent('session-old', '/tmp/default-workspace')
+    // The fallback plugin's continuation: select Gemini, one request on it,
+    // then the original model is selected again at turn end.
+    requestOn(old, OPUS)
+    old.model.select(GEMINI)
+    requestOn(old, GEMINI)
+    old.model.select(OPUS)
+    run.telegram.push({ message_thread_id: 7001, text: '/menu' })
+    await wait(150)
+    assert.equal(panelOf(run.telegram.calls).model, '🤖 Claude Opus 5.5', 'the menu shows the agent\'s own model')
+    assert.equal(panelOf(run.telegram.calls).effort, '🧠 Effort: Medium')
+
+    run.telegram.push({ message_thread_id: 7001, text: '/new' })
+    await wait(200)
+    const state = await run.readState()
+    const fresh = run.host.live.get(state.threads['100:7001'])
+    assert.notEqual(fresh.id, 'session-old')
+    assert.deepEqual(fresh.model.current(), OPUS, 'the new session runs the restored model')
+    assert.equal(fresh.session.events.filter((event) => event.type === 'model/selection').length, 0, 'the default needs no recorded selection')
+    assert.equal(panelOf(run.telegram.calls).model, '🤖 Claude Opus 5.5', 'and the menu after /new shows it')
+    for (const record of Object.values(state.sessions)) {
+      assert.equal(record.model, undefined, 'no model copy is stored')
+      assert.equal(record.provider, undefined)
+      assert.equal(record.effort, undefined)
+    }
+  } finally {
+    run.stop()
+  }
+})
+
+test('/new carries the model chosen for the previous session, not the default', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const first = run.host.live.get('session-1')
+    // Chosen in the Web UI for this session only; the default stays Opus.
+    const sonnet = { provider: 'anthropic', model: 'claude-sonnet-5', reasoningEffort: 'low' }
+    first.model.select(sonnet)
+    requestOn(first, sonnet)
+    run.telegram.push({ message_thread_id: 7001, text: '/new' })
+    await wait(200)
+    const second = run.host.live.get('session-2')
+    assert.deepEqual(second.model.current(), sonnet, 'the agent really runs the carried model')
+    assert.deepEqual(second.session.events.filter((event) => event.type === 'model/selection').map((event) => event.data), [sonnet])
+    assert.equal(panelOf(run.telegram.calls).model, '🤖 Claude Sonnet 5')
+    assert.deepEqual(run.host.defaults.saved, [], '/new does not change the default')
+  } finally {
+    run.stop()
+  }
+})
+
+test('the model picker lists providers, then their models, and a pick switches the agent', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const agent = run.host.live.get('session-1')
+    run.telegram.push({ message_thread_id: 7001, text: '/menu' })
+    await wait(150)
+    const panel = panelOf(run.telegram.calls)
+    run.telegram.pushCallback(7001, 'o:model', panel.messageId)
+    await wait(150)
+    const providers = picker(run.telegram.calls, 'mp:')
+    assert.deepEqual(providers.buttons.filter((button) => button.callback_data.startsWith('mp:')).map((button) => button.text), [
+      '✅ Anthropic (2)', 'Antigravity (1)', 'DeepSeek (1)', 'OpenRouter (11)',
+    ])
+    for (const button of providers.buttons) assert.ok(Buffer.byteLength(button.callback_data) <= 64, 'callback data fits Telegram')
+
+    // A long provider list pages: 8 models, then the rest.
+    const openrouter = providers.buttons.find((button) => button.text.startsWith('OpenRouter'))
+    run.telegram.pushCallback(7001, openrouter.callback_data, providers.messageId)
+    await wait(150)
+    let models = picker(run.telegram.calls, 'ms:')
+    assert.equal(models.buttons.filter((button) => button.callback_data.startsWith('ms:')).length, 8)
+    const next = models.buttons.find((button) => button.text === '▶️')
+    run.telegram.pushCallback(7001, next.callback_data, models.messageId)
+    await wait(150)
+    models = picker(run.telegram.calls, 'ms:')
+    assert.deepEqual(models.buttons.filter((button) => button.callback_data.startsWith('ms:')).map((button) => button.text), ['Router Model 9', 'Router Model 10', 'Router Model 11'])
+    assert.ok(models.buttons.some((button) => button.text === '◀️'))
+
+    // Pick a model on another provider: Gemini, which has no effort levels.
+    run.telegram.pushCallback(7001, 'o:model', models.messageId)
+    await wait(150)
+    const again = picker(run.telegram.calls, 'mp:')
+    run.telegram.pushCallback(7001, again.buttons.find((button) => button.text.startsWith('Antigravity')).callback_data, again.messageId)
+    await wait(150)
+    const gemini = picker(run.telegram.calls, 'ms:')
+    assert.equal(gemini.buttons[0].text, 'Gemini 4 Argon (High)')
+    run.telegram.pushCallback(7001, gemini.buttons[0].callback_data, gemini.messageId)
+    await wait(150)
+    assert.deepEqual(agent.model.current(), GEMINI, 'the pick reaches the agent')
+    assert.deepEqual(run.host.modelSelections.at(-1), { sessionId: 'session-1', ...GEMINI }, 'through the Web UI\'s selectModel')
+    assert.deepEqual(run.host.defaults.selection, GEMINI, 'saved as the default, like a Web pick')
+    assert.equal(panelOf(run.telegram.calls).model, '🤖 Gemini 4 Argon (High)')
+
+    // Back to Anthropic Sonnet: the effort starts at the model's default, then changes.
+    run.telegram.pushCallback(7001, 'o:model', gemini.messageId)
+    await wait(150)
+    const third = picker(run.telegram.calls, 'mp:')
+    run.telegram.pushCallback(7001, third.buttons.find((button) => button.text.startsWith('Anthropic')).callback_data, third.messageId)
+    await wait(150)
+    const claude = picker(run.telegram.calls, 'ms:')
+    run.telegram.pushCallback(7001, claude.buttons.find((button) => button.text === 'Claude Sonnet 5').callback_data, claude.messageId)
+    await wait(150)
+    assert.deepEqual(agent.model.current(), { provider: 'anthropic', model: 'claude-sonnet-5', reasoningEffort: 'high' })
+    run.telegram.pushCallback(7001, 'o:effort', claude.messageId)
+    await wait(150)
+    const efforts = picker(run.telegram.calls, 'e:')
+    assert.deepEqual(efforts.buttons.filter((button) => button.callback_data.startsWith('e:')).map((button) => button.text), ['Low', '✅ High'])
+    run.telegram.pushCallback(7001, 'e:low', efforts.messageId)
+    await wait(150)
+    assert.deepEqual(agent.model.current(), { provider: 'anthropic', model: 'claude-sonnet-5', reasoningEffort: 'low' })
+    assert.equal(panelOf(run.telegram.calls).effort, '🧠 Effort: Low')
   } finally {
     run.stop()
   }

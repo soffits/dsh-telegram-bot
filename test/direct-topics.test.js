@@ -53,8 +53,8 @@ function makeHost() {
       resume: async ({ resumeSessionId }) => ({ agent: live.get(resumeSessionId) ?? agent }),
     },
     sessionController: {
-      createSession: async () => ({ agent }),
-      resume: async () => ({ agent }),
+      create: async () => ({ sessionId: agent.session.id }),
+      resolveAgent: async () => ({ agent }),
       fork: async () => ({ sessionId: 'session-fork' }),
     },
     sessionQuery: {

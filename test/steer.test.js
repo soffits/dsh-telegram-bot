@@ -1,3 +1,4 @@
+import './setup-home.js'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { busyMode, clearTelegramInbox, hasPendingInput, steerPrompt } from '../src/steer.js'

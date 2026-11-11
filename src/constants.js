@@ -19,20 +19,6 @@ export const FORWARD_BATCH_MS = 1200
 /** Loader row id and settings namespace; the npm package name stays dsh-telegram-bot. */
 export const name = 'telegram-bot'
 
-/** Models exposed by the account route and their short menu labels. */
-const MODEL_CHOICES = [
-  { id: 'deepseek-flash', label: 'DeepSeek-V4.1-Flash' },
-  { id: 'deepseek-v4-pro', label: 'DeepSeek-V4-Pro' },
-]
-
-/** Reasoning efforts accepted by the DeepSeek account adapter. */
-const EFFORT_CHOICES = [
-  { id: 'off', label: 'Off' },
-  { id: 'low', label: 'Low' },
-  { id: 'high', label: 'High' },
-  { id: 'max', label: 'Max' },
-]
-
 /** Command menu shown by Telegram clients while the user types `/`. */
 const BOT_COMMANDS = [
   { command: 'start', description: 'Start the bot and show help' },
@@ -86,8 +72,6 @@ const STATUS_DIR = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'telegr
 
 
 export {
-  MODEL_CHOICES,
-  EFFORT_CHOICES,
   BOT_COMMANDS,
   BOT_COMMANDS_RU,
   MAX_TELEGRAM_TEXT,

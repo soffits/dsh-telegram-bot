@@ -35,8 +35,8 @@ function makeContext(agent) {
     credentials: { resolve: async () => ({ value: 'TEST_TOKEN' }) },
     agents: { get: () => undefined, create: async () => ({ agent }), resume: async () => ({ agent }) },
     sessionController: {
-      createSession: async () => ({ agent }),
-      resume: async () => ({ agent }),
+      create: async () => ({ sessionId: agent.session.id }),
+      resolveAgent: async () => ({ agent }),
       fork: async () => ({ sessionId: 'session-fork' }),
     },
     sessionQuery: {

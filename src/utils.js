@@ -81,6 +81,22 @@ function allowedChatsOf(config) {
 }
 
 /**
+ * The chat that gets lifecycle notices (bot enabled, Threaded mode warnings):
+ * `controlChat` when set, otherwise the private chat of the first allowed
+ * user, whose chat id is their user id. Both come from config, so a message
+ * from another allowed user never moves it.
+ * @returns a chat id or @channelname, or undefined when there is none (the
+ * first allowed user is a @username and `controlChat` is empty).
+ */
+function controlChatOf(config) {
+  const configured = readLive(config.controlChat, '')
+  const chat = typeof configured === 'string' ? configured.trim() : ''
+  if (chat.length > 0) return /^-?\d+$/u.test(chat) ? Number(chat) : chat
+  const owner = String(allowedUsersOf(config)[0] ?? '').trim()
+  return /^\d+$/u.test(owner) ? Number(owner) : undefined
+}
+
+/**
  * Whether one user is on the allowlist.
  * @param from - Telegram user.
  * @param allowedUsers - configured entries.
@@ -117,6 +133,7 @@ export {
   isEnabled,
   allowedUsersOf,
   allowedChatsOf,
+  controlChatOf,
   userAllowed,
   chatAllowed,
 }

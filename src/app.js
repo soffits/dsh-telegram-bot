@@ -35,7 +35,7 @@ import {
 } from './formatting.js'
 import { admitText } from './admission.js'
 import { STEER_REACTION, busyMode, clearTelegramInbox, hasPendingInput, steerPrompt } from './steer.js'
-import { loadState, loadTopics, STATE_PATH, TOPICS_PATH } from './state.js'
+import { loadState, STATE_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
 import { createOutbox } from './outbox.js'
@@ -48,6 +48,7 @@ import { catalogKey, createModelCatalog, defaultModelOf, effortChoices, effortNa
 import {
   allowedChatsOf,
   allowedUsersOf,
+  controlChatOf,
   chatAllowed,
   isEnabled,
   messageOf,
@@ -93,15 +94,11 @@ export function apply(ctx, config) {
   const outboundStates = new Map()
   /** Agent API calls use this lifetime; the bot polling lifetime is separate. */
   const bridgeAbort = new AbortController()
-  /** Control chat id used for lifecycle notifications. */
-  let topics = { chatId: 0 }
-  /** Resolves after the mapping and topic files have been read. */
   /** True once state.json has been read; Host event listeners need a synchronous lookup. */
   let stateLoaded = false
-  const stateReady = Promise.all([
-    loadState().then((loaded) => { state = loaded }),
-    loadTopics().then((loaded) => { topics = loaded }),
-  ]).catch((error) => warn(`state load failed: ${messageOf(error)}`))
+  /** Resolves after the mapping file has been read. */
+  const stateReady = loadState().then((loaded) => { state = loaded })
+    .catch((error) => warn(`state load failed: ${messageOf(error)}`))
     .finally(() => {
       stateLoaded = true
       state.directChats ??= {}
@@ -2951,23 +2948,15 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Remember the chat that owns lifecycle notifications (All, thread 0).
-   * @param chatId - control chat id.
-   */
-  async function rememberControlChat(chatId) {
-    if (topics.chatId === chatId) return
-    topics = { chatId }
-    await mkdir(STATUS_DIR, { recursive: true })
-    await writeFile(TOPICS_PATH, JSON.stringify(topics, null, 2) + '\n', { mode: 0o600 })
-  }
-
-  /**
-   * Publish a lifecycle notification into All.
+   * Publish a lifecycle notification into All of the control chat
+   * (`controlChatOf`). It comes from config only, so a message from another
+   * allowed user never moves it.
    * @param text - HTML-safe body.
    * @param signal - request lifetime.
    */
   async function notifyAll(text, signal) {
-    if (topics.chatId === 0) return false
+    const chatId = controlChatOf(config)
+    if (chatId === undefined) return false
     let lastError
     // Startup messages are easy to lose during a restart: the bot may still be
     // reconnecting to the network or Telegram may answer 429. Retry a few times
@@ -2975,7 +2964,7 @@ export function apply(ctx, config) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
         await call('sendMessage', {
-          chat_id: topics.chatId,
+          chat_id: chatId,
           text,
           parse_mode: 'HTML',
         }, signal)
@@ -4061,7 +4050,7 @@ export function apply(ctx, config) {
     state.threads[`${chatId}:${threadId}`] = sessionId
     await persistState()
     forgetChatState(chatId, threadId)
-    await notifyAll(`📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
+    await send(chatId, `📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
     await deliverSessionTopic(record, chatId, signal)
     return record
   }
@@ -4826,7 +4815,6 @@ export function apply(ctx, config) {
       lastOutcome: allowedUser && allowedChat ? 'allowed' : 'denied',
     })
     if (allowedUser && allowedChat) {
-      await rememberControlChat(chat.id)
       if (chat.type === 'private') rememberDirectChat(chat.id)
       if (typeof directTopicId === 'number') rememberDirectTopic(chat.id, threadId, directTopicId)
     }
@@ -4906,7 +4894,6 @@ export function apply(ctx, config) {
     }
 
     if (command === '/start' || command === '/help') {
-      await rememberControlChat(chat.id)
       await send(
         chat.id,
         `<b>DeepSeek Harness Telegram bot</b>\n\n` +

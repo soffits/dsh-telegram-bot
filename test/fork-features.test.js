@@ -302,14 +302,13 @@ function makeTelegram() {
 }
 
 /** Start the plugin against fresh fakes and an optional initial state. */
-async function start(config = {}, initialState = {}, topicsFile = { chatId: 100 }) {
+async function start(config = {}, initialState = {}) {
   await mkdir(STATUS_DIR, { recursive: true })
   // Message ids restart with every fake bot; old sends must not match them.
   await rm(join(STATUS_DIR, 'sent-messages.json'), { force: true })
   await rm(join(STATUS_DIR, 'stickers.json'), { force: true })
   await rm(join(STATUS_DIR, 'sticker-previews'), { recursive: true, force: true })
   await writeFile(join(STATUS_DIR, 'state.json'), JSON.stringify({ version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, ...initialState }))
-  await writeFile(join(STATUS_DIR, 'topics.json'), JSON.stringify(topicsFile))
   const host = makeHost()
   const telegram = makeTelegram()
   const originalRequest = https.request
@@ -824,6 +823,52 @@ test('a thread-id send goes to the chat that owns the thread, not the chat that 
     await assert.rejects(run.host.provided.telegramTopics.send({ to: 9999, text: 'x' }), (error) => /Unknown thread id 9999: the bot knows no topic with that id in any chat/.test(error.message) && error.retryable === false)
     assert.equal(run.telegram.calls.slice(count).filter((call) => call.method === 'sendMessage').length, 0)
     assert.deepEqual(run.host.provided.telegramTopics.topics().map((topic) => [topic.chatId, topic.threadId]), [[100, 7100], [200, 8100]])
+  } finally {
+    run.stop()
+  }
+})
+
+/** Chats that got the "Polling started" lifecycle notice. */
+const startupNoticeChats = (calls) => calls
+  .filter((call) => call.method === 'sendMessage' && /Polling started/u.test(call.body.text))
+  .map((call) => call.body.chat_id)
+
+test('lifecycle notices stay with the first allowed user when another allowed user writes', async () => {
+  // A private chat's id is the user's id: 42 owns chat 42, 43 owns chat 43.
+  const users = { allowedUsers: ['42', '43'], allowedChats: [] }
+  let run = await start(users)
+  try {
+    await wait(100)
+    assert.deepEqual(startupNoticeChats(run.telegram.calls), [42])
+    run.telegram.push({ chat: { id: 43, type: 'private' }, from: { id: 43 }, text: 'hello from the second user' })
+    run.telegram.push({ chat: { id: 43, type: 'private' }, from: { id: 43 }, text: '/start' })
+    await wait(250)
+    assert.ok(run.telegram.calls.some((call) => call.method === 'sendMessage' && call.body.chat_id === 43 && /Telegram bot enabled/u.test(call.body.text)), '/start is answered where it was sent')
+  } finally {
+    run.stop()
+  }
+  // The next start still notifies the first allowed user.
+  run = await start(users)
+  try {
+    await wait(100)
+    assert.deepEqual(startupNoticeChats(run.telegram.calls), [42])
+  } finally {
+    run.stop()
+  }
+})
+
+test('controlChat picks the lifecycle chat; a @username owner without it gets no notice', async () => {
+  let run = await start({ allowedUsers: ['42'], controlChat: ' -1005550001 ' })
+  try {
+    await wait(100)
+    assert.deepEqual(startupNoticeChats(run.telegram.calls), [-1005550001])
+  } finally {
+    run.stop()
+  }
+  run = await start({ allowedUsers: ['@owner', '42'] })
+  try {
+    await wait(100)
+    assert.deepEqual(startupNoticeChats(run.telegram.calls), [], 'a username has no known chat id')
   } finally {
     run.stop()
   }

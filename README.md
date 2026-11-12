@@ -91,6 +91,7 @@ Restart `dsh web` after installing or updating the plugin. Then open **Settings 
 | `agentPreset` | Preset mounted for Telegram sessions; default `standard` |
 | Allowed users | Telegram user ids or `@usernames` |
 | Allowed chats | Telegram chat ids or `@channelnames` |
+| `controlChat` | Chat id or `@channelname` for lifecycle notices ("Telegram bot enabled", Threaded mode warnings); empty means the private chat of the first allowed user |
 | Show model thinking | Show reasoning in a temporary message |
 | Show tool calls | Show tool calls in a temporary message |
 | Show turns from other clients (`mirrorTurns`) | Mirror turns started outside Telegram into the bound topic; default on |
@@ -102,7 +103,7 @@ Restart `dsh web` after installing or updating the plugin. Then open **Settings 
 | Bot language | `en` (default) or `ru` |
 | Enable bot | Start or pause Telegram polling |
 
-The voice fields and `busyMessages` have no controls on the settings page yet; set them in the profile's `cordis.patch.yml` under the `telegram-bot` row's `config`.
+The voice fields, `controlChat` and `busyMessages` have no controls on the settings page yet; set them in the profile's `cordis.patch.yml` under the `telegram-bot` row's `config`.
 
 The token field only reports whether a token is configured. A token supplied through the environment cannot be overwritten from the page.
 
@@ -112,7 +113,7 @@ The token field only reports whether a token is configured. A token supplied thr
 2. In @BotFather open **Bot Settings → Threaded mode** and enable it. Leave **Disallow users to create new threads** off.
 3. Open the bot chat, tap the bot name and enable **Topics**.
 4. Send `/start` in **All**. With an empty allowlist the bot replies with your user and chat ids.
-5. Add your user id to **Allowed users** and press **Save**.
+5. Add your user id to **Allowed users** and press **Save**. List your own id first: lifecycle notices go to the first allowed user's private chat unless `controlChat` names another chat. If the first entry is a `@username`, set `controlChat`, since a username has no chat id the bot can send to.
 6. Create a topic and send a message in it. Choose a workspace, then **New session** or one of the listed sessions. Your message runs in that session.
 
 A message sent in **All** makes Telegram create a topic for it; the bot treats it like any new topic and asks for the workspace (if Telegram delivers it to All instead, the bot opens a new topic in the default workspace). Chat-wide commands are the exception: when `/start`, `/help`, `/sessions`, `/status`, `/menu`, `/id`, `/ping` or `/restart` is sent in **All** and Telegram makes a topic for it, the bot answers in **All** and deletes that topic. If the topic cannot be deleted, it leaves a short note there. `/sessions` in **All** still opens existing sessions in new topics, and commands such as `/fork` and `/last` work as before.

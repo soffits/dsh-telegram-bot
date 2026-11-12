@@ -24,6 +24,11 @@ export const Config = z.object({
    */
   allowedChats: z.array(z.string()).default([]).volatile(),
   /**
+   * Chat id (or @channelname) that gets lifecycle notices such as "Telegram
+   * bot enabled". Empty means the private chat of the first allowed user.
+   */
+  controlChat: z.string().default('').volatile(),
+  /**
    * Monotonic value the Restart button writes. Any settings update restarts the
    * runtime, but this field lets the button request a restart even when every
    * other field is unchanged.

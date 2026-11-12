@@ -285,6 +285,8 @@ test('fork creates one new topic with the requested name', async () => {
     const topics = result.calls.filter((call) => call.method === 'createForumTopic')
     assert.equal(topics.length, 2, 'initial topic plus fork topic')
     assert.equal(topics[1].body.name, 'branch')
+    const opened = result.calls.filter((call) => call.method === 'sendMessage' && /Session opened/u.test(call.body.text))
+    assert.deepEqual(opened.map((call) => [call.body.chat_id, call.body.message_thread_id]), [[100, undefined]], 'the fork notice goes to All of the chat that forked')
     assert.equal(result.logs.filter((line) => line.startsWith('W ') && !line.includes('getUpdates failed')).length, 0, result.logs.join('\n'))
   } finally {
     result.cleanup()

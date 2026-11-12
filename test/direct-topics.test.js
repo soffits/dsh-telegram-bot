@@ -169,7 +169,6 @@ test('private-chat topics send with message_thread_id and edit by message id', a
     directChats: { 100: true },
     directTopics: { '100:7001': 2597 },
   }))
-  await writeFile(join(STATUS_DIR, 'topics.json'), JSON.stringify({ chatId: 100 }))
   const host = makeHost()
   const telegram = makeTelegram()
   const originalRequest = https.request

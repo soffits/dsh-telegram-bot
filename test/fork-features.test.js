@@ -1302,9 +1302,7 @@ test('a topic session is titled "<topic name> · <DSH title>" and a rename moves
     await wait(50)
     assert.deepEqual(titles.refreshed, [agent.id])
     assert.equal(agent.session.title, `${first} · Generated task`)
-    assert.equal(agent.session.titleSource.kind, 'fallback', 'the prefixed title is not a provider title, so the provider never anchors on the prefix')
-    const fold = titles.get(agent.session)
-    assert.notEqual(fold.source.kind, 'provider', 'no currentTitle anchor reaches the all-prompts provider')
+    assert.equal(agent.session.titleSource.kind, 'provider', 'the prefixed title keeps the provider source, so automatic titling continues')
 
     // Later generated titles get the prefix too, once.
     agent.session.append('session/title', { title: 'Better task', messageSeqs: [1], source: { kind: 'provider', provider: 'fake' } })

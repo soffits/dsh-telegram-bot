@@ -3382,8 +3382,8 @@ export function apply(ctx, config) {
    * Bring a topic session's title to "<topic name> · <conversation title>".
    * DSH writes the conversation part (its title provider, or the first-prompt
    * fallback); DSH has no title hook, so the bot adds the prefix by appending
-   * the title event with a fallback source (never a provider anchor), which
-   * keeps automatic titling going. Before a conversation title exists the title is the bare topic
+   * the same title event with the same source, which keeps automatic titling
+   * going. Before a conversation title exists the title is the bare topic
    * name, set as a user title so DSH's fallback does not replace it; the bot
    * asks DSH for the real title at the first model request (see
    * `startTopicTitle`). A title someone typed is left alone.
@@ -3419,12 +3419,7 @@ export function apply(ctx, config) {
       session.append('session/title', {
         title: wanted,
         messageSeqs: Array.isArray(current.messageSeqs) ? [...current.messageSeqs] : [],
-        // Not the provider's source: an all-prompts provider anchors on a
-        // provider title, and with the prefix in it (some routes pass the
-        // whole request on) the next generation collapsed to the bare topic
-        // name. A fallback title is never an anchor and never blocks a new
-        // generated one.
-        source: { kind: 'fallback' },
+        source: current.source,
       })
     } catch (error) {
       warn(`session title not set for ${session?.id}: ${messageOf(error)}`)

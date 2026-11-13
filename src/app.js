@@ -44,7 +44,7 @@ import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.j
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference, senderLabel } from './message-context.js'
 import { createSentLog } from './sent-log.js'
-import { catalogKey, createModelCatalog, defaultModelOf, effortChoices, effortName, findModel, modelByKey, modelName, pageOf, pickedSelection, providerByKey, sameSelection, sessionModelOf } from './models.js'
+import { catalogKey, createModelCatalog, defaultModelOf, effortChoices, healGoneRoute, effortName, findModel, modelByKey, modelName, pageOf, pickedSelection, providerByKey, sameSelection, sessionModelOf } from './models.js'
 import {
   allowedChatsOf,
   allowedUsersOf,
@@ -1964,6 +1964,22 @@ export function apply(ctx, config) {
    *   (`/new` carries the previous session's model); ignored on resume.
    * @returns the live agent.
    */
+  /**
+   * Move a bound session whose model route is gone from this host onto the
+   * default model (see `healGoneRoute`), so the topic keeps answering.
+   * @param agent - the session's live agent.
+   */
+  async function healRoute(agent) {
+    try {
+      const moved = await healGoneRoute(ctx, agent)
+      if (moved !== undefined) {
+        warn(`${agent.session?.id ?? agent.id} was on ${moved.from.provider}/${moved.from.model}, which this host no longer has; it continues on the default ${moved.to.provider}/${moved.to.model}`)
+      }
+    } catch (error) {
+      warn(`could not check the model route of ${agent.session?.id ?? agent.id}: ${messageOf(error)}`)
+    }
+  }
+
   async function ensureAgent(chat, options = {}) {
     const agents = ctx.get('agents')
     if (agents === undefined) throw new Error('dsh-agent is not mounted in this profile')
@@ -1979,6 +1995,7 @@ export function apply(ctx, config) {
         if (typeof live.session?.header?.cwd === 'string') chat.cwd = live.session.header.cwd
         attachAgent(live, chat)
         await syncPermission(chat, live)
+        await healRoute(live)
         return live
       }
       try {
@@ -1988,6 +2005,7 @@ export function apply(ctx, config) {
         if (typeof agent?.session?.header?.cwd === 'string') chat.cwd = agent.session.header.cwd
         attachAgent(agent, chat)
         await syncPermission(chat, agent)
+        await healRoute(agent)
         info(`resumed Telegram session ${chat.sessionId}`)
         return agent
       } catch (error) {

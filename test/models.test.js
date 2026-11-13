@@ -42,3 +42,24 @@ test('pages are clamped', () => {
   assert.deepEqual(pageOf(items, Number.NaN).page, 0)
   assert.deepEqual(pageOf([], 0), { items: [], page: 0, pages: 1 })
 })
+
+test('a session on a route this host no longer has moves to the default model', async () => {
+  const { healGoneRoute } = await import('../src/models.js')
+  const gone = Object.assign(new Error('no adapter registered for provider "anthropic"'), { code: 'NO_ADAPTER' })
+  const selected = []
+  const agentOn = (route) => ({ model: { current: () => route, select: (s) => selected.push(s) } })
+  const ctxWith = (resolve) => ({
+    get: (name) => (name === 'llm' ? { resolveCallConfig: resolve }
+      : name === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'claude-code', model: 'claude-opus-5-5', reasoningEffort: 'high' }) }
+        : undefined),
+  })
+  const moved = await healGoneRoute(ctxWith(async () => { throw gone }), agentOn({ provider: 'anthropic', model: 'claude-opus-5-5', reasoningEffort: 'medium' }))
+  assert.deepEqual(moved, { from: { provider: 'anthropic', model: 'claude-opus-5-5', reasoningEffort: 'medium' }, to: { provider: 'claude-code', model: 'claude-opus-5-5', reasoningEffort: 'high' } })
+  assert.deepEqual(selected, [{ provider: 'claude-code', model: 'claude-opus-5-5', reasoningEffort: 'high' }])
+  selected.length = 0
+  assert.equal(await healGoneRoute(ctxWith(async (c) => c), agentOn({ provider: 'claude-code', model: 'claude-sonnet-5-5' })), undefined, 'a working route stays')
+  const down = Object.assign(new Error('timeout'), { code: 'TIMEOUT' })
+  assert.equal(await healGoneRoute(ctxWith(async () => { throw down }), agentOn({ provider: 'openrouter', model: 'x' })), undefined, 'a route that is only failing now stays')
+  assert.equal(await healGoneRoute(ctxWith(async () => { throw gone }), agentOn(undefined)), undefined)
+  assert.deepEqual(selected, [])
+})

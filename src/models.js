@@ -79,6 +79,36 @@ export function defaultModelOf(ctx) {
   return undefined
 }
 
+/** Failure codes that mean a route is gone from this host, not briefly down. */
+const GONE_ROUTE_CODES = new Set(['NO_ADAPTER', 'UNKNOWN_MODEL'])
+
+/**
+ * Move a session off a model route this host no longer has (a provider that
+ * was removed, a model dropped from its catalog) onto the default model, so
+ * a topic left on that route answers again instead of failing every turn
+ * with NO_ADAPTER. The switch is recorded on the session only, the way a job
+ * picks its model; the saved default stays as it is. Routes that resolve, or
+ * fail for any other reason, are left alone.
+ * @param ctx - Host context (`llm`, `agentDefaultModel`).
+ * @param agent - the session's live agent.
+ * @returns the dead route and the default it moved to, or undefined.
+ */
+export async function healGoneRoute(ctx, agent) {
+  const current = agent?.model?.current?.()
+  const llm = ctx.get('llm')
+  if (current === undefined || typeof llm?.resolveCallConfig !== 'function') return undefined
+  try {
+    await llm.resolveCallConfig(toSelection(current))
+    return undefined
+  } catch (error) {
+    if (!GONE_ROUTE_CODES.has(error?.code)) return undefined
+  }
+  const fallback = defaultModelOf(ctx)
+  if (fallback === undefined || (fallback.provider === current.provider && fallback.model === current.model)) return undefined
+  agent.model.select(fallback)
+  return { from: toSelection(current), to: fallback }
+}
+
 /**
  * Whether two selections name the same provider, model and effort.
  * @param left - first selection.

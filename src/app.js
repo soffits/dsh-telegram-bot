@@ -83,7 +83,7 @@ export function apply(ctx, config) {
   /** Invalidates a start that was overtaken by stop/restart. */
   let startEpoch = 0
   /** Durable chat → session mapping. */
-  let state = { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, directChats: {}, directTopics: {}, goalPanels: {} }
+  let state = { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, directChats: {}, directTopics: {}, goalPanels: {}, pickedModels: {} }
   /** Serializes state-file writes. */
   let stateWrite = Promise.resolve()
   /** Diagnostic counter for topic creation attempts. */
@@ -3232,6 +3232,13 @@ export function apply(ctx, config) {
    * @param selection - provider, model and optional effort.
    */
   async function selectModel(chat, selection) {
+    // Remembered per topic, so /new keeps a model picked here and only that: a session that merely
+    // ran on an older default starts its successor on today's default.
+    const picked = { provider: selection.provider, model: selection.model }
+    if (selection.reasoningEffort !== undefined) picked.reasoningEffort = selection.reasoningEffort
+    state.pickedModels ??= {}
+    state.pickedModels[`${chat.chatId}:${chat.threadId}`] = picked
+    void persistState()
     const agent = await ensureAgent(chat)
     const controller = ctx.get('sessionController')
     if (typeof controller?.selectModel === 'function') {
@@ -4574,11 +4581,10 @@ export function apply(ctx, config) {
     const previous = typeof chatState.sessionId === 'string' ? state.sessions[chatState.sessionId] : undefined
     const cwd = chatState.cwd ?? previous?.cwd ?? defaultWorkspaceCwd()
     const title = previous?.title
-    // The new session starts on the model the old one runs now, read from its
-    // agent. /new waits for the topic's turn to end, and a fallback plugin's
-    // temporary switch is undone at turn end, so this is the user's choice
-    // (made here or in the Web UI), not a cached copy.
-    const model = await sessionModelOf(ctx, chatState.sessionId)
+    // The new session starts on the model last picked in this topic's model
+    // menu, else on the current default. Copying the old session's model carried
+    // an old default forward after the default changed (2026-11-12).
+    const model = state.pickedModels?.[`${chatState.chatId}:${chatState.threadId}`]
     const previousId = releaseTopic(chatState, true)
     chatState.cwd = cwd
     await persistState()

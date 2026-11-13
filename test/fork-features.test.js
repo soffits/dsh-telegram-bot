@@ -1854,22 +1854,20 @@ test('a fallback switch that was undone does not leak into the menu or into /new
   }
 })
 
-test('/new carries the model chosen for the previous session, not the default', async () => {
+test('/new starts on the default unless a model was picked in the topic', async () => {
   const run = await start()
   try {
     run.telegram.push({ message_thread_id: 1, text: 'hello' })
     await wait(200)
     const first = run.host.live.get('session-1')
-    // Chosen in the Web UI for this session only; the default stays Opus.
+    // The old session ran on another model (an older default, a Web UI choice): not carried.
     const sonnet = { provider: 'anthropic', model: 'claude-sonnet-5', reasoningEffort: 'low' }
     first.model.select(sonnet)
     requestOn(first, sonnet)
     run.telegram.push({ message_thread_id: 7001, text: '/new' })
     await wait(200)
     const second = run.host.live.get('session-2')
-    assert.deepEqual(second.model.current(), sonnet, 'the agent really runs the carried model')
-    assert.deepEqual(second.session.events.filter((event) => event.type === 'model/selection').map((event) => event.data), [sonnet])
-    assert.equal(panelOf(run.telegram.calls).model, '🤖 Claude Sonnet 5')
+    assert.deepEqual(second.session.events.filter((event) => event.type === 'model/selection'), [], 'follows the default')
     assert.deepEqual(run.host.defaults.saved, [], '/new does not change the default')
   } finally {
     run.stop()

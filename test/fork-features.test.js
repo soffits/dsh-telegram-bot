@@ -925,7 +925,8 @@ test('the agent tool and the file spool use the same path', async () => {
     const tool = run.host.tools.get('telegram_send')
     assert.ok(tool, 'tool registered')
     const own = await tool.execute({ thread: '7100', text: 'from my own session' }, { agent: { id: 'session-notify' } })
-    assert.equal(own.recorded, false, 'the sending session gets no copy of its own message')
+    assert.equal(own.recorded, true, 'the sending session gets its own copy, so the Web UI shows it')
+    assert.match(agent.injected[0].content[0].text, /^\[Sent to the Telegram topic "Notify" by this session\]\nfrom my own session$/u)
     const other = await tool.execute({ thread: '7100', text: 'from elsewhere' }, { agent: { id: 'session-other' } })
     assert.equal(other.recorded, true)
     const id = await enqueue({ to: '7100', text: 'from cron', from: { label: 'cron' } })
@@ -935,7 +936,86 @@ test('the agent tool and the file spool use the same path', async () => {
     const bad = await waitForResult(await enqueue({ to: '4242', text: 'x' }), 3000)
     assert.equal(bad.ok, false)
     assert.match(bad.error, /Unknown thread id 4242/)
-    assert.equal(agent.injected.length, 2)
+    assert.equal(agent.injected.length, 3)
+  } finally {
+    run.stop()
+  }
+})
+
+/** Smallest byte strings the image sniffer accepts. */
+const PNG_BYTES = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('png-body')])
+const GIF_BYTES = Buffer.from('GIF89a-gif-body', 'latin1')
+
+test('a session sending into its own topic records the pictures and files it sent, for the Web UI', async () => {
+  const run = await start({}, notifyState)
+  try {
+    const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    agent.status = 'running'
+    const picture = join(STATUS_DIR, 'cat.png')
+    const animation = join(STATUS_DIR, 'dance.gif')
+    const report = join(STATUS_DIR, 'notes.txt')
+    await writeFile(picture, PNG_BYTES)
+    await writeFile(animation, GIF_BYTES)
+    await writeFile(report, 'plain text')
+    const tool = run.host.tools.get('telegram_send')
+    const result = await tool.execute({ thread: '7100', text: 'look', files: [picture, animation, report] }, { agent: { id: 'session-notify' } })
+    assert.equal(result.recorded, true)
+    assert.equal(agent.received.length, 0, 'no turn is started')
+    assert.equal(agent.injected.length, 1, 'a running session gets the copy at its next step')
+    const [header, ...blocks] = agent.injected[0].content
+    assert.equal(header.text, '[Sent to the Telegram topic "Notify" by this session]\nlook')
+    assert.deepEqual(blocks.map((block) => [block.type, block.attachment.mediaType ?? null, block.attachment.name]), [
+      ['image', 'image/png', 'cat.png'],
+      ['image', 'image/gif', 'dance.gif'],
+      ['file', null, 'notes.txt'],
+    ])
+    assert.match(agent.injected[0].source.rpcId, /^telegram-post:/u)
+    const log = JSON.parse(await readFile(join(STATUS_DIR, 'sent-messages.json'), 'utf8'))
+    assert.equal(log.entries.at(-1).recorded, true)
+    assert.equal(log.entries.at(-1).boundSession, 'session-notify')
+    // The copy is not echoed back into the topic as a Web message.
+    agent.emit('session/event', { id: 'session-notify' }, { type: 'user/message', data: agent.injected[0] })
+    await wait(100)
+    assert.ok(!texts(run.telegram.calls, 7100).some((text) => /From Web/u.test(text ?? '')))
+  } finally {
+    run.stop()
+  }
+})
+
+test('an idle session gets a send appended at once; a picture DSH refuses stays a file and an unstorable file stays a line', async () => {
+  const run = await start({}, notifyState)
+  try {
+    const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    agent.session.append('system/message', { turn: 1, step: 1, message: { id: 's1', role: 'system', content: [], source: { kind: 'system-prompt' } } })
+    agent.session.surface = { get nodes() { return agent.session.events.filter((event) => event.type.endsWith('/message')).map((event) => event.seq) } }
+    agent.session.eventAt = (seq) => agent.session.events[seq]
+    const store = run.host.services.attachments
+    const saveImage = store.saveImage
+    const saveFile = store.saveFile
+    store.saveImage = async () => { throw new Error('image too large') }
+    store.saveFile = async ({ data, name }) => {
+      if (name === 'broken.bin') throw new Error('disk full')
+      return saveFile({ data, name })
+    }
+    const picture = join(STATUS_DIR, 'huge.png')
+    const broken = join(STATUS_DIR, 'broken.bin')
+    await writeFile(picture, PNG_BYTES)
+    await writeFile(broken, 'x')
+    try {
+      const result = await run.host.provided.telegramTopics.send({ to: 7100, text: 'daily', files: [picture, broken], from: { job: 'Digest', sessionId: 'session-job' } })
+      assert.equal(result.recorded, true)
+    } finally {
+      store.saveImage = saveImage
+      store.saveFile = saveFile
+    }
+    assert.equal(agent.injected.length, 0, 'nothing waits in the inbox')
+    const messages = agent.session.events.filter((event) => event.type === 'user/message')
+    assert.equal(messages.length, 1)
+    const content = messages[0].data.content
+    assert.match(content[0].text, /^\[Sent to the Telegram topic "Notify" by job "Digest" from session session-job\]\ndaily$/u)
+    assert.equal(content[1].type, 'file')
+    assert.equal(content[1].attachment.name, 'huge.png')
+    assert.deepEqual(content[2], { type: 'text', text: '[File broken.bin was sent but could not be stored here: disk full]' })
   } finally {
     run.stop()
   }
@@ -1678,9 +1758,16 @@ test('telegram_sticker finds, views, loads sets and sends stickers into a topic'
     assert.equal(call.body.message_thread_id, 7100)
     assert.equal(sent.recorded, true)
     assert.match(agent.injected.at(-1).content[0].text, /\[Sticker 😾 from set "CatMoods" \(Cat Moods\) \(sticker U-SET-1\)\]/u)
+    assert.equal(agent.injected.at(-1).content[1].type, 'image', 'the sticker shows as its picture')
+    assert.equal(agent.injected.at(-1).content[1].attachment.mediaType, 'image/webp')
     const log = JSON.parse(await readFile(join(STATUS_DIR, 'sent-messages.json'), 'utf8'))
     assert.deepEqual(log.entries.at(-1).sticker, { id: 'U-SET-1', emoji: '😾', setName: 'CatMoods' })
     assert.deepEqual(log.entries.at(-1).messageIds, sent.messageIds)
+    // The bound session's own sticker is recorded the same way.
+    const own = await tool.execute({ action: 'send', id: 'U-SET-2', thread: '7100' }, { agent: { id: 'session-notify' } })
+    assert.equal(own.recorded, true)
+    assert.match(agent.injected.at(-1).content[0].text, /^\[Sent to the Telegram topic "Notify" by this session\]\n\[Sticker 😻/u)
+    assert.equal(agent.injected.at(-1).content[1].type, 'image')
   } finally {
     run.stop()
   }

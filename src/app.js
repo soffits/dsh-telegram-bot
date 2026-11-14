@@ -1060,6 +1060,7 @@ export function apply(ctx, config) {
     if (data.length >= 12 && data.toString('latin1', 0, 4) === 'RIFF' && data.toString('latin1', 8, 12) === 'WEBP') return { mediaType: 'image/webp', ext: '.webp' }
     if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return { mediaType: 'image/jpeg', ext: '.jpg' }
     if (data.length >= 8 && data.toString('latin1', 1, 4) === 'PNG') return { mediaType: 'image/png', ext: '.png' }
+    if (data.length >= 6 && data.toString('latin1', 0, 4) === 'GIF8') return { mediaType: 'image/gif', ext: '.gif' }
     return undefined
   }
 
@@ -3336,18 +3337,31 @@ export function apply(ctx, config) {
    * @param summary - one-line label the Web UI shows.
    */
   function recordNote(agent, text, summary) {
-    const message = {
+    recordMessage(agent, {
       id: randomUUID(),
       role: 'user',
       content: [{ type: 'text', text }],
       source: { kind: 'telegram-topic', form: 'notice', summary: summary.slice(0, 120) },
-    }
+    })
+  }
+
+  /**
+   * Put a message into a session without starting a turn: appended now to an
+   * idle session whose surface starts with its system prompt, otherwise queued
+   * for the next step (see recordNote for why). Either way the Web UI shows
+   * it, images included, and the model reads it at its next step.
+   * @param agent - the session's live agent.
+   * @param message - a user message (`{ id, role, content, source }`).
+   */
+  function recordMessage(agent, message) {
     if (agent.status === 'idle' && typeof agent.session?.append === 'function' && hasSystemHead(agent.session)) {
       agent.session.append('user/message', message, { surfaceOp: 'append' })
     } else if (typeof agent.inject === 'function') {
       agent.inject(message)
+    } else if (typeof agent.send === 'function') {
+      agent.send(message, 'next-step', false)
     } else {
-      throw new Error('The session cannot record notes.')
+      throw new Error('The session cannot record messages.')
     }
   }
 
@@ -3567,6 +3581,59 @@ export function apply(ctx, config) {
   }
 
   /**
+   * The content blocks that show sent files in a session: pictures as images
+   * (the Web UI draws them inline), everything else as file attachments. A
+   * picture DSH refuses as an image is kept as a file; a file that cannot be
+   * stored at all becomes a line naming it, so the rest is still recorded.
+   * @param files - `{ name, data }` as read for upload.
+   * @returns content blocks, in file order.
+   */
+  async function recordedFiles(files) {
+    const store = ctx.get('attachments')
+    const blocks = []
+    for (const file of files) {
+      const image = sniffImage(file.data)
+      try {
+        if (store === undefined) throw new Error('no attachment store')
+        if (image !== undefined) {
+          try {
+            blocks.push({ type: 'image', attachment: await store.saveImage({ data: file.data, mediaType: image.mediaType, name: file.name }) })
+            continue
+          } catch (error) {
+            warn(`${file.name} kept as a file, not an image: ${messageOf(error)}`)
+          }
+        }
+        blocks.push({ type: 'file', attachment: await store.saveFile({ data: file.data, name: file.name }) })
+      } catch (error) {
+        warn(`${file.name} not stored in the session: ${messageOf(error)}`)
+        blocks.push({ type: 'text', text: `[File ${file.name} was sent but could not be stored here: ${messageOf(error)}]` })
+      }
+    }
+    return blocks
+  }
+
+  /**
+   * The sticker's still picture as an image block, for the session record.
+   * @param sticker - sticker library entry.
+   * @param signal - request lifetime.
+   * @returns one image block, or none when the sticker has no still picture
+   *   or it cannot be stored (the text line still names the sticker).
+   */
+  async function recordedSticker(sticker, signal) {
+    const store = ctx.get('attachments')
+    if (store === undefined || typeof sticker?.id !== 'string') return []
+    try {
+      const preview = await stickerPreview(sticker, signal)
+      if (preview === undefined) return []
+      const attachment = await store.saveImage({ data: preview.data, mediaType: preview.mediaType, name: `sticker-${sticker.id}${extname(preview.path)}` })
+      return [{ type: 'image', attachment }]
+    } catch (error) {
+      warn(`sticker ${sticker.id} preview not stored in the session: ${messageOf(error)}`)
+      return []
+    }
+  }
+
+  /**
    * Remember that a file went to a topic in one turn, so the same file is
    * not uploaded twice in that turn (present, telegram_send and reply images
    * may all name it).
@@ -3697,8 +3764,8 @@ export function apply(ctx, config) {
    *   thread id; the message goes to the chat the bot saw that thread in,
    *   or to `chat` when given (needed only when two chats share the id);
    *   `from` may hold `label` (who sent it), `job` (a job name)
-   *   and `sessionId` (the sender session; when it is the bound session
-   *   itself, no copy is recorded).
+   *   and `sessionId` (the sender session; the bound session sending into
+   *   its own topic gets its copy too, labelled "by this session").
    * @param signal - request lifetime.
    * @returns where it went and whether the session recorded it.
    */
@@ -3779,31 +3846,24 @@ export function apply(ctx, config) {
         }
       }
     }
-    if (typeof sessionId === 'string' && sessionId !== request?.from?.sessionId) {
+    // Every send is recorded in the bound session, the sender's own included:
+    // the Web UI shows that session, and a tool call alone shows neither the
+    // picture nor the sticker that went to Telegram.
+    if (typeof sessionId === 'string') {
       try {
         const chat = await chatFor(chatId, threadId)
         const agent = ctx.get('agents')?.get(sessionId) ?? await ensureAgent(chat)
-        const label = sender.length > 0 ? ` by ${sender}` : ''
+        const self = sessionId === request?.from?.sessionId
+        const label = self ? ' by this session' : sender.length > 0 ? ` by ${sender}` : ''
         const where = target.name === undefined ? `topic ${threadId}` : `topic "${target.name}"`
         const stickerLine = sticker === undefined ? '' : `\n[Sticker ${describeSticker(sticker)}]`
         const content = [{ type: 'text', text: `[Sent to the Telegram ${where}${label}]${text.trim().length > 0 ? `\n${text.trim()}` : ''}${stickerLine}` }]
-        const store = ctx.get('attachments')
-        for (const file of files) {
-          if (store === undefined) break
-          const mediaType = PHOTO_TYPES[extname(file.name).toLowerCase()]
-          const attachment = mediaType === undefined
-            ? await store.saveFile({ data: file.data, name: file.name })
-            : await store.saveImage({ data: file.data, mediaType, name: file.name })
-          content.push({ type: mediaType === undefined ? 'file' : 'image', attachment })
-        }
+        content.push(...await recordedFiles(files))
+        if (sticker !== undefined) content.push(...await recordedSticker(sticker, signal))
         const id = randomUUID()
-        // A next-step inbox item is durable and waits for whatever turn comes
-        // next; it does not wake the agent. The request id keeps the mirror from
-        // echoing it back into the topic.
-        const message = { id, role: 'user', content, source: { kind: 'user', rpcId: `telegram-post:${id}` } }
-        if (typeof agent?.inject === 'function') agent.inject(message)
-        else if (typeof agent?.send === 'function') agent.send(message, 'next-step', false)
-        else throw new Error('The bound session cannot record messages.')
+        // Recording never starts a turn. The request id keeps the mirror from
+        // echoing the copy back into the topic.
+        recordMessage(agent, { id, role: 'user', content, source: { kind: 'user', rpcId: `telegram-post:${id}` } })
         recorded = true
       } catch (error) {
         // The message is already in Telegram; report the missing record
@@ -3825,7 +3885,7 @@ export function apply(ctx, config) {
         job: typeof request?.from?.job === 'string' && request.from.job.trim().length > 0 ? request.from.job.trim() : null,
         label: typeof request?.from?.label === 'string' ? request.from.label : null,
         boundSession: typeof sessionId === 'string' ? sessionId : null,
-        recorded: recorded || (typeof sessionId === 'string' && sessionId === request?.from?.sessionId),
+        recorded,
       })
     } catch (error) {
       reportError('sent-log', error)
@@ -6095,7 +6155,7 @@ export function apply(ctx, config) {
   /** Model-facing tool for sending into a topic; see sendToTopic. */
   const sendTool = {
     name: 'telegram_send',
-    description: 'Send a message, and optionally files, into a Telegram topic of the DSH Telegram bot, addressed by its numeric thread id. The message appears in the topic and is recorded in the session bound to that topic, which sees it on its next turn; no turn is started. Use it to notify the user on Telegram. It goes to the chat that owns the thread; fails on a thread id the bot does not know.',
+    description: 'Send a message, and optionally files, into a Telegram topic of the DSH Telegram bot, addressed by its numeric thread id. The message appears in the topic and is recorded in the session bound to that topic, files and pictures included, so it also shows there in the Web UI; that session reads it at its next step, and no turn is started. Use it to notify the user on Telegram. It goes to the chat that owns the thread; fails on a thread id the bot does not know.',
     parameters: {
       type: 'object',
       properties: {
@@ -6128,7 +6188,7 @@ export function apply(ctx, config) {
   /** Model-facing tool for the sticker library; see stickers.js. */
   const stickerTool = {
     name: 'telegram_sticker',
-    description: 'Use the Telegram sticker library: stickers the user sent (added automatically) and whole sets you add. find: search by meaning words, emoji or set. view: see one sticker as an image. note: save what a sticker means and when to use it, so find can pick it later. add_set: load every sticker of a set by its name (the part after t.me/addstickers/). send: send a sticker into a topic by thread id; it is recorded in the bound session like telegram_send.',
+    description: 'Use the Telegram sticker library: stickers the user sent (added automatically) and whole sets you add. find: search by meaning words, emoji or set. view: see one sticker as an image. note: save what a sticker means and when to use it, so find can pick it later. add_set: load every sticker of a set by its name (the part after t.me/addstickers/). send: send a sticker into a topic by thread id; it is recorded in the bound session, with its picture, like telegram_send.',
     parameters: {
       type: 'object',
       properties: {

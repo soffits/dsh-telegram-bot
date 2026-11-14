@@ -34,6 +34,20 @@ export const Config = z.object({
    * other field is unchanged.
    */
   restartRequest: z.number().default(0).volatile(),
+  /**
+   * Names for Telegram user ids, shown in session titles
+   * ("Telegram-<name>-<task>"). A private chat's id is its user's id; group
+   * chat ids may be listed too. Unlisted chats use the name Telegram gives
+   * them (a user's first name, a group's title). Wins over `userNamesFile`.
+   */
+  userNames: z.dict(z.string()).default({}).volatile(),
+  /**
+   * JSON file with more such names, re-read when it changes, so a list kept
+   * elsewhere stays the one source. Empty means none.
+   */
+  userNamesFile: z.string().default('').volatile(),
+  /** Key of the id → name object inside `userNamesFile`; empty means the whole file. */
+  userNamesKey: z.string().default('').volatile(),
   /** Working directory for Telegram-created DSH sessions. */
   cwd: z.string().default(process.cwd()).volatile(),
   /** Agent preset mounted for Telegram-created sessions when presets exist. */

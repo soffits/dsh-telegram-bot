@@ -10,7 +10,7 @@ import { STATUS_DIR } from '../src/constants.js'
 import { followupThroughGate, makeAgentModel, makeTitleService } from './fake-dsh.js'
 import { senderLabel } from '../src/message-context.js'
 import { enqueue, waitForResult } from '../src/outbox.js'
-import { isAutoCommandTopic, isPlaceholderTitle, isTopicGone, resolveSendTarget, topicNameOf, topicTask, topicTitle } from '../src/topics.js'
+import { isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, titleTask, topicNameOf } from '../src/topics.js'
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -52,6 +52,8 @@ function makeHost() {
   const cleanups = []
   let sequence = 0
   const sessionRecords = []
+  /** Titles persisted in session logs, by session id: `{ title, source }`. */
+  const titleSnapshots = new Map()
   const workspaces = [
     { id: 'workspace-default', path: '/tmp/default-workspace', title: 'default-workspace', sessionIds: [], attachSession() {} },
     { id: 'workspace-notes', path: '/tmp/notes', title: 'notes', sessionIds: [], attachSession() {} },
@@ -73,6 +75,8 @@ function makeHost() {
       },
       snapshotEvents() { return [...this.events] },
     }
+    const persisted = titleSnapshots.get(id)
+    if (persisted !== undefined) Object.assign(session, { title: persisted.title, titleSource: persisted.source, titleSeqs: [] })
     const agent = {
       id,
       session,
@@ -160,7 +164,7 @@ function makeHost() {
     },
     sessionQuery: {
       listSessions: async () => sessionRecords,
-      readTitleSnapshot: async () => ({ title: { title: 'Generated title' } }),
+      readTitleSnapshot: async (id) => ({ session: { id }, title: titleSnapshots.get(id) ?? { title: 'Generated title', source: { kind: 'provider', provider: 'fake' } } }),
       readSurface: async () => ({ events: [] }),
       readSession: async () => ({ events: [] }),
     },
@@ -186,7 +190,7 @@ function makeHost() {
     on(name, fn) { hostEvents.on(name, fn); return () => hostEvents.off(name, fn) },
     effect(fn) { cleanups.push(fn()) },
   }
-  return { ctx, services, live, created, logs, makeAgent, sessionRecords, provided, tools, defaults, modelSelections, cleanup: () => { for (const fn of cleanups) fn?.() } }
+  return { ctx, services, live, created, logs, makeAgent, sessionRecords, titleSnapshots, provided, tools, defaults, modelSelections, cleanup: () => { for (const fn of cleanups) fn?.() } }
 }
 
 /**
@@ -199,6 +203,8 @@ function makeTelegram() {
   /** Thread id -> Bot API error for every call into that topic. */
   const goneThreads = new Map()
   const undeletable = new Set()
+  /** Chats `getChat` knows, by id. */
+  const chats = new Map()
   let messageId = 0
   let topicId = 7000
   let updateId = 0
@@ -246,6 +252,10 @@ function makeTelegram() {
         return deliver({ ok: true, result: { file_path: `files/${body.file_id}.jpg`, file_size: 9 } })
       }
       if (method === 'getUpdates') return deliver({ ok: true, result: pending.splice(0) }, 15)
+      if (method === 'getChat') {
+        calls.push({ method, body })
+        return chats.has(body.chat_id) ? deliver({ ok: true, result: chats.get(body.chat_id) }) : deliver({ ok: false, description: 'Bad Request: chat not found' })
+      }
       calls.push({ method, body })
       // A deleted topic is gone whichever field addresses it (private-chat
       // topics may be retried with direct_messages_topic_id).
@@ -296,13 +306,13 @@ function makeTelegram() {
   const push = (message) => {
     updateId += 1
     messageId += 1
-    pending.push({ update_id: updateId, message: { message_id: messageId, date: 1, chat: { id: 100, type: 'private' }, from: { id: 42 }, ...message } })
+    pending.push({ update_id: updateId, message: { message_id: messageId, date: 1, chat: { id: 100, type: 'private', first_name: 'Lia' }, from: { id: 42 }, ...message } })
   }
-  return { fake, calls, push, pushCallback, missingThreads, goneThreads, undeletable }
+  return { fake, calls, push, pushCallback, missingThreads, goneThreads, undeletable, chats }
 }
 
 /** Start the plugin against fresh fakes and an optional initial state. */
-async function start(config = {}, initialState = {}) {
+async function start(config = {}, initialState = {}, prepare = () => {}) {
   await mkdir(STATUS_DIR, { recursive: true })
   // Message ids restart with every fake bot; old sends must not match them.
   await rm(join(STATUS_DIR, 'sent-messages.json'), { force: true })
@@ -311,6 +321,7 @@ async function start(config = {}, initialState = {}) {
   await writeFile(join(STATUS_DIR, 'state.json'), JSON.stringify({ version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, ...initialState }))
   const host = makeHost()
   const telegram = makeTelegram()
+  prepare({ host, telegram })
   const originalRequest = https.request
   https.request = telegram.fake
   const { apply } = await import('../src/index.js')
@@ -1099,7 +1110,7 @@ test('a long send from a job is recorded with its sender, and a reply after /new
 })
 
 test('a known topic without a session gets one like /new, and a session that cannot record still gets the message', async () => {
-  const run = await start({}, { threads: {}, topicNames: { '100:7200': 'Loose' } })
+  const run = await start({ userNames: { 100: 'Livia' } }, { threads: {}, topicNames: { '100:7200': 'Loose' } })
   try {
     const unbound = await run.host.provided.telegramTopics.send({ to: '7200', text: 'hello', files: [], from: { job: 'probe' } })
     assert.equal(sent(run.telegram.calls, 7200).length, 1)
@@ -1110,7 +1121,7 @@ test('a known topic without a session gets one like /new, and a session that can
     const opened = run.host.live.get('session-1')
     assert.equal(opened.turns, 1, 'never left blank')
     assert.equal(opened.received.length, 0)
-    assert.equal(opened.session.title, 'Loose')
+    assert.equal(opened.session.title, 'Telegram-Livia-Loose', 'the configured name, before Telegram has named the chat')
     assert.match(opened.injected[0].content[0].text, /^\[Sent to the Telegram topic "Loose" by job "probe"\]\nhello$/u)
     const state = await run.readState()
     assert.equal(state.threads['100:7200'], 'session-1')
@@ -1388,7 +1399,7 @@ test('a session opened for a topic is never blank and carries the topic title', 
     assert.equal(fresh.received.length, 0, 'nothing reached the model')
     assert.equal(fresh.rejected.length, 1)
     assert.match(fresh.rejected[0].source.rpcId, /^telegram-claim:/u)
-    assert.equal(fresh.session.title, 'Alerts', 'the bare topic name until DSH titles the conversation')
+    assert.equal(fresh.session.title, 'Telegram-Lia-Alerts', 'the topic name stands in until DSH titles the conversation')
     const before = run.telegram.calls.length
     run.telegram.push({ message_thread_id: 7100, text: 'real question' })
     await wait(200)
@@ -1399,13 +1410,14 @@ test('a session opened for a topic is never blank and carries the topic title', 
   }
 })
 
-test('a topic session is titled "<topic name> · <DSH title>" and a rename moves only the prefix', async () => {
+test('a topic session is titled "Telegram-<person>-<DSH title>"; a topic rename changes only the placeholder', async () => {
   const run = await start()
   try {
     const agent = await openSessionTopic(run)
     const state = await run.readState()
     const first = state.topicNames['100:7001']
-    assert.equal(agent.session.title, first, 'the bare topic name before any conversation title')
+    assert.equal(agent.session.title, `Telegram-Lia-${first}`, 'the topic name stands in before any conversation title')
+    assert.equal(state.chatNames['100'], 'Lia', 'the chat name Telegram gives is remembered')
     const titles = run.host.ctx.get('sessionTitle')
     // DSH's first step puts the system prompt at surface node 0.
     agent.session.append('system/message', { turn: 1, step: 1, message: { id: 's1', role: 'system', content: [], source: { kind: 'system-prompt' } } })
@@ -1420,19 +1432,19 @@ test('a topic session is titled "<topic name> · <DSH title>" and a rename moves
     agent.session.append('request/header', { header: {} })
     await wait(50)
     assert.deepEqual(titles.refreshed, [agent.id])
-    assert.equal(agent.session.title, `${first} · Generated task`)
+    assert.equal(agent.session.title, 'Telegram-Lia-Generated task')
     assert.equal(agent.session.titleSource.kind, 'provider', 'the prefixed title keeps the provider source, so automatic titling continues')
 
     // Later generated titles get the prefix too, once.
     agent.session.append('session/title', { title: 'Better task', messageSeqs: [1], source: { kind: 'provider', provider: 'fake' } })
     await wait(50)
-    assert.equal(agent.session.title, `${first} · Better task`)
-    assert.equal(agent.session.events.filter((event) => event.type === 'session/title' && event.data.title === `${first} · Better task`).length, 1)
+    assert.equal(agent.session.title, 'Telegram-Lia-Better task')
+    assert.equal(agent.session.events.filter((event) => event.type === 'session/title' && event.data.title === 'Telegram-Lia-Better task').length, 1)
 
-    // A topic rename moves only the prefix and leaves a searchable note.
+    // A topic rename leaves a conversation title alone and leaves a searchable note.
     run.telegram.push({ message_thread_id: 7001, forum_topic_edited: { name: 'Ops' } })
     await wait(150)
-    assert.equal(agent.session.title, 'Ops · Better task')
+    assert.equal(agent.session.title, 'Telegram-Lia-Better task')
     const notes = agent.session.events.filter((event) => event.type === 'user/message' && event.data.source.kind === 'telegram-topic')
     assert.equal(notes.length, 1)
     assert.equal(notes[0].data.content[0].text, `Telegram topic renamed: "${first}" -> "Ops" (thread 7001)`)
@@ -1506,16 +1518,88 @@ test('a note never lands ahead of the system prompt of a session that has not ru
   }
 })
 
-test('an old "TG · <name>" title becomes the topic name when the session is next used', async () => {
+test('an old "TG · <name>" title becomes the current placeholder when the session is next used', async () => {
   const run = await start({}, notifyState)
   try {
     const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
     agent.session.title = 'TG · Notify'
     run.telegram.push({ message_thread_id: 7100, text: 'ping' })
     await wait(250)
-    assert.equal(agent.session.title, 'Notify')
+    assert.equal(agent.session.title, 'Telegram-Lia-Notify')
   } finally {
     run.stop()
+  }
+})
+
+test('on start every bound session moves to "Telegram-<person>-<task>"; topics are never renamed', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tg-names-'))
+  const namesFile = join(dir, 'people.json')
+  await writeFile(namesFile, JSON.stringify({ telegram_users: { 200: 'Selina' }, other: {} }))
+  const record = (sessionId, chatId, threadId, extra = {}) => ({ sessionId, chatId, threadId, title: '', cwd: '/tmp/default-workspace', updatedAt: 1, ...extra })
+  const initial = {
+    sessions: {
+      'session-old-form': record('session-old-form', 100, 7100),
+      'session-current': record('session-current', 100, 7200),
+      'session-typed': record('session-typed', 100, 7300),
+      'session-tg': record('session-tg', 100, 7400),
+      'session-relabel': record('session-relabel', 100, 7500, { titlePerson: 'Lia' }),
+      'session-selina': record('session-selina', 200, 8100),
+      'session-group': record('session-group', -100500, 9100),
+    },
+    threads: {
+      '100:7100': 'session-old-form',
+      '100:7200': 'session-current',
+      '100:7300': 'session-typed',
+      '100:7400': 'session-tg',
+      '100:7500': 'session-relabel',
+      '200:8100': 'session-selina',
+      '-100500:9100': 'session-group',
+    },
+    topicNames: { '100:7100': 'Chat-1', '100:7200': 'Chat-2', '100:7300': 'Chat-3', '100:7400': 'Notify', '100:7500': 'Life', '200:8100': 'Selina-chat', '-100500:9100': 'Plans' },
+  }
+  const provider = (title) => ({ title, source: { kind: 'provider', provider: 'fake' } })
+  const run = await start({ userNames: { 100: 'Livia' }, userNamesFile: namesFile, userNamesKey: 'telegram_users' }, initial, ({ host, telegram }) => {
+    host.titleSnapshots.set('session-old-form', provider('Chat-1 · Fix the mirror'))
+    host.titleSnapshots.set('session-current', provider('Telegram-Livia-Already done'))
+    host.titleSnapshots.set('session-typed', { title: 'My pinned title', source: { kind: 'user' } })
+    host.titleSnapshots.set('session-tg', { title: 'TG · Notify', source: { kind: 'user' } })
+    host.titleSnapshots.set('session-relabel', provider('Telegram-Lia-Groceries'))
+    host.titleSnapshots.set('session-selina', provider('Trip'))
+    host.titleSnapshots.set('session-group', provider('Weekend plan'))
+    telegram.chats.set(-100500, { id: -100500, type: 'supergroup', title: 'Family' })
+  })
+  try {
+    await wait(200)
+    const title = (id) => run.host.live.get(id)?.session.title
+    assert.equal(title('session-old-form'), 'Telegram-Livia-Fix the mirror')
+    assert.equal(run.host.live.get('session-old-form').session.titleSource.kind, 'provider', 'a generated title keeps its source')
+    assert.equal(run.host.live.has('session-current'), false, 'a title already in the current form is not opened')
+    assert.equal(run.host.live.has('session-typed'), false, 'a typed title is left alone')
+    assert.equal(title('session-tg'), 'Telegram-Livia-Notify')
+    assert.equal(title('session-relabel'), 'Telegram-Livia-Groceries', 'a changed name replaces the earlier one')
+    assert.equal(title('session-selina'), 'Telegram-Selina-Trip', 'the name from the names file')
+    assert.equal(title('session-group'), 'Telegram-Family-Weekend plan', "a group's title")
+    assert.equal(run.telegram.calls.filter((call) => call.method === 'editForumTopic').length, 0)
+    const state = await run.readState()
+    assert.equal(state.chatNames['-100500'], 'Family')
+    assert.equal(state.sessions['session-relabel'].titlePerson, 'Livia')
+    assert.equal(state.sessions['session-current'].titlePerson, 'Livia')
+    assert.ok(!run.telegram.calls.some((call) => call.method === 'getChat' && (call.body.chat_id === 100 || call.body.chat_id === 200)), 'configured chats are not looked up')
+
+    // The names file is re-read when it changes; the earlier name is still recognized.
+    await wait(20)
+    await writeFile(namesFile, JSON.stringify({ telegram_users: { 200: 'Selina Li' } }))
+    const selina = run.host.live.get('session-selina')
+    selina.session.append('session/title', { title: 'Trip to Banff', messageSeqs: [1], source: { kind: 'provider', provider: 'fake' } })
+    await wait(50)
+    assert.equal(selina.session.title, 'Telegram-Selina Li-Trip to Banff')
+    // A provider that echoes the prefix of the title it was shown gets it once.
+    selina.session.append('session/title', { title: 'Telegram-Selina Li-Trip to Jasper', messageSeqs: [1], source: { kind: 'provider', provider: 'fake' } })
+    await wait(50)
+    assert.equal(selina.session.title, 'Telegram-Selina Li-Trip to Jasper')
+  } finally {
+    run.stop()
+    await rm(dir, { recursive: true, force: true })
   }
 })
 
@@ -1587,17 +1671,53 @@ test('a voice message that cannot be transcribed still passes the file and says 
   }
 })
 
-test('topic title helpers split and join the topic prefix', () => {
-  assert.equal(topicTitle('Chat-1', ''), 'Chat-1')
-  assert.equal(topicTitle('Chat-1', '修 Telegram 空会话'), 'Chat-1 · 修 Telegram 空会话')
-  assert.equal(topicTask('Chat-1 · Fix it', ['Chat-1']), 'Fix it')
-  assert.equal(topicTask('Old · Fix it', ['New', 'Old']), 'Fix it')
-  assert.equal(topicTask('Chat · 2 · Fix', ['Chat', 'Chat · 2']), 'Fix', 'the longest name wins')
-  assert.equal(topicTask('Fix it', ['Chat-1']), 'Fix it')
-  assert.equal(topicTask('TG · Chat-1', ['Chat-1']), '')
+test('title helpers build "Telegram-<person>-<task>" and read every earlier form', () => {
+  assert.equal(sessionTitleOf('Livia', 'Chat-1'), 'Telegram-Livia-Chat-1')
+  assert.equal(sessionTitleOf('Livia', '修 Telegram 空会话'), 'Telegram-Livia-修 Telegram 空会话')
+  assert.equal(sessionTitleOf('Livia', ''), 'Telegram-Livia')
+
+  // The task part, from the current form and the earlier "<topic> · <task>" form.
+  assert.equal(titleTask('Telegram-Livia-Fix it', ['Chat-1'], ['Livia']), 'Fix it')
+  assert.equal(titleTask('Telegram-Livia-Fix-it-now', [], ['Livia']), 'Fix-it-now', 'dashes in the task stay')
+  assert.equal(titleTask('Telegram-Ann-Marie-Fix', [], ['Ann', 'Ann-Marie']), 'Fix', 'the longest label wins')
+  assert.equal(titleTask('Telegram-Old-Fix', [], ['New', 'Old']), 'Fix', 'an earlier label is stripped')
+  assert.equal(titleTask('Chat-1 · Fix it', ['Chat-1'], ['Livia']), 'Fix it')
+  assert.equal(titleTask('Old · Fix it', ['New', 'Old']), 'Fix it')
+  assert.equal(titleTask('Chat · 2 · Fix', ['Chat', 'Chat · 2']), 'Fix', 'the longest name wins')
+  assert.equal(titleTask('Fix it', ['Chat-1'], ['Livia']), 'Fix it')
+  assert.equal(titleTask('TG · Chat-1', ['Chat-1']), '')
+  assert.equal(titleTask('Telegram-Livia', [], ['Livia']), '')
+
+  // Placeholders: current form, bare topic name, "TG · <name>".
+  assert.equal(isPlaceholderTitle('Telegram-Livia-Chat-1', ['Chat-1'], ['Livia']), true)
+  assert.equal(isPlaceholderTitle('Telegram-Livia-topic 7', ['Chat-1', 'topic 7'], ['Livia']), true)
+  assert.equal(isPlaceholderTitle('Telegram-Livia-Other', ['Chat-1'], ['Livia']), false)
   assert.equal(isPlaceholderTitle('TG · Anything', []), true)
   assert.equal(isPlaceholderTitle('topic 7', ['Chat', 'topic 7']), true)
   assert.equal(isPlaceholderTitle('My title', ['Chat']), false)
+})
+
+test('plannedTitle moves every earlier form to the current one and leaves typed titles alone', () => {
+  const context = { person: 'Livia', names: ['Chat-1', 'topic 7'], people: [] }
+  const user = (title) => ({ title, source: { kind: 'user' } })
+  const provider = (title) => ({ title, source: { kind: 'provider', provider: 'fake' } })
+  assert.deepEqual(plannedTitle(undefined, context), { kind: 'rename', title: 'Telegram-Livia-Chat-1' })
+  assert.deepEqual(plannedTitle(user('Chat-1'), context), { kind: 'rename', title: 'Telegram-Livia-Chat-1' })
+  assert.deepEqual(plannedTitle(user('TG · Chat-1'), context), { kind: 'rename', title: 'Telegram-Livia-Chat-1' })
+  assert.deepEqual(plannedTitle(user('Telegram-Livia-topic 7'), context), { kind: 'rename', title: 'Telegram-Livia-Chat-1' })
+  assert.deepEqual(plannedTitle(user('Telegram-Lia-Chat-1'), { ...context, people: ['Lia'] }), { kind: 'rename', title: 'Telegram-Livia-Chat-1' }, 'a placeholder with an earlier label')
+  assert.deepEqual(plannedTitle(user('Telegram-Livia-Chat-1'), context), { kind: 'none' })
+  assert.deepEqual(plannedTitle(user('My own title'), context), { kind: 'none' })
+  assert.deepEqual(plannedTitle(provider('Fix it'), context), { kind: 'append', title: 'Telegram-Livia-Fix it' })
+  assert.deepEqual(plannedTitle(provider('Chat-1 · Fix it'), context), { kind: 'append', title: 'Telegram-Livia-Fix it' })
+  assert.deepEqual(plannedTitle(provider('Telegram-Livia-Fix it'), context), { kind: 'none' })
+  assert.deepEqual(plannedTitle(provider('Telegram-Lia-Fix it'), { ...context, people: ['Lia'] }), { kind: 'append', title: 'Telegram-Livia-Fix it' })
+  assert.deepEqual(plannedTitle({ title: 'Fix it', source: { kind: 'fallback' } }, context), { kind: 'append', title: 'Telegram-Livia-Fix it' })
+
+  // A chat without topics has no placeholder: DSH titles it and the bot only adds the prefix.
+  const plain = { person: 'Selina', names: [], people: [] }
+  assert.deepEqual(plannedTitle(undefined, plain), { kind: 'none' })
+  assert.deepEqual(plannedTitle(provider('Plan a trip'), plain), { kind: 'append', title: 'Telegram-Selina-Plan a trip' })
 })
 
 /** Uploads into one topic, as `[method, filename]`. */

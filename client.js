@@ -10,7 +10,7 @@ window.__ModuleLoader__.load({
     const { Button, SettingsSecretField, Switch } = primitives
     const h = React.createElement
 
-    /** Loader row id / settings namespace; the npm package name is dsh-telegram-bot. */
+    /** Loader row id / settings namespace; the npm package name is @soffits/dsh-telegram-bot. */
     const NS = 'telegram-bot'
     /** Default credential reference holding the Telegram bot token. */
     const DEFAULT_TOKEN_REF = 'TELEGRAM_BOT_TOKEN'
@@ -790,7 +790,7 @@ window.__ModuleLoader__.load({
             ctx.slots.register(
               {
                 name: 'plugins.bundle.config',
-                key: 'dsh-telegram-bot',
+                key: '@soffits/dsh-telegram-bot',
                 locale: NS,
                 inject: () => ({ t }),
               },

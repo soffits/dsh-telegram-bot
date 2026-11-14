@@ -1,4 +1,4 @@
-/** Public host entry point for dsh-telegram-bot. */
+/** Public host entry point for @soffits/dsh-telegram-bot. */
 export { apply } from './app.js'
 export { Config } from './config.js'
 export { name } from './constants.js'

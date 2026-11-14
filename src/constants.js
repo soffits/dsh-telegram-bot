@@ -16,7 +16,7 @@ export const RESTART_DEBOUNCE_MS = 300
  */
 export const FORWARD_BATCH_MS = 1200
 
-/** Loader row id and settings namespace; the npm package name stays dsh-telegram-bot. */
+/** Loader row id and settings namespace; the npm package name is @soffits/dsh-telegram-bot. */
 export const name = 'telegram-bot'
 
 /** Command menu shown by Telegram clients while the user types `/`. */

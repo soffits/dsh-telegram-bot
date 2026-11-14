@@ -34,6 +34,6 @@ npm test
 git push origin main
 ```
 
-Conflicts usually land in `src/app.js` (most of the bridge lives there), `README.md` and the `version` line of `package.json`. Keep the fork's version as upstream's version plus a `-fork.N` suffix, and make sure `client.js` still matches `src/client.js` after the merge (`cmp client.js src/client.js`).
+Conflicts usually land in `src/app.js` (most of the bridge lives there), `README.md` and the `name` and `version` lines of `package.json`. Keep the fork's own name and version: it is published on npm as `@soffits/dsh-telegram-bot` with its own semver line (0.4.0 was the first release, on top of upstream 0.3.0), so bump the minor version for features and upstream merges and the patch version for fixes, and name the merged upstream version in the merge or release commit. Make sure `client.js` still matches `src/client.js` after the merge (`cmp client.js src/client.js`).
 
 Fork-only code is kept in separate files where that is natural (`src/topics.js`, `src/outbox.js`, `src/message-context.js`, `src/sent-log.js`, `src/voice.js`, `src/steer.js`, `src/models.js`, `src/final-text.js`, `bin/dsh-telegram-send.js`, `test/fake-dsh.js`, `test/fork-features.test.js`, `test/message-context.test.js`, `test/sent-log.test.js`, `test/steer.test.js`, `test/models.test.js`, `test/final-text.test.js`, `test/voice.test.js`), so most upstream edits apply without touching it.

@@ -1,7 +1,5 @@
 # dsh-telegram-bot
 
-[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/boobaw/dsh-telegram-bot)
-
 > This is a maintained fork of [Boobaw/dsh-telegram-bot](https://github.com/Boobaw/dsh-telegram-bot) with `/new`, user-created topics with a workspace picker, two-way sync, sending into topics by thread id, and reply, quote and forward context. See [MAINTAINING.md](MAINTAINING.md) for what differs and how upstream changes are merged in.
 
 Telegram client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It connects a DSH profile to a Telegram bot and keeps the same DSH sessions available in both interfaces.
@@ -65,19 +63,19 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Leave **Disallow users
 
 ## Install
 
-From this repository:
+From npm:
+
+```bash
+npx @deepseek-ai/dsh plugin --profile web add @soffits/dsh-telegram-bot@latest
+```
+
+From a clone of this repository:
 
 ```bash
 npx @deepseek-ai/dsh plugin --profile web add .
 ```
 
-From npm:
-
-```bash
-npx @deepseek-ai/dsh plugin --profile web add dsh-telegram-bot@latest
-```
-
-The npm package is the upstream release without this fork's features; install the fork from a clone of this repository.
+The unscoped `dsh-telegram-bot` package on npm is the upstream release without this fork's features.
 
 Restart `dsh web` after installing or updating the plugin. Then open **Settings → Telegram**.
 
@@ -235,10 +233,10 @@ cd ~/.dsh/profiles/tg
 {
   "name": "dsh-profile-tg",
   "private": true,
-  "dependencies": { "dsh-telegram-bot": "latest" },
+  "dependencies": { "@soffits/dsh-telegram-bot": "latest" },
   "dsh": {
     "profile": {
-      "bundles": ["@deepseek-ai/dsh-base", "dsh-telegram-bot"]
+      "bundles": ["@deepseek-ai/dsh-base", "@soffits/dsh-telegram-bot"]
     }
   }
 }
@@ -248,7 +246,7 @@ cd ~/.dsh/profiles/tg
 
 ```yaml
 - id: telegram-bot
-  name: dsh-telegram-bot
+  name: '@soffits/dsh-telegram-bot'
   config:
     enabled: true
     allowedUsers: ["<user-id>"]

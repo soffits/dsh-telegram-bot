@@ -1,6 +1,6 @@
 {
-  "name": "dsh-telegram-bot",
-  "version": "0.3.0-fork.1",
+  "name": "@soffits/dsh-telegram-bot",
+  "version": "0.4.0",
   "description": "Telegram sessions, topics, model controls and approvals for DeepSeek Harness.",
   "type": "module",
   "main": "./index.js",
@@ -12,8 +12,7 @@
     "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
-    "./package.json": "./package.json",
-    ".\"": "./index.js"
+    "./package.json": "./package.json"
   },
   "files": [
     "bin",
@@ -60,16 +59,16 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Boobaw/dsh-telegram-bot.git"
+    "url": "git+https://github.com/soffits/dsh-telegram-bot.git"
   },
-  "homepage": "https://github.com/Boobaw/dsh-telegram-bot#readme",
+  "homepage": "https://github.com/soffits/dsh-telegram-bot#readme",
   "bugs": {
-    "url": "https://github.com/Boobaw/dsh-telegram-bot/issues"
+    "url": "https://github.com/soffits/dsh-telegram-bot/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "test": "NODE_ENV=test node --test --test-concurrency=1"
-  },
-  "bin": {
-    "dsh-telegram-send": "./bin/dsh-telegram-send.js"
   }
 }

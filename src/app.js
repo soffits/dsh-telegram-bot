@@ -1,5 +1,6 @@
 /** Host runtime: Telegram polling, topic routing and the DSH session bridge. */
 import { randomUUID } from 'node:crypto'
+import { readFileSync, statSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import https from 'node:https'
 import { tmpdir } from 'node:os'
@@ -41,7 +42,7 @@ import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
 import { messageAnswer, turnAnswer } from './final-text.js'
 import { createOutbox } from './outbox.js'
-import { deliveredToTopic, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, resolveSendTarget, topicNameOf, topicTargetFor, topicTask, topicTitle } from './topics.js'
+import { deliveredToTopic, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor } from './topics.js'
 import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.js'
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference, senderLabel } from './message-context.js'
@@ -240,6 +241,7 @@ export function apply(ctx, config) {
       threadId: chat.threadId,
       title: title ?? state.sessions[sessionId]?.title ?? '',
       ...(state.sessions[sessionId]?.titleLocked === true ? { titleLocked: true } : {}),
+      ...(typeof state.sessions[sessionId]?.titlePerson === 'string' ? { titlePerson: state.sessions[sessionId].titlePerson } : {}),
       ...(chat.cwd === undefined ? {} : { cwd: chat.cwd }),
       ...(chat.permission === undefined ? {} : { permission: chat.permission }),
       updatedAt: Date.now(),
@@ -1739,10 +1741,11 @@ export function apply(ctx, config) {
   function attachAgent(agent, chat) {
     if (chat.boundAgent === agent) return
     chat.boundAgent = agent
-    // Older versions titled topic sessions "TG · <name>"; move them to the
-    // current form when the session is next used.
-    if (agent.session !== undefined && typeof chat.threadId === 'number' && topicOfSession(agent.session.id) !== undefined) {
-      fireAndForget('topic-title', () => syncTopicTitle(agent.session, chat.chatId, chat.threadId))
+    // Bring a title from an older form, or with a changed person label, to
+    // the current one when the session is used.
+    const bound = agent.session === undefined ? undefined : topicOfSession(agent.session.id)
+    if (bound !== undefined) {
+      fireAndForget('topic-title', () => syncTopicTitle(agent.session, bound.chatId, bound.threadId))
     }
     agent.ctx.on('session/event', (session, event) => {
       try {
@@ -1928,7 +1931,11 @@ export function apply(ctx, config) {
       } catch {
         current = undefined
       }
-      if (service !== undefined && current === undefined) setSessionTitle(session, topicPrefixOf(chat.chatId, chat.threadId))
+      if (service !== undefined && current === undefined) {
+        const person = personOf(chat.chatId)
+        setSessionTitle(session, sessionTitleOf(person, topicNameFor(chat.chatId, chat.threadId)))
+        rememberTitlePerson(session.id, person)
+      }
     }
     if (typeof agent?.followup !== 'function' || typeof agent?.ctx?.on !== 'function') {
       warn(`session ${session?.id ?? agent?.id} cannot run an empty turn; DSH may treat it as blank`)
@@ -3438,48 +3445,149 @@ export function apply(ctx, config) {
   }
 
   /**
-   * The topic name a bound session's title starts with.
+   * The topic name that stands in a bound session's title until DSH has
+   * titled the conversation.
    * @param chatId - chat holding the topic.
    * @param threadId - topic thread.
    * @returns the topic's name, or "topic <id>" while it is unknown.
    */
-  function topicPrefixOf(chatId, threadId) {
+  function topicNameFor(chatId, threadId) {
     const name = state.topicNames?.[`${chatId}:${threadId}`]
     return typeof name === 'string' && name.trim().length > 0 ? name.trim() : `topic ${threadId}`
   }
 
+  /** Cached copy of the `userNamesFile` map, re-read when the file changes. */
+  let userNamesCache = { path: '', key: '', mtimeMs: -1, names: {} }
+
   /**
-   * The topic a session is bound to.
+   * Names the operator gave Telegram users (and chats): `userNames` from the
+   * config over the map in `userNamesFile`.
+   * @returns `{ "<id>": name }`.
+   */
+  function userNamesOf() {
+    const inline = readLive(config.userNames, {})
+    const path = String(readLive(config.userNamesFile, '') ?? '').trim()
+    const key = String(readLive(config.userNamesKey, '') ?? '').trim()
+    let fromFile = {}
+    if (path.length > 0) {
+      try {
+        const mtimeMs = statSync(path).mtimeMs
+        if (userNamesCache.path !== path || userNamesCache.key !== key || userNamesCache.mtimeMs !== mtimeMs) {
+          const parsed = JSON.parse(readFileSync(path, 'utf8'))
+          const map = key.length > 0 ? parsed?.[key] : parsed
+          userNamesCache = { path, key, mtimeMs, names: map !== null && typeof map === 'object' && !Array.isArray(map) ? map : {} }
+        }
+        fromFile = userNamesCache.names
+      } catch (error) {
+        if (userNamesCache.path !== path || userNamesCache.mtimeMs !== -2) warn(`user names not read from ${path}: ${messageOf(error)}`)
+        userNamesCache = { path, key, mtimeMs: -2, names: {} }
+      }
+    }
+    const names = {}
+    for (const source of [fromFile, inline]) {
+      if (source === null || typeof source !== 'object') continue
+      for (const [id, name] of Object.entries(source)) {
+        if (typeof name === 'string' && name.trim().length > 0) names[String(id).trim()] = name.trim()
+      }
+    }
+    return names
+  }
+
+  /**
+   * Remember how Telegram names a chat, for session titles: a private chat's
+   * first name, a group's title.
+   * @param chat - Telegram chat object.
+   */
+  function rememberChatName(chat) {
+    if (typeof chat?.id !== 'number') return
+    const raw = chat.type === 'private' ? chat.first_name : chat.title
+    const name = typeof raw === 'string' ? raw.trim() : ''
+    if (name.length === 0) return
+    state.chatNames ??= {}
+    if (state.chatNames[String(chat.id)] === name) return
+    state.chatNames[String(chat.id)] = name
+    void persistState()
+  }
+
+  /**
+   * Whose chat a session belongs to, as its title shows it: the name the
+   * operator configured for the chat (a private chat's id is its user's id),
+   * else the name Telegram gives the chat (first name, group title).
+   * @param chatId - Telegram chat id.
+   * @returns the label.
+   */
+  function personOf(chatId) {
+    const configured = userNamesOf()[String(chatId)]
+    if (configured !== undefined) return configured
+    const known = state.chatNames?.[String(chatId)]
+    return typeof known === 'string' && known.length > 0 ? known : `chat ${chatId}`
+  }
+
+  /**
+   * Learn the names of chats the bot has bound sessions in but never heard
+   * from since this version, so their titles get a name instead of an id.
+   * @param signal - cancellation.
+   */
+  async function learnChatNames(signal) {
+    const configured = userNamesOf()
+    const chatIds = new Set(Object.values(state.sessions).map((record) => record?.chatId).filter((id) => typeof id === 'number'))
+    for (const chatId of chatIds) {
+      if (signal.aborted) return
+      if (configured[String(chatId)] !== undefined || state.chatNames?.[String(chatId)] !== undefined) continue
+      try {
+        rememberChatName(await call('getChat', { chat_id: chatId }, signal, 10_000))
+      } catch (error) {
+        if (!signal.aborted) warn(`chat name not read for ${chatId}: ${messageOf(error)}`)
+      }
+    }
+  }
+
+  /**
+   * The chat a session is bound to: a topic, or a chat without topics.
    * @param sessionId - DSH session id.
-   * @returns `{ chatId, threadId }`, or undefined.
+   * @returns `{ chatId, threadId }` (threadId undefined without topics), or undefined.
    */
   function topicOfSession(sessionId) {
     if (!stateLoaded || typeof sessionId !== 'string') return undefined
     const record = state.sessions[sessionId]
-    if (typeof record?.chatId !== 'number' || typeof record.threadId !== 'number') return undefined
-    if (state.threads[`${record.chatId}:${record.threadId}`] !== sessionId) return undefined
-    return { chatId: record.chatId, threadId: record.threadId }
+    if (typeof record?.chatId !== 'number') return undefined
+    const threadId = typeof record.threadId === 'number' ? record.threadId : undefined
+    if (state.threads[`${record.chatId}:${threadId ?? 0}`] !== sessionId) return undefined
+    return { chatId: record.chatId, threadId }
   }
 
   /**
-   * Bring a topic session's title to "<topic name> · <conversation title>".
-   * DSH writes the conversation part (its title provider, or the first-prompt
-   * fallback); DSH has no title hook, so the bot adds the prefix by appending
-   * the same title event with the same source, which keeps automatic titling
-   * going. Before a conversation title exists the title is the bare topic
-   * name, set as a user title so DSH's fallback does not replace it; the bot
-   * asks DSH for the real title at the first model request (see
-   * `startTopicTitle`). A title someone typed is left alone.
+   * What a bound session's title may carry: the current person label and
+   * placeholder names, plus earlier ones it may still show.
+   * @param sessionId - DSH session id.
+   * @param chatId - chat holding the session.
+   * @param threadId - topic thread, undefined for a chat without topics.
+   * @param previousNames - earlier topic names.
+   * @returns `{ person, names, people }` for `plannedTitle`.
+   */
+  function titleContext(sessionId, chatId, threadId, previousNames = []) {
+    const person = personOf(chatId)
+    const names = typeof threadId === 'number' ? [topicNameFor(chatId, threadId), ...previousNames, `topic ${threadId}`] : []
+    const earlier = state.sessions[sessionId]?.titlePerson
+    return { person, names, people: typeof earlier === 'string' && earlier !== person ? [earlier] : [] }
+  }
+
+  /**
+   * Bring a bound session's title to "Telegram-<person>-<conversation title>"
+   * (see `plannedTitle`). DSH writes the conversation part (its title
+   * provider, or the first-prompt fallback); before it exists a topic
+   * session's title is "Telegram-<person>-<topic name>", set as a user title
+   * so DSH's fallback does not replace it, and the bot asks DSH for the real
+   * title at the first model request (see `startTopicTitle`). A title someone
+   * typed is left alone.
    * @param session - live session.
-   * @param chatId - chat holding the topic.
-   * @param threadId - topic thread.
+   * @param chatId - chat holding the session.
+   * @param threadId - topic thread, undefined for a chat without topics.
    * @param previousNames - earlier topic names the title may still carry.
    */
   function syncTopicTitle(session, chatId, threadId, previousNames = []) {
     const service = ctx.get('sessionTitle')
     if (service === undefined) return
-    const prefix = topicPrefixOf(chatId, threadId)
-    const names = [prefix, ...previousNames, `topic ${threadId}`]
     let current
     try {
       current = service.get(session)
@@ -3487,26 +3595,82 @@ export function apply(ctx, config) {
       warn(`session title not read for ${session?.id}: ${messageOf(error)}`)
       return
     }
-    if (current === undefined) {
-      setSessionTitle(session, prefix)
-      return
+    const context = titleContext(session.id, chatId, threadId, previousNames)
+    const plan = plannedTitle(current, context)
+    if (plan.kind === 'rename') {
+      setSessionTitle(session, plan.title)
+    } else if (plan.kind === 'append') {
+      try {
+        session.append('session/title', {
+          title: plan.title,
+          messageSeqs: Array.isArray(current.messageSeqs) ? [...current.messageSeqs] : [],
+          source: current.source,
+        })
+      } catch (error) {
+        warn(`session title not set for ${session?.id}: ${messageOf(error)}`)
+        return
+      }
     }
-    const title = current.title
-    if (current.source?.kind === 'user') {
-      if (isPlaceholderTitle(title, names) && title !== prefix) setSessionTitle(session, prefix)
-      return
+    rememberTitlePerson(session.id, context.person)
+  }
+
+  /**
+   * Record which person label a session's title carries, so a later change
+   * of that label (a new configured name) still finds the old prefix.
+   * @param sessionId - DSH session id.
+   * @param person - the label now in the title.
+   */
+  function rememberTitlePerson(sessionId, person) {
+    const record = state.sessions[sessionId]
+    if (record === undefined || record.titlePerson === person) return
+    record.titlePerson = person
+    void persistState()
+  }
+
+  /**
+   * Move every bound session's title to the current form once the bot is
+   * connected, so the sidebar shows where each session comes from without
+   * waiting for it to be used. Titles are read from the session log first;
+   * only a session whose title changes is opened. Topics are never renamed.
+   * @param signal - cancellation.
+   */
+  async function migrateSessionTitles(signal) {
+    const query = ctx.get('sessionQuery')
+    if (ctx.get('sessionTitle') === undefined) return
+    await learnChatNames(signal)
+    for (const [key, sessionId] of Object.entries(state.threads)) {
+      if (signal.aborted) return
+      const topic = topicOfSession(sessionId)
+      if (topic === undefined || `${topic.chatId}:${topic.threadId ?? 0}` !== key) continue
+      try {
+        const live = ctx.get('agents')?.get(sessionId)
+        if (live?.session === undefined && typeof query?.readTitleSnapshot === 'function') {
+          const observed = await query.readTitleSnapshot(sessionId, signal)
+          const context = titleContext(sessionId, topic.chatId, topic.threadId)
+          if (plannedTitle(observed?.title, context).kind === 'none') {
+            rememberTitlePerson(sessionId, context.person)
+            continue
+          }
+        }
+        const agent = live ?? await openForTitle(sessionId)
+        if (agent?.session !== undefined) syncTopicTitle(agent.session, topic.chatId, topic.threadId)
+      } catch (error) {
+        if (!signal.aborted) warn(`session title not migrated for ${sessionId}: ${messageOf(error)}`)
+      }
     }
-    const wanted = topicTitle(prefix, topicTask(title, names))
-    if (wanted === title) return
-    try {
-      session.append('session/title', {
-        title: wanted,
-        messageSeqs: Array.isArray(current.messageSeqs) ? [...current.messageSeqs] : [],
-        source: current.source,
-      })
-    } catch (error) {
-      warn(`session title not set for ${session?.id}: ${messageOf(error)}`)
-    }
+  }
+
+  /**
+   * Open a bound session only to change its title, through the Web session
+   * controller as the Web UI's rename does. Unlike `ensureAgent`, a failure
+   * leaves the binding alone. Without a controller the session keeps its
+   * title until it is next used.
+   * @param sessionId - DSH session id.
+   * @returns the live agent, or undefined.
+   */
+  async function openForTitle(sessionId) {
+    const controller = sessionControllerOf()
+    return controller === undefined ? undefined : resolveThroughController(controller, sessionId)
   }
 
   /** Sessions whose first conversation title is being generated. */
@@ -3524,10 +3688,11 @@ export function apply(ctx, config) {
   function startTopicTitle(session) {
     const topic = topicOfSession(session?.id)
     const service = ctx.get('sessionTitle')
-    if (topic === undefined || typeof service?.refresh !== 'function' || titleRequests.has(session.id)) return
+    // Without a topic there is no placeholder, so DSH's own titling runs.
+    if (typeof topic?.threadId !== 'number' || typeof service?.refresh !== 'function' || titleRequests.has(session.id)) return
     const current = service.get(session)
-    const names = [topicPrefixOf(topic.chatId, topic.threadId), `topic ${topic.threadId}`]
-    if (current !== undefined && (current.source?.kind !== 'user' || !isPlaceholderTitle(current.title, names))) return
+    const { person, names, people } = titleContext(session.id, topic.chatId, topic.threadId)
+    if (current !== undefined && (current.source?.kind !== 'user' || !isPlaceholderTitle(current.title, names, [person, ...people]))) return
     const events = typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : []
     const hasPrompt = events.some((event) => event?.type === 'user/message'
       && event.data?.source?.kind === 'user'
@@ -4951,12 +5116,13 @@ export function apply(ctx, config) {
     const directTopicId = message.direct_messages_topic?.topic_id
     const threadId = message.message_thread_id ?? inferredTopicId(message)
     const announced = topicNameOf(message)
-    if (announced !== undefined && chat !== undefined && typeof threadId === 'number') {
-      try {
-        if (chatAllowed(chat, allowedChatsOf(config))) rememberTopicName(chat.id, threadId, announced.name, announced.authoritative)
-      } catch {
-        // A malformed allowlist is reported by the main check below.
+    try {
+      if (chat !== undefined && chatAllowed(chat, allowedChatsOf(config))) {
+        rememberChatName(chat)
+        if (announced !== undefined && typeof threadId === 'number') rememberTopicName(chat.id, threadId, announced.name, announced.authoritative)
       }
+    } catch {
+      // A malformed allowlist is reported by the main check below.
     }
     const hasAttachment = downloadableFile(message) !== undefined
     // A forward is a prompt even when its media cannot be attached (video,
@@ -6025,6 +6191,7 @@ export function apply(ctx, config) {
         void publishCommands(tokenLifetime.signal)
         void unpinLegacyGoalPanels(tokenLifetime.signal)
         void checkForumConfiguration(me, tokenLifetime.signal)
+        void migrateSessionTitles(tokenLifetime.signal).catch((error) => warn(`session titles not migrated: ${messageOf(error)}`))
         void notifyAll(
           `🟢 <b>${tr('Telegram bot enabled', 'Telegram-бот включён')}</b>\n` +
             `@${escapeHtml(me.username ?? String(me.id))}\n` +

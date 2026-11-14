@@ -17,48 +17,95 @@ export function topicNameOf(message) {
   return undefined
 }
 
-/** Joins a topic name and the task part of a topic session's title. */
-export const TITLE_SEPARATOR = ' · '
+/** Where a bot session comes from, the first part of its DSH title. */
+export const TITLE_SOURCE = 'Telegram'
 
-/** The title form earlier versions gave topic sessions: "TG · <topic name>". */
+/** Joins the source, the person and the task in a session title. */
+const TITLE_JOIN = '-'
+
+/** Joined a topic name and the task in titles of earlier versions. */
+const LEGACY_SEPARATOR = ' · '
+
+/** The title form the oldest versions gave topic sessions: "TG · <topic name>". */
 const LEGACY_PREFIX = 'TG · '
 
 /**
- * The DSH title of a topic session: the topic name, then what the
- * conversation is about once DSH has titled it.
- * @param prefix - the topic's name.
- * @param task - the conversation's own title, or empty before one exists.
+ * The DSH title of a bot session: "Telegram-<person>-<task>". Before DSH has
+ * titled the conversation, a topic's name stands in for the task.
+ * @param person - whose chat it is: a person's name, or a group's title.
+ * @param task - what the conversation is about; empty gives "Telegram-<person>".
  * @returns the session title.
  */
-export function topicTitle(prefix, task) {
+export function sessionTitleOf(person, task) {
   const rest = typeof task === 'string' ? task.trim() : ''
-  return rest.length === 0 ? prefix : `${prefix}${TITLE_SEPARATOR}${rest}`
+  const head = `${TITLE_SOURCE}${TITLE_JOIN}${person}`
+  return rest.length === 0 ? head : `${head}${TITLE_JOIN}${rest}`
 }
 
 /**
- * Whether a title is one the bot set before any conversation title existed:
- * a bare topic name (current or earlier) or the old "TG · <name>" form.
+ * Whether a title is a placeholder the bot set before any conversation title
+ * existed, in this version's form or an earlier one: "Telegram-<person>-<topic
+ * name>", a bare topic name, or "TG · <topic name>".
  * @param title - current session title.
- * @param names - topic names the title may carry.
+ * @param names - topic names the title may carry (current and earlier).
+ * @param people - person labels the title may carry (current and earlier).
  * @returns true for a bot placeholder.
  */
-export function isPlaceholderTitle(title, names) {
-  return typeof title === 'string' && (title.startsWith(LEGACY_PREFIX) || names.includes(title))
+export function isPlaceholderTitle(title, names, people = []) {
+  if (typeof title !== 'string') return false
+  if (title.startsWith(LEGACY_PREFIX) || names.includes(title)) return true
+  return people.some((person) => names.some((name) => sessionTitleOf(person, name) === title))
 }
 
 /**
- * The conversation part of a title, without a topic-name prefix the bot added.
+ * The conversation part of a title, without the source, person or topic-name
+ * prefix the bot added in this or an earlier version.
  * @param title - current session title.
- * @param names - topic names a prefix may carry, current name first.
- * @returns the task part; empty when the title is only a prefix.
+ * @param names - topic names an earlier-form prefix may carry.
+ * @param people - person labels a prefix may carry.
+ * @returns the task part; empty when the title is only a placeholder.
  */
-export function topicTask(title, names) {
-  if (isPlaceholderTitle(title, names)) return ''
-  // Longest name first, so "Chat · 2" wins over "Chat" for "Chat · 2 · Fix".
+export function titleTask(title, names, people = []) {
+  if (isPlaceholderTitle(title, names, people)) return ''
+  // Longest label first, so "Ann-Marie" wins over "Ann".
+  for (const person of [...people].sort((a, b) => b.length - a.length)) {
+    const head = sessionTitleOf(person, '')
+    if (title === head) return ''
+    if (title.startsWith(`${head}${TITLE_JOIN}`)) return title.slice(head.length + TITLE_JOIN.length).trim()
+  }
   for (const name of [...names].sort((a, b) => b.length - a.length)) {
-    if (title.startsWith(`${name}${TITLE_SEPARATOR}`)) return title.slice(name.length + TITLE_SEPARATOR.length).trim()
+    if (title.startsWith(`${name}${LEGACY_SEPARATOR}`)) return title.slice(name.length + LEGACY_SEPARATOR.length).trim()
   }
   return title
+}
+
+/**
+ * Decide how a bot session's title should change. DSH has no title hook, so
+ * the bot rewrites titles after the fact: a missing title or a bot
+ * placeholder becomes the current placeholder through a user rename (which
+ * stops DSH's own fallback from replacing it); a generated title gets the
+ * prefix by re-appending it with the same source, so automatic titling keeps
+ * running. A title someone typed is left alone.
+ * @param current - the latest title snapshot (`{ title, source }`), if any.
+ * @param options - `person`, the label for the chat now; `names`, topic names
+ *   the title may carry, current first (empty for a chat without topics);
+ *   `people`, earlier person labels the title may carry.
+ * @returns `{ kind: 'rename' | 'append', title }`, or `{ kind: 'none' }`.
+ */
+export function plannedTitle(current, { person, names = [], people = [] }) {
+  const labels = [person, ...people.filter((label) => label !== person)]
+  const placeholder = names.length > 0 ? sessionTitleOf(person, names[0]) : undefined
+  if (current === undefined || typeof current?.title !== 'string') {
+    return placeholder === undefined ? { kind: 'none' } : { kind: 'rename', title: placeholder }
+  }
+  const title = current.title
+  if (current.source?.kind === 'user') {
+    const stale = placeholder !== undefined && title !== placeholder && isPlaceholderTitle(title, names, labels)
+    return stale ? { kind: 'rename', title: placeholder } : { kind: 'none' }
+  }
+  const task = titleTask(title, names, labels)
+  const wanted = task.length > 0 ? sessionTitleOf(person, task) : (placeholder ?? sessionTitleOf(person, ''))
+  return wanted === title ? { kind: 'none' } : { kind: 'append', title: wanted }
 }
 
 /**

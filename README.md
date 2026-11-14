@@ -25,7 +25,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Leave **Disallow users
 - One Telegram topic per DSH session; Web and Telegram use the same session.
 - You create the topics. A new topic asks which workspace to use, then whether to start a new session or continue an existing one from that workspace. The message that opened the topic runs once the session is chosen.
 - Topic names are yours: the bot never renames a topic after the session title. `/rename` renames it on request.
-- A topic's session is titled `<topic name> · <what the conversation is about>` in DSH, for example `Chat-1 · Fix empty Telegram sessions`. The second part is DSH's own title (its title model, or the first words of the first message); until it exists the title is just the topic name. Renaming the topic changes only the first part. A title someone types for the session is left alone.
+- A Telegram session is titled `Telegram-<person>-<what the conversation is about>` in DSH, for example `Telegram-Livia-Fix empty Telegram sessions`, so the sidebar shows where each session comes from and whose chat it is. `<person>` is the name set for the chat's user in `userNames` or `userNamesFile`, else the user's Telegram first name; in a group it is the group's title. The last part is DSH's own title (its title model, or the first words of the first message); until it exists the topic name stands in for it. Sessions with titles from earlier versions (`<topic name> · <task>`, a bare topic name) are moved to this form when the bot starts. A title someone types for the session is left alone.
 - Renaming a topic also records a short note in its session, such as `Telegram topic renamed: "Old" -> "New" (thread 123)`, so searching earlier sessions finds it under either name.
 - A session the bot creates for a topic is never handed out as a blank session. DSH's **New conversation** reuses a session that has not started a turn yet; the bot therefore starts one empty turn as soon as it creates a session, and stops it before any model request. Without this, a topic session waiting for its first message could be picked up by the Web UI, and that Web chat would be mirrored into the topic.
 - Deleted topics clean themselves up: when Telegram answers any call for a topic with "message thread not found", `TOPIC_ID_INVALID` or `TOPIC_DELETED`, the bot drops that topic's session binding and name and logs it. The session stays in DSH. A closed topic keeps its binding, since it can be reopened.
@@ -98,10 +98,13 @@ Restart `dsh web` after installing or updating the plugin. Then open **Settings 
 | `transcribeLanguage` | Language hint for DSH speech-to-text, such as `zh` or `en`; empty uses its own setting |
 | `transcribeCommand` | Program and arguments for `transcriber: command` |
 | `ffmpegPath` | ffmpeg used to decode recordings for DSH speech-to-text; default `ffmpeg` |
+| `userNames` | Names for Telegram user ids (or group chat ids) in session titles, such as `{ "123456789": "Alex" }` |
+| `userNamesFile` | JSON file with more such names, re-read when it changes; `userNames` wins |
+| `userNamesKey` | Key of the id → name object inside `userNamesFile`; empty means the whole file is the map |
 | Bot language | `en` (default) or `ru` |
 | Enable bot | Start or pause Telegram polling |
 
-The voice fields, `controlChat` and `busyMessages` have no controls on the settings page yet; set them in the profile's `cordis.patch.yml` under the `telegram-bot` row's `config`.
+The voice fields, the name fields, `controlChat` and `busyMessages` have no controls on the settings page yet; set them in the profile's `cordis.patch.yml` under the `telegram-bot` row's `config`.
 
 The token field only reports whether a token is configured. A token supplied through the environment cannot be overwritten from the page.
 
@@ -146,7 +149,7 @@ Scripts, scheduled jobs, other plugins and agents can post into a topic by its n
 
 The bot also remembers each such send (`$DSH_HOME/telegram/sent-messages.json`: the last 1,000 sends from the past 180 days, text up to 20,000 characters). When someone replies to or quotes one of those messages, the agent gets the whole original text, however many Telegram messages it was split into, with its send time, job name and sending session, and a hint to open that session for more context. This works after `/new` too, when the current session never saw the message.
 
-The bot learns a topic's name when it creates the topic, when Telegram reports a topic being created or renamed, and on `/rename`, and uses it in the labels of recorded messages and in session titles.
+The bot learns a topic's name when it creates the topic, when Telegram reports a topic being created or renamed, and on `/rename`, and uses it in the labels of recorded messages and as the placeholder in session titles.
 
 From a shell (no bot token needed):
 

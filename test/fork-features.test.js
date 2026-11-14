@@ -532,6 +532,30 @@ test('messages sent from Telegram are not echoed back', async () => {
   }
 })
 
+test('a message to a topic whose session was archived brings the session back first', async () => {
+  const run = await start({}, {
+    sessions: { 'session-old': { sessionId: 'session-old', chatId: 100, threadId: 7001, title: 'Chat-1' } },
+    threads: { '100:7001': 'session-old' },
+  })
+  try {
+    const agent = run.host.makeAgent('session-old', '/tmp/default-workspace')
+    const registry = run.host.services.workspaceRegistry
+    registry.archivedSessionIds = ['session-old']
+    const unarchived = []
+    registry.unarchiveSession = async (id) => {
+      unarchived.push({ id, receivedBefore: agent.received.length })
+      registry.archivedSessionIds = registry.archivedSessionIds.filter((entry) => entry !== id)
+    }
+    run.telegram.push({ message_thread_id: 7001, text: 'are you there?' })
+    await wait(200)
+    assert.deepEqual(unarchived, [{ id: 'session-old', receivedBefore: 0 }], 'unarchived once, before the message went in')
+    assert.equal(agent.received.length, 1)
+    assert.ok(run.host.logs.some((line) => line.includes('unarchived session session-old')), run.host.logs.join('\n'))
+  } finally {
+    run.stop()
+  }
+})
+
 test('scheduled turns are labelled, and mirroring can be turned off', async () => {
   const run = await start()
   try {

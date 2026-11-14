@@ -2801,6 +2801,25 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Bring a topic's archived session back before a message from the topic
+   * starts a turn in it. DSH admits a prompt into an archived session but
+   * rejects its every model step (the archived-session gate), so without this
+   * the turn would end as `blocked` and the message would get no answer.
+   * @param chat - chat bridge state.
+   */
+  async function unarchiveForTopic(chat) {
+    const registry = ctx.get('workspaceRegistry')
+    const sessionId = chat.sessionId
+    if (typeof sessionId !== 'string' || registry?.archivedSessionIds?.includes(sessionId) !== true) return
+    if (typeof registry.unarchiveSession !== 'function') {
+      warn(`session ${sessionId} is archived and this DSH cannot unarchive it; the message will not be answered`)
+      return
+    }
+    await registry.unarchiveSession(sessionId)
+    info(`unarchived session ${sessionId} for a message in its topic`)
+  }
+
+  /**
    * Show the turn's placeholders and hand its prompt to DSH.
    * @param chat - chat bridge state.
    * @param epoch - the turn epoch this prompt opened.
@@ -2818,6 +2837,7 @@ export function apply(ctx, config) {
     chat.lastEdit = Date.now()
     try {
       const agent = await ensureAgent(chat)
+      await unarchiveForTopic(chat)
       let admitted = false
       if (nativeText) {
         admitted = admitText(ctx, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text }, signal)

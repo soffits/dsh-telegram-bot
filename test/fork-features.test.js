@@ -524,6 +524,7 @@ test('messages sent from Telegram are not echoed back', async () => {
     agent.emit('session/event', { id: 'session-1' }, { type: 'user/message', data: { id: legacyId, role: 'user', content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } } })
     agent.emit('session/event', { id: 'session-1' }, { type: 'user/message', data: { id: 'x', role: 'user', content: [{ type: 'text', text: 'hello' }], source: { kind: 'user', rpcId: 'telegram:100:1' } } })
     agent.emit('session/event', { id: 'session-1' }, { type: 'user/message', data: { id: 'y', role: 'user', content: [{ type: 'text', text: 'now is 10:00' }], source: { kind: 'time-context' } } })
+    agent.emit('session/event', { id: 'session-1' }, { type: 'user/message', data: { id: 'z', role: 'user', content: [{ type: 'text', text: '[Sent to the Telegram topic 1]\nposted' }], source: { kind: 'telegram-post', form: 'notice', summary: 'Sent to the Telegram topic 1' } } })
     await wait(80)
     assert.deepEqual(texts(run.telegram.calls.slice(before), 7001), [])
   } finally {
@@ -782,7 +783,17 @@ test('the Host service posts into a topic by thread id and records it in the bou
     const content = agent.injected[0].content
     assert.match(content[0].text, /^\[Sent to the Telegram topic "Notify" by backup job\]\nBackup \*\*done\*\*/)
     assert.equal(content[1].type, 'file')
-    assert.match(agent.injected[0].source.rpcId, /^telegram-post:/)
+    assert.deepEqual(agent.injected[0].source, {
+      kind: 'telegram-post',
+      form: 'notice',
+      summary: 'Sent to the Telegram topic "Notify" by backup job',
+      threadId: 7100,
+      topic: 'Notify',
+      job: null,
+      label: 'backup job',
+      fromSession: null,
+      self: false,
+    }, 'a post is not something the user typed, and DSH shows it as a notice without the client')
     await assert.rejects(run.host.provided.telegramTopics.send({ to: 4242, text: 'x' }), (error) => /Unknown thread id 4242/.test(error.message) && error.retryable === false)
     await assert.rejects(run.host.provided.telegramTopics.send({ to: 'notify', text: 'x' }), (error) => /not a Telegram thread id/.test(error.message) && error.retryable === false)
     await assert.rejects(run.host.provided.telegramTopics.send({ to: 7100, text: 'x', files: [join(STATUS_DIR, 'missing.txt')] }), (error) => error.retryable === false)
@@ -895,6 +906,8 @@ test('send({ to, text, files, from }) takes a thread id and names the job and it
     assert.equal(result.threadId, 7100)
     assert.equal(result.recorded, true)
     assert.match(agent.injected[0].content[0].text, /^\[Sent to the Telegram topic "Notify" by job "Check-in" from session session-job\]\nNothing new today$/u)
+    const { kind, job, label, fromSession, self } = agent.injected[0].source
+    assert.deepEqual({ kind, job, label, fromSession, self }, { kind: 'telegram-post', job: 'Check-in', label: null, fromSession: 'session-job', self: false })
   } finally {
     run.stop()
   }
@@ -969,7 +982,9 @@ test('a session sending into its own topic records the pictures and files it sen
       ['image', 'image/gif', 'dance.gif'],
       ['file', null, 'notes.txt'],
     ])
-    assert.match(agent.injected[0].source.rpcId, /^telegram-post:/u)
+    assert.equal(agent.injected[0].source.kind, 'telegram-post')
+    assert.equal(agent.injected[0].source.self, true)
+    assert.equal(agent.injected[0].source.fromSession, 'session-notify')
     const log = JSON.parse(await readFile(join(STATUS_DIR, 'sent-messages.json'), 'utf8'))
     assert.equal(log.entries.at(-1).recorded, true)
     assert.equal(log.entries.at(-1).boundSession, 'session-notify')

@@ -19,6 +19,12 @@ export const FORWARD_BATCH_MS = 1200
 /** Loader row id and settings namespace; the npm package name is @soffits/dsh-telegram-bot. */
 export const name = 'telegram-bot'
 
+/**
+ * Source kind of the copy a topic send leaves in the bound session; the
+ * client draws these as posts on the assistant's side.
+ */
+export const POST_SOURCE_KIND = 'telegram-post'
+
 /** Command menu shown by Telegram clients while the user types `/`. */
 const BOT_COMMANDS = [
   { command: 'start', description: 'Start the bot and show help' },

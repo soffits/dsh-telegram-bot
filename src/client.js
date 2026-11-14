@@ -70,6 +70,19 @@ window.__ModuleLoader__.load({
       loadingSettings: 'Loading settings…',
       unavailable: 'This plugin is not loaded, so it cannot be configured right now.',
       readOnly: 'This deployment stores settings read-only.',
+      postTitle: 'Sent to Telegram',
+      postTopic: 'topic',
+      postJob: 'job',
+      postSession: 'session',
+      postOtherSession: 'another session',
+      postSticker: 'Sticker',
+      postFile: 'file',
+      postCopy: 'Copy',
+      postCopied: 'Copied',
+      postCode: 'Code',
+      postWrap: 'Wrap',
+      postUnwrap: 'Unwrap',
+      postFootnotes: 'Footnotes',
     }
 
     const ru = {
@@ -127,6 +140,19 @@ window.__ModuleLoader__.load({
       loadingSettings: 'Загрузка настроек…',
       unavailable: 'Плагин не загружен, поэтому настройки сейчас недоступны.',
       readOnly: 'Этот deployment хранит настройки только для чтения.',
+      postTitle: 'Отправлено в Telegram',
+      postTopic: 'тема',
+      postJob: 'задача',
+      postSession: 'сессия',
+      postOtherSession: 'другая сессия',
+      postSticker: 'Стикер',
+      postFile: 'файл',
+      postCopy: 'Копировать',
+      postCopied: 'Скопировано',
+      postCode: 'Код',
+      postWrap: 'Переносить',
+      postUnwrap: 'Не переносить',
+      postFootnotes: 'Сноски',
     }
 
     const CSS = `
@@ -730,6 +756,293 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // ---- Telegram posts in the Chat transcript ----
+    //
+    // A send into a topic leaves a user-role copy in the topic's session, so
+    // the model knows what was said there. DSH's Chat would draw an ordinary
+    // user message as the user's own bubble; these Definitions claim the copy
+    // and draw it as what it is: something sent to Telegram, on the
+    // assistant's side, pictures included. The recorded message is unchanged.
+
+    /** Chat node kind, conversation Definition kind and Host source kind of a post. */
+    const POST_KIND = 'telegram-post'
+    /** Request-id prefix of posts recorded before they had their own source kind. */
+    const LEGACY_POST_RPC = 'telegram-post:'
+    /** First text line of every post: what the model reads as its sender. */
+    const HEADER_LINE = /^\[(Sent to the Telegram [^\n]*)\]$/u
+    /** Line naming a sent sticker; its still picture follows as an image. */
+    const STICKER_LINE = /^\[Sticker ([^\n]*)\]$/u
+    /** The header's own words, for posts that carry no structured source. */
+    const HEADER_PARTS = /^Sent to the Telegram topic (?:"(.*)"|(\d+))(?: by (.*))?$/u
+
+    /**
+     * Whether a durable message source marks a topic send's copy.
+     * @param source - `user/message` source.
+     * @returns true for posts, old and new.
+     */
+    function isPostSource(source) {
+      if (typeof source !== 'object' || source === null) return false
+      if (source.kind === POST_KIND) return true
+      return source.kind === 'user' && typeof source.rpcId === 'string' && source.rpcId.startsWith(LEGACY_POST_RPC)
+    }
+
+    /**
+     * Claim a post's `user/message` on the Chat target. Only append-origin
+     * copies are claimed: a replacement copy (compaction) belongs to the
+     * system-prompt Definition and is never drawn.
+     * @param event - Client history event.
+     * @returns the match, or null when the event is not a post.
+     */
+    function matchPost(event) {
+      if (event?.type !== 'user/message' || event.surfaceOp !== 'append') return null
+      const data = event.data
+      if (data === null || typeof data !== 'object' || !isPostSource(data.source)) return null
+      return { id: String(data.id), role: 'start', exclusive: true }
+    }
+
+    /**
+     * Who sent a post and where, from its source or, for old records, from
+     * the header line the model reads.
+     * @param source - the post's source.
+     * @param header - header line without brackets, when present.
+     * @returns `{ topic, threadId, job, label, fromSession, self }`; unknown fields are null.
+     */
+    function postMeta(source, header) {
+      if (source?.kind === POST_KIND) {
+        return {
+          topic: typeof source.topic === 'string' ? source.topic : null,
+          threadId: typeof source.threadId === 'number' ? source.threadId : null,
+          job: typeof source.job === 'string' ? source.job : null,
+          label: typeof source.label === 'string' ? source.label : null,
+          fromSession: typeof source.fromSession === 'string' ? source.fromSession : null,
+          self: source.self === true,
+        }
+      }
+      const meta = { topic: null, threadId: null, job: null, label: null, fromSession: null, self: false }
+      const parts = header === null ? null : HEADER_PARTS.exec(header)
+      if (parts === null) return meta
+      if (parts[1] !== undefined) meta.topic = parts[1]
+      else meta.threadId = Number(parts[2])
+      const by = parts[3]
+      if (by === undefined) return meta
+      if (by === 'this session') {
+        meta.self = true
+        return meta
+      }
+      const job = /^job "(.*?)"(?: from session (\S+))?$/u.exec(by)
+      const session = /^session (\S+)$/u.exec(by)
+      if (job !== null) {
+        meta.job = job[1]
+        meta.fromSession = job[2] ?? null
+      } else if (session !== null) {
+        meta.fromSession = session[1]
+      } else {
+        meta.label = by
+      }
+      return meta
+    }
+
+    /**
+     * Split a post's recorded content into what the transcript shows.
+     * @param content - the message's content blocks.
+     * @param source - the message's source.
+     * @returns `{ meta, text, stickers, images, files }`: the body without
+     *   its header and sticker lines, sticker descriptions, image sources
+     *   for the gallery and file attachments.
+     */
+    function readPost(content, source) {
+      const blocks = Array.isArray(content) ? content : []
+      const lines = blocks
+        .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+        .map((block) => block.text)
+        .join('\n')
+        .split('\n')
+      const first = HEADER_LINE.exec(lines[0] ?? '')
+      if (first !== null) lines.shift()
+      const stickers = []
+      const body = []
+      for (const line of lines) {
+        const sticker = STICKER_LINE.exec(line)
+        if (sticker !== null) stickers.push(sticker[1])
+        else body.push(line)
+      }
+      const images = []
+      const files = []
+      for (const block of blocks) {
+        if (block?.attachment === undefined || block.attachment === null) continue
+        if (block.type === 'image') {
+          const name = block.attachment.name
+          images.push(typeof name === 'string' && name.length > 0 ? { attachment: block.attachment, label: name } : { attachment: block.attachment })
+        } else if (block.type === 'file') {
+          files.push(block.attachment)
+        }
+      }
+      return {
+        meta: postMeta(source, first === null ? null : first[1]),
+        text: body.join('\n').trim(),
+        stickers,
+        images,
+        files,
+      }
+    }
+
+    /**
+     * Chat Definition for topic sends. The row stays in its Turn outside the
+     * folded work rows (`turn`): it is something sent, not a step of work,
+     * and it neither opens nor joins a Turn's input.
+     */
+    const postDefinition = {
+      kind: POST_KIND,
+      target: 'chat',
+      match: { 'user/message': matchPost },
+      start: (_context, match) => {
+        const event = match.event
+        return {
+          seq: event.seq,
+          time: event.time,
+          ...readPost(event.data.content, event.data.source),
+        }
+      },
+      update: (context) => context.state,
+      buildViewNode: (context) => {
+        if (context.state === undefined) return null
+        const location = context.start?.location ?? context.matches[0]?.location ?? { kind: 'unresolved' }
+        return {
+          key: context.key,
+          kind: POST_KIND,
+          id: context.id,
+          target: 'chat',
+          anchorSeq: context.state.seq,
+          location,
+          visibility: 'visible',
+          groupTree: location.kind === 'turn' || location.kind === 'step' ? 'turn' : undefined,
+          data: context.state,
+        }
+      },
+    }
+
+    /**
+     * Where and from whom, as short header pieces.
+     * @param meta - see postMeta.
+     * @param t - locale reader.
+     * @returns `{ where, who, whoTitle }`; `who` is null for the session's
+     *   own sends, which already sit on its side of the transcript.
+     */
+    function postLabels(meta, t) {
+      const where = meta.topic !== null ? meta.topic : meta.threadId !== null ? `${t('postTopic')} ${meta.threadId}` : null
+      let who = null
+      let whoTitle
+      if (meta.job !== null) {
+        who = `${t('postJob')} ${meta.job}`
+        if (meta.fromSession !== null) whoTitle = `${t('postSession')} ${meta.fromSession}`
+      } else if (!meta.self && meta.fromSession !== null) {
+        who = t('postOtherSession')
+        whoTitle = `${t('postSession')} ${meta.fromSession}`
+      } else if (!meta.self && meta.label !== null) {
+        who = meta.label
+      }
+      return { where, who, whoTitle }
+    }
+
+    /**
+     * Clock and full date of the post, in the browser's locale.
+     * @param time - event time (epoch milliseconds or ISO text).
+     * @returns `{ clock, iso, full }`, or null for a missing time.
+     */
+    function postTime(time) {
+      if (time === undefined || time === null) return null
+      const date = new Date(time)
+      if (Number.isNaN(date.getTime())) return null
+      return {
+        clock: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        iso: date.toISOString(),
+        full: date.toLocaleString(),
+      }
+    }
+
+    /** Transcript styles; theme tokens keep it in step with light and dark. */
+    const POST_CSS = `
+.dtb-post{display:flex;flex-direction:column;gap:6px;min-width:0;padding:2px 0 2px 12px;border-left:2px solid var(--dsw-alias-border-l2,rgba(127,127,127,.35))}
+.dtb-postHead{display:flex;align-items:center;gap:6px;min-width:0;color:var(--dsw-alias-label-tertiary);font-size:var(--dsh-content-font-size-secondary,13px);line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px))}
+.dtb-postIcon{display:inline-flex;flex:none}
+.dtb-postTitle{flex:none}
+.dtb-postSep{flex:none;width:2px;height:2px;border-radius:1px;background:var(--dsw-alias-label-caption,currentColor)}
+.dtb-postMeta{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dtb-postTime{flex:none;margin-left:auto;font:var(--dsw-font-xxs-12,12px/16px inherit)}
+.dtb-postBody{min-width:0;color:var(--dsw-alias-label-primary)}
+.dtb-postPlain{white-space:pre-wrap;overflow-wrap:anywhere}
+.dtb-postCaption{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:16px}
+.dtb-postFiles{display:flex;flex-wrap:wrap;gap:6px}
+.dtb-postFile{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:.5px solid var(--dsw-alias-border-l2,rgba(127,127,127,.35));border-radius:var(--dsw-radius-md,8px);padding:4px 10px;font-size:13px;color:var(--dsw-alias-label-secondary)}
+`
+
+    /**
+     * Markdown control labels from this plugin's dictionary.
+     * @param t - locale reader.
+     */
+    function postMarkdownLabels(t) {
+      return {
+        code: {
+          copyLabel: t('postCopy'),
+          copiedLabel: t('postCopied'),
+          toolbarLabels: { codeLabel: t('postCode'), wrapLabel: t('postWrap'), unwrapLabel: t('postUnwrap') },
+        },
+        footnotes: t('postFootnotes'),
+      }
+    }
+
+    /**
+     * Keyed Chat renderer of one post.
+     * @param props - `node`, `loadImage`, `renderFactorySlot` and `t` from the Chat node slot.
+     */
+    function TelegramPostView(props) {
+      const { node, loadImage, renderFactorySlot, t } = props
+      const data = node.data
+      const labels = React.useMemo(() => postMarkdownLabels(t), [t])
+      const { where, who, whoTitle } = postLabels(data.meta, t)
+      const time = postTime(data.time)
+      const Icon = primitives.IconPaperPlaneOutlineRegular
+      const Markdown = primitives.MarkdownText
+      const head = [
+        h('span', { key: 'icon', className: 'dtb-postIcon', 'aria-hidden': true }, Icon === undefined ? null : h(Icon, { size: 14 })),
+        h('span', { key: 'title', className: 'dtb-postTitle' }, t('postTitle')),
+      ]
+      if (where !== null) {
+        head.push(h('span', { key: 'sep-where', className: 'dtb-postSep', 'aria-hidden': true }))
+        head.push(h('span', { key: 'where', className: 'dtb-postMeta' }, where))
+      }
+      if (who !== null) {
+        head.push(h('span', { key: 'sep-who', className: 'dtb-postSep', 'aria-hidden': true }))
+        head.push(h('span', { key: 'who', className: 'dtb-postMeta', title: whoTitle }, who))
+      }
+      if (time !== null) head.push(h('time', { key: 'time', className: 'dtb-postTime', dateTime: time.iso, title: time.full }, time.clock))
+      return h(
+        'div',
+        { className: 'dtb-post', 'data-telegram-post': true },
+        h('div', { className: 'dtb-postHead' }, ...head),
+        data.text.length === 0
+          ? null
+          : h(
+              'div',
+              { className: 'dtb-postBody' },
+              Markdown === undefined ? h('div', { className: 'dtb-postPlain' }, data.text) : h(Markdown, { text: data.text, labels }),
+            ),
+        data.images.length === 0 || typeof renderFactorySlot !== 'function'
+          ? null
+          : renderFactorySlot('conversation.images.content', { images: data.images, loadImage, align: 'start' }),
+        ...data.stickers.map((sticker, index) => h('div', { key: `sticker-${index}`, className: 'dtb-postCaption' }, `${t('postSticker')} ${sticker}`)),
+        data.files.length === 0
+          ? null
+          : h(
+              'div',
+              { className: 'dtb-postFiles' },
+              ...data.files.map((file, index) =>
+                h('span', { key: `file-${index}`, className: 'dtb-postFile', title: file.name }, `📎 ${file.name ?? t('postFile')}`),
+              ),
+            ),
+      )
+    }
+
     /** Required client services. */
     const inject = ['slots', 'locale', 'remote', 'remote.credentials', 'configForms']
 
@@ -799,11 +1112,32 @@ window.__ModuleLoader__.load({
           ),
         'dsh-telegram-bot: bundle settings',
       )
+
+      if (typeof document !== 'undefined') {
+        ctx.effect(() => {
+          const style = document.createElement('style')
+          style.dataset.plugin = '@soffits/dsh-telegram-bot'
+          style.textContent = POST_CSS
+          document.head.appendChild(style)
+          return () => style.remove()
+        }, 'dsh-telegram-bot: post styles')
+      }
+      // Chat may be absent (a client without the transcript); settings still load.
+      ctx.inject(['uiConversation'], (scope) => {
+        scope.uiConversation.events.register(postDefinition)
+      })
+      ctx.slots.inject('conversation.chat.node', () =>
+        ctx.slots.register({ name: 'conversation.chat.node', key: POST_KIND, locale: NS }, TelegramPostView),
+      )
     }
 
     exports.NS = NS
     exports.apply = apply
     exports.inject = inject
+    exports.postDefinition = postDefinition
+    exports.readPost = readPost
+    exports.postLabels = postLabels
+    exports.TelegramPostView = TelegramPostView
     return module.exports
   },
 })

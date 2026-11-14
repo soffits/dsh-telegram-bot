@@ -10,6 +10,7 @@ import {
   FORWARD_BATCH_MS,
   MAX_TELEGRAM_TEXT,
   POLL_TIMEOUT_SECONDS,
+  POST_SOURCE_KIND,
   RESTART_DEBOUNCE_MS,
   RETRY_DELAY_MS,
   SILENT_REPLY,
@@ -3374,9 +3375,9 @@ export function apply(ctx, config) {
    * Put a message into a session without starting a turn: appended now to an
    * idle session whose surface starts with its system prompt, otherwise queued
    * for the next step (see recordNote for why). Either way the Web UI shows
-   * it, images included, and the model reads it at its next step.
+   * it and the model reads it at its next step.
    * @param agent - the session's live agent.
-   * @param message - a user message (`{ id, role, content, source }`).
+   * @param message - a user-role message (`{ id, role, content, source }`).
    */
   function recordMessage(agent, message) {
     if (agent.status === 'idle' && typeof agent.session?.append === 'function' && hasSystemHead(agent.session)) {
@@ -3756,6 +3757,33 @@ export function apply(ctx, config) {
   }
 
   /**
+   * The source of a send's copy in the bound session. It is not `user`, so
+   * DSH does not take the copy for something the user typed (Web UI bubble,
+   * session title, turn outline, last-prompt time) and the mirror skips it.
+   * `form: 'notice'` with `summary` is how DSH's Chat shows it when the
+   * bot's client is not loaded: a one-line notice row. The bot's client
+   * draws it in full, pictures included, on the assistant's side.
+   * @param post - `{ header, threadId, topic, from, self }`; `header` is the
+   *   line the model also reads, `from` the request's sender.
+   * @returns the message source.
+   */
+  function postSource({ header, threadId, topic, from, self }) {
+    const job = typeof from?.job === 'string' && from.job.trim().length > 0 ? from.job.trim() : null
+    const label = typeof from?.label === 'string' && from.label.trim().length > 0 ? from.label.trim() : null
+    return {
+      kind: POST_SOURCE_KIND,
+      form: 'notice',
+      summary: header.slice(0, 120),
+      threadId,
+      topic: topic ?? null,
+      job,
+      label: job === null ? label : null,
+      fromSession: typeof from?.sessionId === 'string' && from.sessionId.length > 0 ? from.sessionId : null,
+      self: self === true,
+    }
+  }
+
+  /**
    * An error a retry will not fix: callers such as scheduled-job delivery
    * read `retryable: false` and stop trying.
    * @param error - the error, or its message.
@@ -3881,14 +3909,19 @@ export function apply(ctx, config) {
         const self = sessionId === request?.from?.sessionId
         const label = self ? ' by this session' : sender.length > 0 ? ` by ${sender}` : ''
         const where = target.name === undefined ? `topic ${threadId}` : `topic "${target.name}"`
+        const header = `Sent to the Telegram ${where}${label}`
         const stickerLine = sticker === undefined ? '' : `\n[Sticker ${describeSticker(sticker)}]`
-        const content = [{ type: 'text', text: `[Sent to the Telegram ${where}${label}]${text.trim().length > 0 ? `\n${text.trim()}` : ''}${stickerLine}` }]
+        const content = [{ type: 'text', text: `[${header}]${text.trim().length > 0 ? `\n${text.trim()}` : ''}${stickerLine}` }]
         content.push(...await recordedFiles(files))
         if (sticker !== undefined) content.push(...await recordedSticker(sticker, signal))
-        const id = randomUUID()
-        // Recording never starts a turn. The request id keeps the mirror from
-        // echoing the copy back into the topic.
-        recordMessage(agent, { id, role: 'user', content, source: { kind: 'user', rpcId: `telegram-post:${id}` } })
+        // Recording never starts a turn. The model reads it as user-role
+        // context; the source says it is a post, not something the user typed.
+        recordMessage(agent, {
+          id: randomUUID(),
+          role: 'user',
+          content,
+          source: postSource({ header, threadId, topic: target.name, from: request?.from, self }),
+        })
         recorded = true
       } catch (error) {
         // The message is already in Telegram; report the missing record

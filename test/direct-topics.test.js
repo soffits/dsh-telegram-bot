@@ -233,6 +233,13 @@ test('private-chat topics send with message_thread_id and edit by message id', a
     agent.emit('session/event', { id: 'session-1' }, { type: 'turn/start', data: { turn: 't1' } })
     agent.emit('agent/assistant-stream', { frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'Hello' } } })
     await wait(450)
+    // Narration before a tool call shows while streaming, but only the answer stays.
+    agent.emit('agent/assistant-stream', { frame: { type: 'chunk', chunk: { type: 'block-start', blockType: 'text' } } })
+    agent.emit('agent/assistant-stream', { frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'Final answer' } } })
+    agent.session.log = [
+      { type: 'assistant/message', data: { turn: 't1', message: { content: [{ type: 'text', text: 'Hello' }, { type: 'tool-call', id: 'c1', name: 'bash', input: {} }] } } },
+      { type: 'assistant/message', data: { turn: 't1', message: { content: [{ type: 'text', text: 'Final answer' }] } } },
+    ]
     const edits = telegram.calls.filter((call) => call.method === 'editMessageText')
     assert.ok(edits.length >= 1, 'the stream is edited into the placeholder')
     for (const call of edits) {
@@ -241,6 +248,11 @@ test('private-chat topics send with message_thread_id and edit by message id', a
     }
     agent.emit('session/event', { id: 'session-1' }, { type: 'turn/end', data: { turn: 't1' } })
     await wait(300)
+    const posted = telegram.calls.filter((call) =>
+      (call.method === 'editMessageText' || call.method === 'sendMessage') && call.body?.message_thread_id === 7001).at(-1)
+    assert.match(posted.body.text, /Final answer/)
+    assert.doesNotMatch(posted.body.text, /Hello/, 'narration between tool calls is not kept in the reply')
+    agent.session.log = []
 
     // Autonomous goal rounds must be mirrored into the topic too.
     agent.emit('session/event', { id: 'session-1' }, { type: 'turn/start', data: { turn: 'g1' } })

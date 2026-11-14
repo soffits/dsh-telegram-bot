@@ -45,7 +45,7 @@ import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.j
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference, senderLabel } from './message-context.js'
 import { createSentLog } from './sent-log.js'
-import { catalogKey, createModelCatalog, defaultModelOf, effortChoices, healGoneRoute, effortName, findModel, modelByKey, modelName, pageOf, pickedSelection, providerByKey, sameSelection, sessionModelOf } from './models.js'
+import { catalogKey, createModelCatalog, defaultModelOf, effortChoices, effortName, findModel, isGoneModel, modelByKey, modelName, pageOf, pickedSelection, providerByKey, sameSelection, sessionModelOf } from './models.js'
 import {
   allowedChatsOf,
   allowedUsersOf,
@@ -1967,18 +1967,43 @@ export function apply(ctx, config) {
    * @returns the live agent.
    */
   /**
-   * Move a bound session whose model route is gone from this host onto the
-   * default model (see `healGoneRoute`), so the topic keeps answering.
+   * Move a topic's session off a model the catalog no longer offers (a
+   * removed provider or a dropped model: every turn would fail before any
+   * request, so no fallback can help). The session goes to the current
+   * default through the Web picker's `selectModel`, a stale per-topic pick is
+   * dropped, and the topic gets one line about it. A model that is merely
+   * failing now, or no catalog, changes nothing.
+   * @param chat - chat bridge state.
    * @param agent - the session's live agent.
    */
-  async function healRoute(agent) {
+  async function healRoute(chat, agent) {
     try {
-      const moved = await healGoneRoute(ctx, agent)
-      if (moved !== undefined) {
-        warn(`${agent.session?.id ?? agent.id} was on ${moved.from.provider}/${moved.from.model}, which this host no longer has; it continues on the default ${moved.to.provider}/${moved.to.model}`)
+      const catalog = await modelCatalog.load()
+      const pickKey = `${chat.chatId}:${chat.threadId}`
+      if (isGoneModel(catalog, state.pickedModels?.[pickKey])) {
+        delete state.pickedModels[pickKey]
+        void persistState()
       }
+      const current = agent.model?.current?.()
+      if (!isGoneModel(catalog, current)) return
+      const fallback = defaultModelOf(ctx)
+      if (fallback === undefined || isGoneModel(catalog, fallback)) return
+      const controller = ctx.get('sessionController')
+      if (typeof controller?.selectModel === 'function') {
+        await controller.selectModel({ sessionId: agent.session?.id ?? chat.sessionId, ...fallback })
+      } else {
+        agent.model.select(fallback)
+      }
+      warn(`${agent.session?.id ?? agent.id} was on ${current.provider}/${current.model}, which is not offered any more; it continues on ${fallback.provider}/${fallback.model}`)
+      const name = (selection) => findModel(catalog, selection)?.model.name ?? `${selection.provider}/${selection.model}`
+      await send(
+        chat.chatId,
+        `🤖 ${tr(`${escapeHtml(`${current.provider}/${current.model}`)} is gone; this topic now uses ${escapeHtml(name(fallback))}.`, `${escapeHtml(`${current.provider}/${current.model}`)} больше недоступна; топик теперь использует ${escapeHtml(name(fallback))}.`)}`,
+        bridgeAbort.signal,
+        chat.threadId,
+      )
     } catch (error) {
-      warn(`could not check the model route of ${agent.session?.id ?? agent.id}: ${messageOf(error)}`)
+      warn(`could not check the model of ${agent.session?.id ?? agent.id}: ${messageOf(error)}`)
     }
   }
 
@@ -1997,7 +2022,7 @@ export function apply(ctx, config) {
         if (typeof live.session?.header?.cwd === 'string') chat.cwd = live.session.header.cwd
         attachAgent(live, chat)
         await syncPermission(chat, live)
-        await healRoute(live)
+        await healRoute(chat, live)
         return live
       }
       try {
@@ -2007,7 +2032,7 @@ export function apply(ctx, config) {
         if (typeof agent?.session?.header?.cwd === 'string') chat.cwd = agent.session.header.cwd
         attachAgent(agent, chat)
         await syncPermission(chat, agent)
-        await healRoute(agent)
+        await healRoute(chat, agent)
         info(`resumed Telegram session ${chat.sessionId}`)
         return agent
       } catch (error) {

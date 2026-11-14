@@ -79,34 +79,19 @@ export function defaultModelOf(ctx) {
   return undefined
 }
 
-/** Failure codes that mean a route is gone from this host, not briefly down. */
-const GONE_ROUTE_CODES = new Set(['NO_ADAPTER', 'UNKNOWN_MODEL'])
-
 /**
- * Move a session off a model route this host no longer has (a provider that
- * was removed, a model dropped from its catalog) onto the default model, so
- * a topic left on that route answers again instead of failing every turn
- * with NO_ADAPTER. The switch is recorded on the session only, the way a job
- * picks its model; the saved default stays as it is. Routes that resolve, or
- * fail for any other reason, are left alone.
- * @param ctx - Host context (`llm`, `agentDefaultModel`).
- * @param agent - the session's live agent.
- * @returns the dead route and the default it moved to, or undefined.
+ * Whether the catalog no longer offers a selection's provider or model, for
+ * example after a provider was removed from the profile. A provider the
+ * catalog reports as failing is not counted: its models are unknown now, not
+ * gone. Without a catalog nothing is called gone.
+ * @param catalog - loaded catalog, or undefined.
+ * @param selection - provider and model, or undefined.
+ * @returns true when the selection names something the catalog dropped.
  */
-export async function healGoneRoute(ctx, agent) {
-  const current = agent?.model?.current?.()
-  const llm = ctx.get('llm')
-  if (current === undefined || typeof llm?.resolveCallConfig !== 'function') return undefined
-  try {
-    await llm.resolveCallConfig(toSelection(current))
-    return undefined
-  } catch (error) {
-    if (!GONE_ROUTE_CODES.has(error?.code)) return undefined
-  }
-  const fallback = defaultModelOf(ctx)
-  if (fallback === undefined || (fallback.provider === current.provider && fallback.model === current.model)) return undefined
-  agent.model.select(fallback)
-  return { from: toSelection(current), to: fallback }
+export function isGoneModel(catalog, selection) {
+  if (catalog === undefined || typeof selection?.provider !== 'string' || typeof selection?.model !== 'string') return false
+  if (catalog.failures.some((failure) => failure?.id === selection.provider)) return false
+  return findModel(catalog, selection) === undefined
 }
 
 /**

@@ -1961,6 +1961,34 @@ test('/new starts on the default unless a model was picked in the topic', async 
   }
 })
 
+test('a topic whose model was removed from the catalog moves to the default, drops its pick and says so', async () => {
+  const run = await start({}, {
+    sessions: { 'session-old': { sessionId: 'session-old', chatId: 100, threadId: 7001, title: 'Chat-1' } },
+    threads: { '100:7001': 'session-old' },
+    pickedModels: { '100:7001': { provider: 'gone-provider', model: 'x' } },
+  })
+  try {
+    run.host.defaults.selection = { ...GEMINI }
+    // The anthropic provider is no longer in the catalog.
+    run.host.services.sessionController.modelCatalog = async () => ({ groups: CATALOG_GROUPS.filter((group) => group.id !== 'anthropic'), failures: [] })
+    const old = run.host.makeAgent('session-old', '/tmp/default-workspace')
+    old.model.select(OPUS)
+    run.telegram.push({ message_thread_id: 7001, text: 'hello' })
+    await wait(250)
+    assert.deepEqual(old.model.current(), GEMINI)
+    assert.deepEqual(run.host.modelSelections.at(-1), { sessionId: 'session-old', ...GEMINI }, 'through the Web UI\'s selectModel')
+    assert.equal((await run.readState()).pickedModels?.['100:7001'], undefined, 'the stale pick is dropped')
+    const notices = texts(run.telegram.calls, 7001).filter((text) => /is gone/.test(text))
+    assert.equal(notices.length, 1)
+    assert.match(notices[0], /anthropic\/claude-opus-5-5 is gone; this topic now uses/)
+    run.telegram.push({ message_thread_id: 7001, text: 'again' })
+    await wait(200)
+    assert.equal(texts(run.telegram.calls, 7001).filter((text) => /is gone/.test(text)).length, 1, 'said once')
+  } finally {
+    run.stop()
+  }
+})
+
 test('the model picker lists providers, then their models, and a pick switches the agent', async () => {
   const run = await start()
   try {

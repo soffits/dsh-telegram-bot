@@ -38,6 +38,7 @@ import { STEER_REACTION, busyMode, clearTelegramInbox, hasPendingInput, steerPro
 import { loadState, STATE_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
+import { messageAnswer, turnAnswer } from './final-text.js'
 import { createOutbox } from './outbox.js'
 import { deliveredToTopic, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, resolveSendTarget, topicNameOf, topicTargetFor, topicTask, topicTitle } from './topics.js'
 import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.js'
@@ -2391,13 +2392,18 @@ export function apply(ctx, config) {
     // Take the finished turn out of the chat state before any network wait,
     // so the next turn (from any client) starts with clean buffers.
     let text = chat.text.trim()
+    // The durable messages give the answer without the narration written
+    // between tool calls, which the stream showed only as a live draft
+    // (src/final-text.js). They are also complete when stream frames were
+    // missed. The streamed text stays for a turn that left no answer.
+    let recorded
     if (source === 'mirror') {
-      // Durable assistant messages are complete even when stream frames were
-      // missed, so they win for turns started outside Telegram.
-      const recorded = (chat.mirrorTexts?.get(turn) ?? []).join('\n\n').trim()
-      if (recorded.length > 0) text = recorded
+      recorded = (chat.mirrorTexts?.get(turn) ?? []).join('\n\n').trim()
       chat.mirrorTexts?.delete(turn)
+    } else {
+      recorded = turnAnswer(chat.boundAgent?.session?.log, turn)
     }
+    if (recorded.length > 0) text = recorded
     const messageId = chat.messageId
     const thinkingId = chat.thinkingMessageId
     const toolId = chat.toolMessageId
@@ -2554,8 +2560,7 @@ export function apply(ctx, config) {
     }
     if (event.type === 'assistant/message') {
       const message = event.data?.message ?? event.data
-      const content = Array.isArray(message?.content) ? message.content : []
-      const text = content.filter((block) => block?.type === 'text').map((block) => block.text).join('\n').trim()
+      const text = messageAnswer(message)
       if (text.length === 0) return
       if (chat.turnSource !== 'mirror' && chat.deferredMirrorTurn?.turn !== turn) return
       chat.mirrorTexts ??= new Map()

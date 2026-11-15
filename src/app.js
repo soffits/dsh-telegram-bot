@@ -43,6 +43,7 @@ import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
 import { messageAnswer, turnAnswer } from './final-text.js'
 import { createOutbox } from './outbox.js'
+import { agentsListText, childState, collectSubagents, createAgentBoards, reportOf } from './agents.js'
 import { deliveredToTopic, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor } from './topics.js'
 import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.js'
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
@@ -4264,6 +4265,110 @@ export function apply(ctx, config) {
   }
 
   /**
+   * The description a parent gave one of its subagents, from its catalog.
+   * @param parentId - parent session.
+   * @param childId - subagent session.
+   * @returns the label, or undefined.
+   */
+  async function subagentLabel(parentId, childId) {
+    if (typeof parentId !== 'string') return undefined
+    const children = await ctx.get('subagents')?.listChildren(parentId).catch(() => undefined)
+    const label = Array.isArray(children) ? children.find((child) => child.id === childId)?.label : undefined
+    return typeof label === 'string' && label.trim().length > 0 ? label.trim() : undefined
+  }
+
+  /**
+   * Post a subagent status message, after what the topic has queued.
+   * @param chat - topic state.
+   * @param text - status text.
+   * @returns the message id, or undefined.
+   */
+  function postAgentStatus(chat, text) {
+    const posted = (chat.answerEdit ?? Promise.resolve()).catch(() => {}).then(async () => {
+      try {
+        const result = await call('sendMessage', {
+          chat_id: chat.chatId,
+          ...topicTarget(chat.chatId, chat.threadId),
+          text,
+          disable_notification: true,
+        }, bridgeAbort.signal)
+        return typeof result?.message_id === 'number' ? result.message_id : undefined
+      } catch (error) {
+        if (!bridgeAbort.signal.aborted) warn(`subagent status send failed: ${messageOf(error)}`)
+        return undefined
+      }
+    })
+    chat.answerEdit = posted.then(() => {}, () => {})
+    return posted
+  }
+
+  /**
+   * Edit a subagent status message in place.
+   * @returns `ok`, `gone` when the message can no longer be edited, or `failed`.
+   */
+  async function editAgentStatus(chat, messageId, text) {
+    try {
+      await call('editMessageText', {
+        chat_id: chat.chatId,
+        message_id: messageId,
+        ...(chat.threadId === undefined || chat.threadId === 0 ? {} : { message_thread_id: chat.threadId }),
+        text,
+      }, bridgeAbort.signal)
+      return 'ok'
+    } catch (error) {
+      const message = messageOf(error)
+      if (/not modified/i.test(message)) return 'ok'
+      if (/message to edit not found|message can't be edited|message_id_invalid/i.test(message)) return 'gone'
+      if (!bridgeAbort.signal.aborted) warn(`subagent status edit failed: ${message}`)
+      return 'failed'
+    }
+  }
+
+  /**
+   * The `/agents` text for a session: its running and latest subagents with
+   * their state and the start of their last report. Read from DSH's durable
+   * catalogs and session logs, so it works for subagents of earlier runs.
+   * @param sessionId - the topic's session.
+   * @returns the reply text, or undefined when this DSH has no subagent service.
+   */
+  async function subagentsText(sessionId) {
+    const subagents = ctx.get('subagents')
+    if (typeof subagents?.listChildren !== 'function') return undefined
+    const agents = ctx.get('agents')
+    const isRunning = (id) => agents?.get(id)?.status === 'running'
+    const { rows, total } = await collectSubagents((id) => subagents.listChildren(id), sessionId, isRunning)
+    const now = Date.now()
+    const query = ctx.get('sessionQuery')
+    const detailed = await Promise.all(rows.map(async (row) => {
+      let timing
+      let model
+      let observation
+      try {
+        observation = await query?.observeSession(row.id)
+        const values = observation?.projections?.values
+        timing = values?.subagentTiming
+        const selection = values?.modelSelection
+        model = (selection?.next ?? selection?.pending ?? selection?.lastUsed)?.model
+      } catch {
+        // State falls back to what the live agent says.
+      } finally {
+        observation?.[Symbol.dispose]?.()
+      }
+      const live = agents?.get(row.id)
+      if (typeof live?.model?.current === 'function') model = live.model.current()?.model ?? model
+      let events = []
+      try {
+        events = (await query?.readSurface(row.id))?.events ?? []
+      } catch {
+        // No report preview.
+      }
+      const { state, elapsedMs } = childState({ status: live?.status, timing }, now)
+      return { ...row, label: row.label || `subagent ${String(row.id).slice(0, 8)}`, model, state, elapsedMs, report: reportOf(events) }
+    }))
+    return agentsListText(detailed, total, now, tr)
+  }
+
+  /**
    * Deliver a session preview into its topic.
    * @param record - topic mapping.
    * @param chatId - control chat.
@@ -5252,7 +5357,7 @@ export function apply(ctx, config) {
               ? `${tr('To start a conversation, create a topic and send a message in it, or just send a message here in All: Telegram makes a topic for it. In the topic, pick the workspace, then a new session or an existing one. /sessions opens existing sessions in new topics.', 'Чтобы начать разговор, создай топик и напиши в него, или просто напиши здесь, в All: Telegram сам создаст для сообщения топик. В топике выбери workspace, затем новую или существующую сессию. /sessions открывает существующие сессии в новых топиках.')}\n`
               : `${tr('This topic has no session yet. Send a message to choose a workspace.', 'У этого топика ещё нет сессии. Напиши сообщение, чтобы выбрать workspace.')}\n`) +
           `\n<b>${tr('First run', 'Первый запуск')}:</b> @BotFather → Bot Settings → <b>Threaded mode</b> → ${tr('Enable', 'Включить')}.\n` +
-          `${tr('Commands', 'Команды')}: /sessions, /new, /workspace, /current, /menu, /rename, /topic, /fork, /last, /clear, /stop, /restart, /status, /id, /ping, /goal.`,
+          `${tr('Commands', 'Команды')}: /sessions, /new, /workspace, /current, /menu, /rename, /topic, /fork, /last, /agents, /clear, /stop, /restart, /status, /id, /ping, /goal.`,
         signal,
         threadId,
       )
@@ -5450,6 +5555,17 @@ export function apply(ctx, config) {
           return
         }
       }
+      return
+    }
+
+    if (command === '/agents') {
+      if (!inSession) {
+        await send(chat.id, tr('This topic is not bound to a session. /sessions.', 'Этот topic не привязан к сессии. /sessions.'), signal, threadId)
+        return
+      }
+      const listed = await subagentsText(chatState.sessionId)
+      const body = listed ?? tr('This DSH has no subagent service.', 'В этом DSH нет сервиса субагентов.')
+      await sendPlain(chat.id, body.length > MAX_TELEGRAM_TEXT ? `${body.slice(0, MAX_TELEGRAM_TEXT - 1)}…` : body, signal, threadId)
       return
     }
 
@@ -6568,6 +6684,29 @@ export function apply(ctx, config) {
     void stateReady.then(() => outbox.start()).catch((error) => reportError('outbox', error))
     return () => outbox.stop()
   }, 'dsh-telegram-bot: outbox')
+
+  // Subagents started by a turn the topic shows get one status message per
+  // batch (src/agents.js).
+  const agentBoards = createAgentBoards({
+    parentOf: (id) => ctx.get('agents')?.get(id)?.session?.header?.parentSession,
+    topicOf: (sessionId) => (lifetime === undefined ? undefined : chatForSession(sessionId)),
+    turnOf: (chat) => (chat.busy && !chat.done ? chat.turnEpoch : undefined),
+    labelOf: subagentLabel,
+    modelOf: async (id) => (await sessionModelOf(ctx, id).catch(() => undefined))?.model,
+    post: postAgentStatus,
+    edit: editAgentStatus,
+    reportError,
+    tr,
+  })
+  ctx.on('subagent/start', (info) => fireAndForget('subagent status', () => agentBoards.onStart(info)), { global: true })
+  ctx.on('subagent/end', (info) => {
+    try {
+      agentBoards.onEnd(info)
+    } catch (error) {
+      reportError('subagent status', error)
+    }
+  }, { global: true })
+  ctx.effect(() => () => agentBoards.dispose(), 'dsh-telegram-bot: subagent status')
 
   // Record each Telegram sender on the prompt the session controller built for it.
   ctx.on('agent/pre-step', (payload, next) => principals.preStep(payload, next), { global: true })

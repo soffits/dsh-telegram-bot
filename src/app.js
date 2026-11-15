@@ -38,6 +38,7 @@ import {
 import { admitText, promptRequestId } from './admission.js'
 import { STEER_REACTION, busyMode, clearTelegramInbox, hasPendingInput, steerPrompt } from './steer.js'
 import { createPrincipalTagger, sendPrincipal, telegramUserPrincipal } from './sender.js'
+import { clientTimeZone, formatTelegramDate, resolveTimeZone } from './clock.js'
 import { loadState, STATE_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
@@ -135,6 +136,7 @@ export function apply(ctx, config) {
   // prompt is handed to DSH (a topic binding or the queue may come between).
   const promptSenders = new Map()
   const principals = createPrincipalTagger()
+  let reportedTimeZoneError
 
   /**
    * Persist the chat → session mapping atomically.
@@ -2538,8 +2540,8 @@ export function apply(ctx, config) {
     const source = message?.source
     let label
     if (source?.kind === 'user') {
-      if (typeof source.rpcId === 'string' && source.rpcId.startsWith('telegram')) return
       if (telegramMessageIds.delete(message.id)) return
+      if (typeof source.rpcId === 'string' && source.rpcId.startsWith('telegram')) return
       label = tr('🖥 From Web', '🖥 Из Web')
     } else if (source?.kind === 'schedule') {
       label = tr('⏰ Scheduled task', '⏰ Задача по расписанию')
@@ -2760,7 +2762,7 @@ export function apply(ctx, config) {
       }
       let requestId
       try {
-        requestId = await steerPrompt(ctx, agent, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text, attachments, principal: promptPrincipal(chat, messageId), context: promptContext(chat, messageId) }, signal, principals)
+        requestId = await steerPrompt(ctx, agent, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text, attachments, ...promptDetails(chat, messageId), clientTimeZone: clientTimeZone(messageTimeZone()) }, signal, principals)
       } catch (error) {
         // Not admitted: the bot's queue still delivers it after the turn.
         reportError('steer', error)
@@ -2852,18 +2854,22 @@ export function apply(ctx, config) {
       const agent = await ensureAgent(chat)
       await unarchiveForTopic(chat)
       let admitted = false
-      const principal = promptPrincipal(chat, messageId)
-      const context = promptContext(chat, messageId)
+      const details = promptDetails(chat, messageId)
+      const zone = clientTimeZone(messageTimeZone())
       if (nativeText) {
-        principals.remember(promptRequestId(chat.chatId, messageId), principal, context)
-        admitted = admitText(ctx, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text }, signal)
+        principals.remember(promptRequestId(chat.chatId, messageId), details)
+        admitted = admitText(ctx, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text, clientTimeZone: zone }, signal)
         if (admitted !== false) await admitted
       }
       if (!admitted) {
         const id = randomUUID()
         telegramMessageIds.add(id)
-        principals.remember(id, principal, context)
-        agent.followup({ id, role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user', ...(principal === undefined ? {} : { principal }) } })
+        principals.remember(id, details)
+        const { principal } = details
+        // With a request id and a zone on the source, DSH's clock context reads
+        // times in the sender's zone, as it does for a Web prompt.
+        const rpcId = Number.isSafeInteger(messageId) ? promptRequestId(chat.chatId, messageId) : undefined
+        agent.followup({ id, role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user', ...(rpcId === undefined ? {} : { rpcId }), ...(rpcId === undefined || zone === undefined ? {} : { clientTimeZone: zone }), ...(principal === undefined ? {} : { principal }) } })
       }
       // The turn/end listener finalizes the Telegram turn. whenIdle is only a
       // fallback for the turn that started this epoch, never a queued turn.
@@ -6048,7 +6054,7 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    * @param currentSession - session bound to the message's topic, if any.
    * @returns prompt text, its context for the notice before it, attachment
-   *   blocks, Telegram message id and sender.
+   *   blocks, Telegram message id, sender and send time (Unix seconds).
    */
   async function promptFrom(message, signal, currentSession) {
     const attachments = []
@@ -6091,7 +6097,8 @@ export function apply(ctx, config) {
         warn(`sent-message lookup failed: ${messageOf(error)}`)
       }
     }
-    let { context, text } = composePrompt(message, { botId: me?.id, ownFile, replyFile, sent, currentSession })
+    const timeZone = messageTimeZone()
+    let { context, text } = composePrompt(message, { botId: me?.id, ownFile, replyFile, sent, currentSession, formatDate: (seconds) => formatTelegramDate(seconds, timeZone) })
     // A recording speaks for itself through its transcript, a sticker through its note.
     if (ownFile && !forwarded && spokenMediaOf(message) === undefined && message.sticker === undefined && messageBody(message).trim().length === 0) {
       text = tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
@@ -6101,22 +6108,24 @@ export function apply(ctx, config) {
       text = context
       context = undefined
     }
-    return { text, context, attachments, messageId: message.message_id, from: message.from }
+    // An edited message is the text as of its edit.
+    return { text, context, attachments, messageId: message.message_id, from: message.from, date: message.edit_date ?? message.date }
   }
 
   /**
-   * Keep who wrote a Telegram message, and the context of its prompt, until
-   * the prompt reaches DSH.
+   * Keep who wrote a Telegram message, when, and the context of its prompt,
+   * until the prompt reaches DSH.
    * @param chatId - Telegram chat.
-   * @param prompt - `{ messageId, from, context }` from `promptFrom`.
+   * @param prompt - `{ messageId, from, context, date }` from `promptFrom`.
    */
-  function rememberPrompt(chatId, { messageId, from, context }) {
+  function rememberPrompt(chatId, { messageId, from, context, date }) {
     if (!Number.isSafeInteger(messageId)) return
     const sender = from === null ? undefined : from
-    if (sender === undefined && context === undefined) return
+    const sent = typeof date === 'number' && Number.isFinite(date) ? date : undefined
+    if (sender === undefined && context === undefined && sent === undefined) return
     const key = `${chatId}:${messageId}`
     promptSenders.delete(key)
-    promptSenders.set(key, { from: sender, context })
+    promptSenders.set(key, { from: sender, context, date: sent })
     if (promptSenders.size > 1024) promptSenders.delete(promptSenders.keys().next().value)
   }
 
@@ -6137,13 +6146,32 @@ export function apply(ctx, config) {
   }
 
   /**
-   * The context of a Telegram message's prompt, for the notice before it.
+   * What the notice before a Telegram message's prompt says, and the sender
+   * recorded on it.
    * @param chat - the topic the prompt runs in.
    * @param messageId - Telegram message id.
-   * @returns the context blocks, or undefined.
+   * @returns `{ principal, context, sentAt }`, each undefined when not known.
    */
-  function promptContext(chat, messageId) {
-    return promptSenders.get(`${chat.chatId}:${messageId}`)?.context
+  function promptDetails(chat, messageId) {
+    const entry = promptSenders.get(`${chat.chatId}:${messageId}`)
+    return {
+      principal: promptPrincipal(chat, messageId),
+      context: entry?.context,
+      sentAt: formatTelegramDate(entry?.date, messageTimeZone()),
+    }
+  }
+
+  /**
+   * The zone message times are shown in: `timeZone`, else this process's zone.
+   * A name the runtime does not know is reported once and the process zone is used.
+   */
+  function messageTimeZone() {
+    const { timeZone, error } = resolveTimeZone(readLive(config.timeZone, ''))
+    if (error !== undefined && error !== reportedTimeZoneError) {
+      reportedTimeZoneError = error
+      warn(error)
+    }
+    return timeZone
   }
 
   /**
@@ -6207,6 +6235,7 @@ export function apply(ctx, config) {
         attachments: prompts.flatMap((item) => item.attachments),
         messageId: first.messageId,
         from: first.from,
+        date: first.date,
       }
       fireAndForget('forward-batch', () => dispatchPrompt(chatState, chatId, threadId, merged, signal))
     }, FORWARD_BATCH_MS)

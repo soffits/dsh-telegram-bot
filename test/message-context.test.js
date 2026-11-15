@@ -14,7 +14,7 @@ test('long replied-to text is cut at a word with a note', () => {
   }, { maxQuote: 100 })
   assert.equal(text, 'summary?', 'the prompt is only what the person wrote')
   const lines = context.split('\n')
-  assert.equal(lines[0], '[Replying to a message from Kim (sent 1970-01-01 00:00 UTC)]')
+  assert.equal(lines[0], '[Replying to a message from Kim (sent Thu 1970-01-01 00:00 UTC+00:00)]')
   assert.ok(lines[1].length <= 102)
   assert.match(lines[1], /word\d+$/u, 'cut between words')
   assert.match(lines[2], /^> \[…truncated, \d+ more characters\]$/u)
@@ -32,7 +32,7 @@ test('the user replying to their own forwarded message sees both labels', () => 
       forward_origin: { type: 'chat', sender_chat: { id: -1009, title: 'Team' }, author_signature: 'Lee', date: 60 },
     },
   })
-  assert.equal(text, '[Replying to a message from the user (their own earlier message) (sent 1970-01-01 00:00 UTC; forwarded from "Team", signed Lee, originally sent 1970-01-01 00:01 UTC)]\n> meeting moved')
+  assert.equal(text, '[Replying to a message from the user (their own earlier message) (sent Thu 1970-01-01 00:00 UTC+00:00; forwarded from "Team", signed Lee, originally sent Thu 1970-01-01 00:01 UTC+00:00)]\n> meeting moved')
 })
 
 test('a reply to another chat shows the quote, origin and link', () => {
@@ -47,7 +47,7 @@ test('a reply to another chat shows the quote, origin and link', () => {
       document: { file_id: 'd1', file_name: 'plan.pdf', file_size: 30 * 1024 * 1024 },
     },
   }, { replyFile: 'too-large' })
-  assert.equal(text, '[Replying to a message from another chat (from channel "Private Notes"; sent 1970-01-01 00:00 UTC; https://t.me/c/5551234/12; contains a file "plan.pdf", too large to attach); the user quoted this part]\n> prices go up in May')
+  assert.equal(text, '[Replying to a message from another chat (from channel "Private Notes"; sent Thu 1970-01-01 00:00 UTC+00:00; https://t.me/c/5551234/12; contains a file "plan.pdf", too large to attach); the user quoted this part]\n> prices go up in May')
 })
 
 test('a reply to another chat without a quote says the text is not visible', () => {
@@ -58,12 +58,12 @@ test('a reply to another chat without a quote says the text is not visible', () 
 test('legacy forward fields are still understood', () => {
   const message = { from: user, text: 'old style', forward_from: { id: 5, first_name: 'Robin', is_bot: true }, forward_date: 0 }
   assert.equal(isForwarded(message), true)
-  assert.deepEqual(composePrompt(message), { context: '[Forwarded message from Robin, a bot (originally sent 1970-01-01 00:00 UTC)]', text: 'old style' })
+  assert.deepEqual(composePrompt(message), { context: '[Forwarded message from Robin, a bot (originally sent Thu 1970-01-01 00:00 UTC+00:00)]', text: 'old style' })
 })
 
 test('a forwarded photo notes the attachment and keeps an empty caption out', () => {
   const message = { from: user, photo: [{ file_id: 'p' }], forward_origin: { type: 'user', sender_user: user, date: 0 } }
-  assert.deepEqual(composePrompt(message, { ownFile: true }), { context: '[Forwarded message from the user themselves (originally sent 1970-01-01 00:00 UTC; contains a photo, attached)]', text: '' })
+  assert.deepEqual(composePrompt(message, { ownFile: true }), { context: '[Forwarded message from the user themselves (originally sent Thu 1970-01-01 00:00 UTC+00:00; contains a photo, attached)]', text: '' })
 })
 
 test('plain messages and topic roots add no context', () => {
@@ -90,10 +90,10 @@ test('a reply to a message sent on behalf of a job shows the full text and its s
   const { context, text } = composePrompt(message, { botId: 1, sent: sentEntry, currentSession: 'session-new' })
   assert.equal(text, 'done')
   assert.equal(context, [
-    '[Replying to a message from the assistant (this bot) (sent 1970-01-01 00:00 UTC)]',
+    '[Replying to a message from the assistant (this bot) (sent Thu 1970-01-01 00:00 UTC+00:00)]',
     '> Part two.',
     '',
-    '[The replied-to message was posted by the bot on behalf of another sender (sent 2026-11-08 18:03 UTC; by job "Morning digest"; from DSH session session-sender; 2 Telegram messages; with file "report.pdf"; recorded in session session-old, not this one). Full text:]',
+    '[The replied-to message was posted by the bot on behalf of another sender (sent Sun 2026-11-08 18:03 UTC+00:00; by job "Morning digest"; from DSH session session-sender; 2 Telegram messages; with file "report.pdf"; recorded in session session-old, not this one). Full text:]',
     '> Part one.',
     '> Part two.',
     '(For more context, open session session-sender or session-old.)',
@@ -103,12 +103,12 @@ test('a reply to a message sent on behalf of a job shows the full text and its s
 
 test('a sent message recorded in the current session only names its sender', () => {
   const text = describeSent({ ...sentEntry, files: [], messageIds: [8], fromSession: null, job: null, label: 'backup', boundSession: 'session-new' }, { currentSession: 'session-new' })
-  assert.equal(text, '[The replied-to message was posted by the bot on behalf of another sender (sent 2026-11-08 18:03 UTC; by backup). Full text:]\n> Part one.\n> Part two.')
+  assert.equal(text, '[The replied-to message was posted by the bot on behalf of another sender (sent Sun 2026-11-08 18:03 UTC+00:00; by backup). Full text:]\n> Part one.\n> Part two.')
 })
 
 test('no sent entry adds nothing, and forwards have no reply reference', () => {
   const message = { from: user, text: 'ok', chat: { id: 100 }, reply_to_message: { message_id: 9, date: 0, from: { id: 1 }, text: 'hi' } }
-  assert.deepEqual(composePrompt(message, { botId: 1 }), { context: '[Replying to a message from the assistant (this bot) (sent 1970-01-01 00:00 UTC)]\n> hi', text: 'ok' })
+  assert.deepEqual(composePrompt(message, { botId: 1 }), { context: '[Replying to a message from the assistant (this bot) (sent Thu 1970-01-01 00:00 UTC+00:00)]\n> hi', text: 'ok' })
   assert.equal(replyReference({ ...message, forward_origin: { type: 'hidden_user', sender_user_name: 'x', date: 0 } }), undefined)
   assert.equal(replyReference({ from: user, text: 'plain' }), undefined)
 })

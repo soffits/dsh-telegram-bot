@@ -1159,7 +1159,7 @@ async function openSessionTopic(run) {
 const promptText = (message) => message.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n')
 
 test('a reply carries the replied-to text, its author and its photo', async () => {
-  const run = await start()
+  const run = await start({ timeZone: 'UTC' })
   try {
     const agent = await openSessionTopic(run)
     run.telegram.push({
@@ -1179,7 +1179,7 @@ test('a reply carries the replied-to text, its author and its photo', async () =
     await wait(250)
     const last = agent.received.at(-1)
     assert.equal(promptText(last), 'what does this show?')
-    assert.match(promptText(agent.notices.at(-1)), /^\[Telegram message from [^\n]+\]\n\[Replying to a message from the assistant \(this bot\) \(sent 2025-11-08 11:06 UTC; contains a photo, attached\)\]\n> Weekly chart$/u)
+    assert.match(promptText(agent.notices.at(-1)), /^\[Telegram message from [^\n]+\]\n\[Replying to a message from the assistant \(this bot\) \(sent Sat 2025-11-08 11:06 UTC\+00:00; contains a photo, attached\)\]\n> Weekly chart$/u)
     assert.equal(last.content.filter((block) => block.type === 'image').length, 1)
     assert.ok(run.telegram.calls.some((call) => call.method === 'getFile' && call.body.file_id === 'large'))
   } finally {
@@ -1377,10 +1377,10 @@ test('senderLabel names the Telegram user compactly', () => {
   assert.equal(senderLabel(undefined), undefined)
 })
 
-test('every Telegram prompt says who wrote it in a notice before it, once per forwarded batch', async () => {
-  const run = await start()
+test('every Telegram prompt says who wrote it and when in a notice before it, once per forwarded batch', async () => {
+  const run = await start({ timeZone: 'Asia/Tokyo' })
   try {
-    run.telegram.push({ message_thread_id: 1, text: 'hello', from: { id: 42, first_name: 'Ana', username: 'ana' } })
+    run.telegram.push({ message_thread_id: 1, text: 'hello', date: 1_772_440_872, from: { id: 42, first_name: 'Ana', username: 'ana' } })
     await wait(200)
     const agent = run.host.live.get('session-1')
     assert.equal(promptText(agent.received[0]), 'hello', 'the prompt holds only what the person wrote')
@@ -1393,7 +1393,11 @@ test('every Telegram prompt says who wrote it in a notice before it, once per fo
       chat: { id: '100', thread: 7001, name: 'New session' },
     })
     assert.equal(agent.notices.length, 1)
-    assert.equal(promptText(agent.notices[0]), '[Telegram message from Ana (@ana, user id 42)]')
+    // Telegram's own send time, in the configured zone.
+    assert.equal(promptText(agent.notices[0]), '[Telegram message from Ana (@ana, user id 42), sent Mon 2026-03-02 17:41 UTC+09:00]')
+    // The zone also reaches DSH on the prompt, for its clock context.
+    assert.equal(agent.received[0].source.clientTimeZone, 'Asia/Tokyo')
+    assert.match(agent.received[0].source.rpcId, /^telegram:100:\d+$/u)
     assert.deepEqual({ kind: agent.notices[0].source.kind, form: agent.notices[0].source.form }, { kind: 'telegram-sender', form: 'notice' })
     const before = agent.received.length
     run.telegram.push({ message_thread_id: 7001, text: 'one', forward_origin: { type: 'hidden_user', sender_user_name: 'A', date: 1 } })
@@ -1401,6 +1405,7 @@ test('every Telegram prompt says who wrote it in a notice before it, once per fo
     await wait(1800)
     assert.equal(agent.received.length, before + 1)
     assert.equal(agent.notices.length, 2, 'one notice for the batch')
+    assert.match(promptText(agent.notices[1]), /^\[Telegram message from user id 42, sent Thu 1970-01-01 09:00 UTC\+09:00\]\n\[Forwarded message from A \(account hidden\) \(originally sent Thu 1970-01-01 09:00 UTC\+09:00\)\]$/u)
     assert.doesNotMatch(promptText(agent.received.at(-1)), /\[Telegram message from/u)
   } finally {
     run.stop()
@@ -1809,7 +1814,7 @@ test('title repair helpers find the bot text and the words after it', () => {
   const reply = '[Replying to a message from the assistant (this bot) (sent 2026-11-13 14:45 UTC)]\n> first line\n> \n> after a blank line'
   const sent = '[The replied-to message was posted by the bot on behalf of another sender (sent 2026-11-13 14:45 UTC). Full text:]\n> first line\n(For more context, open session s1.)'
   assert.equal(withoutContextBlocks(`${reply}\n\n${sent}\n\nwhich one\n\nsecond paragraph`), 'which one\n\nsecond paragraph')
-  assert.equal(withoutContextBlocks('[Forwarded message from Sam (originally sent 1970-01-01 00:00 UTC)]\n> Release notes\n> are out'), 'Release notes\nare out', "a forward's own text")
+  assert.equal(withoutContextBlocks('[Forwarded message from Sam (originally sent Thu 1970-01-01 00:00 UTC+00:00)]\n> Release notes\n> are out'), 'Release notes\nare out', "a forward's own text")
   assert.equal(withoutContextBlocks('[Forwarded message from Sam (contains a photo, attached)]'), '')
   assert.equal(withoutContextBlocks('just words'), 'just words')
   assert.equal(leadingWords('  one two\nthree four five six ', 5, 40), 'one two three four five')

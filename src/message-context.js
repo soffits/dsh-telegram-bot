@@ -2,6 +2,7 @@
  * Describe what an incoming Telegram message replies to, quotes or forwards,
  * as short labelled plain text the agent reads before the message itself.
  */
+import { formatTelegramDate } from './clock.js'
 
 /** Longest quoted or forwarded text passed to the agent, in characters. */
 export const QUOTE_LIMIT = 2000
@@ -96,7 +97,8 @@ export function replyReference(message) {
  *   the replied-to file ('attached', 'too-large', 'failed'); ownFile: true when
  *   the message's own photo or document is attached; maxQuote: text limit;
  *   sent: the sent-message log entry the replied-to message belongs to;
- *   currentSession: the session now bound to the topic.
+ *   currentSession: the session now bound to the topic; formatDate: turns a
+ *   Telegram time (Unix seconds) into text, UTC when absent.
  * @returns `{ context, text }`: the context blocks (undefined without any) and
  *   the message text, possibly empty.
  */
@@ -104,7 +106,7 @@ export function composePrompt(message, options = {}) {
   const text = messageBody(message).trim()
   const forward = describeForward(message, options)
   const reply = forward === undefined ? describeReply(message, options) : undefined
-  const sent = reply === undefined ? undefined : describeSent(options.sent, { currentSession: options.currentSession })
+  const sent = reply === undefined ? undefined : describeSent(options.sent, { currentSession: options.currentSession, formatDate: options.formatDate })
   const blocks = [reply, sent, forward].filter((block) => block !== undefined)
   return { context: blocks.length === 0 ? undefined : blocks.join('\n\n'), text }
 }
@@ -118,9 +120,9 @@ export function describeReply(message, options = {}) {
   const quote = typeof message?.quote?.text === 'string' && message.quote.text.trim().length > 0 ? message.quote.text : undefined
   const target = repliedMessage(message)
   if (target !== undefined) {
-    const details = [`sent ${formatDate(target.date)}`]
+    const details = [`sent ${formatDate(target.date, options)}`]
     const origin = originOf(target)
-    if (origin !== undefined) details.push(`forwarded from ${describeOrigin(origin, message, options)}${origin.date === undefined ? '' : `, originally sent ${formatDate(origin.date)}`}`)
+    if (origin !== undefined) details.push(`forwarded from ${describeOrigin(origin, message, options)}${origin.date === undefined ? '' : `, originally sent ${formatDate(origin.date, options)}`}`)
     const media = mediaNote(target, options.replyFile)
     if (media !== undefined) details.push(media)
     const text = quote ?? messageBody(target)
@@ -136,7 +138,7 @@ export function describeReply(message, options = {}) {
   const details = []
   if (external.origin !== undefined) {
     details.push(`from ${describeOrigin(external.origin, message, options)}`)
-    if (external.origin.date !== undefined) details.push(`sent ${formatDate(external.origin.date)}`)
+    if (external.origin.date !== undefined) details.push(`sent ${formatDate(external.origin.date, options)}`)
   }
   if (external.chat !== undefined && external.origin?.type !== 'channel') details.push(`in ${chatName(external.chat)}`)
   const link = messageLink(external.chat, external.message_id)
@@ -156,7 +158,7 @@ export function describeForward(message, options = {}) {
   const origin = originOf(message)
   if (origin === undefined) return undefined
   const details = []
-  if (origin.date !== undefined) details.push(`originally sent ${formatDate(origin.date)}`)
+  if (origin.date !== undefined) details.push(`originally sent ${formatDate(origin.date, options)}`)
   const link = origin.type === 'channel' ? messageLink(origin.chat, origin.message_id) : undefined
   if (link !== undefined) details.push(link)
   const media = mediaNote(message, options.ownFile === true ? 'attached' : undefined)
@@ -169,14 +171,15 @@ export function describeForward(message, options = {}) {
  * a job, a plugin or another session): who sent it, when, where it was
  * recorded, and its full text, which may span several Telegram messages.
  * @param sent - entry from the sent-message log.
- * @param options - currentSession: session now bound to the topic; limit: text limit.
+ * @param options - currentSession: session now bound to the topic; limit: text
+ *   limit; formatDate: as in `composePrompt`.
  * @returns the context block, or undefined.
  */
 export function describeSent(sent, options = {}) {
   if (sent === undefined || sent === null) return undefined
   const details = []
   const time = Date.parse(sent.sentAt ?? '')
-  details.push(Number.isFinite(time) ? `sent ${formatDate(time / 1000)}` : 'sent at an unknown time')
+  details.push(Number.isFinite(time) ? `sent ${formatDate(time / 1000, options)}` : 'sent at an unknown time')
   if (typeof sent.job === 'string' && sent.job.length > 0) details.push(`by job "${sent.job}"`)
   if (typeof sent.fromSession === 'string' && sent.fromSession.length > 0) details.push(`from DSH session ${sent.fromSession}`)
   else if (typeof sent.label === 'string' && sent.label.length > 0 && sent.job == null) details.push(`by ${sent.label}`)
@@ -306,10 +309,15 @@ function mediaKind(message) {
   return undefined
 }
 
-/** UTC date for a Telegram unix timestamp. */
-function formatDate(seconds) {
+/**
+ * A Telegram time (Unix seconds) as the model reads it.
+ * @param seconds - Unix seconds.
+ * @param options - `formatDate`: the bot's formatter for its configured zone;
+ *   without one, UTC.
+ */
+function formatDate(seconds, options = {}) {
   if (typeof seconds !== 'number' || !Number.isFinite(seconds)) return 'at an unknown time'
-  return `${new Date(seconds * 1000).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+  return (typeof options.formatDate === 'function' ? options.formatDate(seconds) : undefined) ?? formatTelegramDate(seconds, 'UTC')
 }
 
 /** Quote text line by line, cut at a word boundary near the limit. */

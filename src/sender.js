@@ -11,9 +11,9 @@
  * known; the other fields depend on the kind. None carries a credential, so
  * all are safe in a session log.
  *
- * The model learns the sender, and the context of the message (what it
- * replies to, where a forward comes from), from a notice message placed right
- * before the prompt, not from lines inside the prompt: DSH titles a session
+ * The model learns the sender, when the message was sent, and the context of
+ * the message (what it replies to, where a forward comes from), from a notice
+ * message placed right before the prompt, not from lines inside the prompt: DSH titles a session
  * from the first words of its first human message, and those must be the
  * person's own.
  */
@@ -96,31 +96,39 @@ export function withPrincipal(message, principal) {
 export const SENDER_NOTICE_KIND = 'telegram-sender'
 
 /**
- * The line that tells the model who wrote a Telegram message. Several allowed
- * users can talk to the same bot, each in their own chat.
+ * The line that tells the model who wrote a Telegram message and when. Several
+ * allowed users can talk to the same bot, each in their own chat, and a
+ * message can reach the agent long after it was sent (a queued message, a
+ * backlog after a restart), so the time is Telegram's own.
  * @param principal - a `telegram-user` principal.
- * @returns a one-line label, or undefined for any other principal.
+ * @param sentAt - when the message was sent, as text (see `formatMoment`).
+ * @returns a one-line label, or undefined with neither a Telegram sender nor a time.
  */
-export function senderLabel(principal) {
-  if (principal?.kind !== 'telegram-user' || principal.id === undefined) return undefined
+export function senderLabel(principal, sentAt) {
+  const time = nonEmpty(sentAt) === undefined ? '' : `, sent ${sentAt.trim()}`
+  if (principal?.kind !== 'telegram-user' || principal.id === undefined) {
+    return time === '' ? undefined : `[Telegram message${time}]`
+  }
   const details = []
   if (nonEmpty(principal.username) !== undefined) details.push(`@${principal.username}`)
   details.push(`user id ${principal.id}`)
   const name = nonEmpty(principal.name)
-  return name !== undefined ? `[Telegram message from ${name} (${details.join(', ')})]` : `[Telegram message from ${details.join(', ')}]`
+  return name !== undefined ? `[Telegram message from ${name} (${details.join(', ')})${time}]` : `[Telegram message from ${details.join(', ')}${time}]`
 }
 
 /**
- * The notice that comes before a prompt: who sent it and the context the bot
- * adds around it. It is its own message with a producer source, so DSH's
- * title input and readers of human messages see only what the person wrote.
+ * The notice that comes before a prompt: who sent it, when, and the context
+ * the bot adds around it. It is its own message with a producer source, so
+ * DSH's title input and readers of human messages see only what the person
+ * wrote.
  * @param message - a user message entering a step.
- * @param context - context blocks for this prompt, if any (see `composePrompt`).
- * @returns the notice, or undefined with neither a Telegram sender nor context.
+ * @param details - `{ context, sentAt }`: context blocks for this prompt (see
+ *   `composePrompt`) and when it was sent, as text; both optional.
+ * @returns the notice, or undefined with no sender, time or context.
  */
-export function senderNotice(message, context) {
+export function senderNotice(message, { context, sentAt } = {}) {
   if (message?.source?.kind !== 'user') return undefined
-  const label = senderLabel(message.source.principal)
+  const label = senderLabel(message.source.principal, sentAt)
   const extra = typeof context === 'string' && context.trim().length > 0 ? context : undefined
   if (label === undefined && extra === undefined) return undefined
   const text = [label, extra].filter((part) => part !== undefined).join('\n')
@@ -152,13 +160,15 @@ export function createPrincipalTagger(limit = MAX_PENDING_PRINCIPALS) {
   const pending = new Map()
   return {
     /**
-     * Remember the sender and context of the prompt with this request id (or,
-     * for a message the bot builds itself, this message id).
+     * Remember the sender, send time and context of the prompt with this
+     * request id (or, for a message the bot builds itself, this message id).
+     * @param requestId - the request or message id.
+     * @param details - `{ principal, context, sentAt }`, each optional.
      */
-    remember(requestId, principal, context) {
-      if (typeof requestId !== 'string' || (principal === undefined && context === undefined)) return
+    remember(requestId, { principal, context, sentAt } = {}) {
+      if (typeof requestId !== 'string' || (principal === undefined && context === undefined && sentAt === undefined)) return
       pending.delete(requestId)
-      pending.set(requestId, { principal, context })
+      pending.set(requestId, { principal, context, sentAt })
       if (pending.size > limit) pending.delete(pending.keys().next().value)
     },
     /** Pending prompts, for tests. */
@@ -167,7 +177,7 @@ export function createPrincipalTagger(limit = MAX_PENDING_PRINCIPALS) {
     },
     /**
      * `agent/pre-step` listener: record remembered senders on the step's
-     * messages and put each prompt's notice (sender and context) before it.
+     * messages and put each prompt's notice (sender, time and context) before it.
      */
     async preStep(_payload, next) {
       const decision = await next()
@@ -184,7 +194,7 @@ export function createPrincipalTagger(limit = MAX_PENDING_PRINCIPALS) {
           message = withPrincipal(message, entry.principal)
           changed = true
         }
-        const notice = senderNotice(message, entry?.context)
+        const notice = senderNotice(message, entry)
         if (notice !== undefined) {
           messages.push(notice)
           changed = true

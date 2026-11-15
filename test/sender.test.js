@@ -1,7 +1,7 @@
 import './setup-home.js'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createPrincipalTagger, sendPrincipal, telegramUserPrincipal, withPrincipal } from '../src/sender.js'
+import { createPrincipalTagger, senderLabel, senderNotice, sendPrincipal, telegramUserPrincipal, withPrincipal } from '../src/sender.js'
 
 test('a Telegram user principal names the user and the topic, without empty fields', () => {
   assert.deepEqual(
@@ -36,7 +36,7 @@ test('the tagger records a remembered sender once, on the matching request only'
   const ours = { id: 'a', role: 'user', content: [], source: { kind: 'user', rpcId: 'telegram:100:5' } }
   const other = { id: 'b', role: 'user', content: [], source: { kind: 'user', rpcId: 'web-1' } }
   const context = { id: 'c', role: 'user', content: [], source: { kind: 'time-context' } }
-  tagger.remember('telegram:100:5', principal)
+  tagger.remember('telegram:100:5', { principal })
   const enter = (messages) => tagger.preStep({ messages }, async () => ({ kind: 'enter', messages }))
   const decision = await enter([context, ours, other])
   assert.equal(decision.messages[0], context)
@@ -50,11 +50,36 @@ test('the tagger records a remembered sender once, on the matching request only'
   const again = [ours]
   assert.equal((await enter(again)).messages[0], ours)
   // Rejected steps pass through and keep what is remembered.
-  tagger.remember('telegram:100:6', principal)
+  tagger.remember('telegram:100:6', { principal })
   assert.deepEqual(await tagger.preStep({ messages: [] }, async () => ({ kind: 'reject' })), { kind: 'reject' })
   assert.equal(tagger.size, 1)
   // The oldest entry goes past the bound.
-  tagger.remember('x', principal)
-  tagger.remember('y', principal)
+  tagger.remember('x', { principal })
+  tagger.remember('y', { principal })
   assert.equal(tagger.size, 2)
+})
+
+test('the sender line says when the message was sent, with or without a known sender', () => {
+  const ana = { kind: 'telegram-user', channel: 'telegram', id: '42', name: 'Ana', username: 'ana' }
+  const sentAt = 'Mon 2026-03-02 09:41 UTC+01:00'
+  assert.equal(senderLabel(ana, sentAt), '[Telegram message from Ana (@ana, user id 42), sent Mon 2026-03-02 09:41 UTC+01:00]')
+  assert.equal(senderLabel(ana), '[Telegram message from Ana (@ana, user id 42)]')
+  assert.equal(senderLabel(undefined, sentAt), '[Telegram message, sent Mon 2026-03-02 09:41 UTC+01:00]')
+  assert.equal(senderLabel(undefined, ' '), undefined)
+  const prompt = { id: 'p', role: 'user', content: [], source: { kind: 'user', principal: ana } }
+  const notice = senderNotice(prompt, { context: '[Forwarded message from Kim]', sentAt })
+  assert.equal(notice.content[0].text, `[Telegram message from Ana (@ana, user id 42), sent ${sentAt}]\n[Forwarded message from Kim]`)
+  assert.equal(notice.source.summary, `[Telegram message from Ana (@ana, user id 42), sent ${sentAt}]`)
+  assert.equal(senderNotice({ ...prompt, source: { kind: 'time-context' } }, { sentAt }), undefined)
+})
+
+test('the tagger keeps a send time remembered without a sender', async () => {
+  const tagger = createPrincipalTagger()
+  tagger.remember('telegram:1:2', { sentAt: 'Tue 2026-03-03 07:15 UTC+01:00' })
+  const prompt = { id: 'p', role: 'user', content: [], source: { kind: 'user', rpcId: 'telegram:1:2' } }
+  const decision = await tagger.preStep({}, async () => ({ kind: 'enter', messages: [prompt] }))
+  assert.equal(decision.messages[0].content[0].text, '[Telegram message, sent Tue 2026-03-03 07:15 UTC+01:00]')
+  assert.equal(decision.messages[1], prompt)
+  tagger.remember('nothing', {})
+  assert.equal(tagger.size, 0)
 })

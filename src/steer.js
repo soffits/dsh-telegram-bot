@@ -53,25 +53,27 @@ function hasRequest(agent, requestId) {
  * @param ctx - plugin context.
  * @param agent - the session's live agent.
  * @param prompt - `{ sessionId, chatId, messageId, text, attachments, principal,
- *   context }`; `principal` is the sender recorded on the message's source,
- *   `context` goes in the notice before the message.
+ *   context, sentAt, clientTimeZone }`; `principal` is the sender recorded on
+ *   the message's source, `context` and `sentAt` (the send time as text) go in
+ *   the notice before the message, and `clientTimeZone` is the sender's zone,
+ *   recorded on the source for DSH's clock context.
  * @param signal - request lifetime.
  * @param tagger - remembers the principal of a prompt the session controller
  *   builds (see `createPrincipalTagger`).
  * @returns the request id, or `undefined` when this DSH cannot steer.
  */
-export async function steerPrompt(ctx, agent, { sessionId, chatId, messageId, text, attachments = [], principal, context }, signal, tagger) {
+export async function steerPrompt(ctx, agent, { sessionId, chatId, messageId, text, attachments = [], principal, context, sentAt, clientTimeZone }, signal, tagger) {
   const requestId = steerRequestId(chatId, messageId)
   const content = [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments]
   const controller = ctx.get('sessionController')
   if (attachments.length === 0 && content.length > 0 && typeof controller?.prompt === 'function') {
-    tagger?.remember(requestId, principal, context)
-    await controller.prompt({ sessionId, requestId, mode: 'steer', content }, signal)
+    tagger?.remember(requestId, { principal, context, sentAt })
+    await controller.prompt({ sessionId, requestId, mode: 'steer', content, ...(clientTimeZone === undefined ? {} : { clientTimeZone }) }, signal)
     return requestId
   }
   if (hasRequest(agent, requestId)) return requestId
-  tagger?.remember(requestId, principal, context)
-  const message = { id: randomUUID(), role: 'user', content, source: { kind: 'user', rpcId: requestId, ...(principal === undefined ? {} : { principal }) } }
+  tagger?.remember(requestId, { principal, context, sentAt })
+  const message = { id: randomUUID(), role: 'user', content, source: { kind: 'user', rpcId: requestId, ...(clientTimeZone === undefined ? {} : { clientTimeZone }), ...(principal === undefined ? {} : { principal }) } }
   if (typeof agent?.steer === 'function') agent.steer(message)
   else if (typeof agent?.send === 'function') agent.send(message, 'next-step', true)
   else return undefined

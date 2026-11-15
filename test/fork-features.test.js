@@ -8,7 +8,7 @@ import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
 import { followupThroughGate, makeAgentModel, makeTitleService } from './fake-dsh.js'
-import { senderLabel } from '../src/message-context.js'
+import { senderLabel } from '../src/sender.js'
 import { enqueue, waitForResult } from '../src/outbox.js'
 import { isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, titleTask, topicNameOf } from '../src/topics.js'
 
@@ -84,7 +84,7 @@ function makeHost() {
       ctx: { on: (name, fn) => { events.on(name, fn); return () => events.off(name, fn) } },
       status: 'idle',
       received: [],
-      followup(message) { followupThroughGate(this, events, message) },
+      followup(message) { followupThroughGate(this, events, message, hostEvents) },
       injected: [],
       inject(message) { this.injected.push(message) },
       /** Messages sent into a running turn; the test plays what DSH does next. */
@@ -360,7 +360,7 @@ function picker(calls, prefix) {
   }
 }
 
-const SENDER = '[Telegram message from user id 42]\n'
+const SENDER = ''
 const sent = (calls, threadId) => calls.filter((call) => call.method === 'sendMessage' && call.body.message_thread_id === threadId)
 
 test('/new binds a fresh session to the same topic and keeps the old one in DSH', async () => {
@@ -381,7 +381,7 @@ test('/new binds a fresh session to the same topic and keeps the old one in DSH'
     assert.equal(run.telegram.calls.filter((call) => call.method === 'createForumTopic').length, 1, '/new creates no topic')
     run.telegram.push({ message_thread_id: 7001, text: 'second' })
     await wait(150)
-    assert.equal(run.host.live.get('session-2').received.at(-1).content[0].text, '[Telegram message from user id 42]\nsecond')
+    assert.equal(run.host.live.get('session-2').received.at(-1).content[0].text, 'second')
     assert.equal(run.host.live.get('session-1').received.length, 1)
   } finally {
     run.stop()
@@ -420,7 +420,7 @@ test('a new topic asks for a workspace, then runs the waiting message in a new s
     assert.equal(run.host.created[0].cwd, '/tmp/notes')
     const state = await run.readState()
     assert.equal(state.threads['100:9001'], 'session-1')
-    assert.equal(run.host.live.get('session-1').received[0].content[0].text, '[Telegram message from user id 42]\nfirst question')
+    assert.equal(run.host.live.get('session-1').received[0].content[0].text, 'first question')
     assert.equal(run.telegram.calls.filter((call) => call.method === 'createForumTopic').length, 0)
   } finally {
     run.stop()
@@ -448,7 +448,7 @@ test('a topic can bind an existing session, which leaves its old topic', async (
     assert.equal(state.threads['100:5000'], undefined, 'one session is bound to one topic')
     assert.equal(state.sessions['session-old'].threadId, 9002)
     assert.equal(run.host.created.length, 0)
-    assert.equal(run.host.live.get('session-old').received.at(-1).content[0].text, '[Telegram message from user id 42]\ncontinue here')
+    assert.equal(run.host.live.get('session-old').received.at(-1).content[0].text, 'continue here')
   } finally {
     run.stop()
   }
@@ -630,7 +630,7 @@ test('with busyMessages: queue, a Telegram message during a Web turn waits for t
     agent.emit('session/event', { id: 'session-1' }, { type: 'assistant/message', data: { turn: 5, step: 1, message: { content: [{ type: 'text', text: 'done on web' }] } } })
     agent.emit('session/event', { id: 'session-1' }, { type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } })
     await wait(150)
-    assert.equal(agent.received.at(-1).content[0].text, '[Telegram message from user id 42]\nqueued from phone')
+    assert.equal(agent.received.at(-1).content[0].text, 'queued from phone')
   } finally {
     run.stop()
   }
@@ -669,7 +669,7 @@ test('a Telegram message during a Web turn goes into that turn', async () => {
     await wait(120)
     assert.equal(agent.received.length, 1, 'no turn of its own')
     assert.equal(agent.steered.length, 1)
-    assert.equal(promptText(agent.steered[0]), '[Telegram message from user id 42]\nsteer from phone')
+    assert.equal(promptText(agent.steered[0]), 'steer from phone')
     assert.match(agent.steered[0].source.rpcId, /^telegram:100:\d+$/u)
     assert.equal(agent.steered[0].source.principal.id, '42')
     assert.equal(agent.steered[0].source.principal.chat.thread, 7001)
@@ -1177,7 +1177,7 @@ test('a reply carries the replied-to text, its author and its photo', async () =
     await wait(250)
     const last = agent.received.at(-1)
     const text = promptText(last)
-    assert.match(text, /^\[Telegram message from user id 42\]\n\[Replying to a message from the assistant \(this bot\) \(sent 2025-11-08 11:06 UTC; contains a photo, attached\)\]\n> Weekly chart\n\nwhat does this show\?$/u)
+    assert.match(text, /^\[Replying to a message from the assistant \(this bot\) \(sent 2025-11-08 11:06 UTC; contains a photo, attached\)\]\n> Weekly chart\n\nwhat does this show\?$/u)
     assert.equal(last.content.filter((block) => block.type === 'image').length, 1)
     assert.ok(run.telegram.calls.some((call) => call.method === 'getFile' && call.body.file_id === 'large'))
   } finally {
@@ -1196,7 +1196,7 @@ test('a partial quote replaces the full text, and the topic root is not a reply'
       reply_to_message: { message_id: 7001, date: 1, chat: { id: 100 }, forum_topic_created: { name: 'hello' } },
     })
     await wait(250)
-    assert.equal(promptText(agent.received.at(-1)), '[Telegram message from user id 42]\nplain message')
+    assert.equal(promptText(agent.received.at(-1)), 'plain message')
     run.telegram.push({
       message_thread_id: 7001,
       is_topic_message: true,
@@ -1212,7 +1212,7 @@ test('a partial quote replaces the full text, and the topic root is not a reply'
     })
     await wait(250)
     const text = promptText(agent.received.at(-1))
-    assert.match(text, /^\[Telegram message from user id 42\]\n\[Replying to a message from Sam \(@sam\) \(sent [^)]+\); the user quoted only this part\]\n> the second step\n\nis this right\?$/u)
+    assert.match(text, /^\[Replying to a message from Sam \(@sam\) \(sent [^)]+\); the user quoted only this part\]\n> the second step\n\nis this right\?$/u)
     assert.doesNotMatch(text, /third step/u)
   } finally {
     run.stop()
@@ -1229,7 +1229,7 @@ test('a reply to a mirrored Web prompt is not shown as an assistant message', as
       reply_to_message: { message_id: 502, date: 1, chat: { id: 100 }, from: { id: 1, is_bot: true }, text: '🖥 From Web:\nsummarize the logs' },
     })
     await wait(250)
-    assert.match(promptText(agent.received.at(-1)), /^\[Telegram message from user id 42\]\n\[Replying to a message from the Web UI \(a user prompt this bot mirrored into the chat, not an assistant answer\)/u)
+    assert.match(promptText(agent.received.at(-1)), /^\[Replying to a message from the Web UI \(a user prompt this bot mirrored into the chat, not an assistant answer\)/u)
   } finally {
     run.stop()
   }
@@ -1364,19 +1364,20 @@ test('when the auto-created topic cannot be deleted, a short note is left in it'
 })
 
 test('senderLabel names the Telegram user compactly', () => {
-  assert.equal(senderLabel({ id: 7, first_name: 'Ana', last_name: 'Silva', username: 'ana' }), '[Telegram message from Ana Silva (@ana, user id 7)]')
-  assert.equal(senderLabel({ id: 8, first_name: 'Sam' }), '[Telegram message from Sam (user id 8)]')
-  assert.equal(senderLabel({ id: 9 }), '[Telegram message from user id 9]')
+  assert.equal(senderLabel({ kind: 'telegram-user', channel: 'telegram', id: '7', name: 'Ana Silva', username: 'ana' }), '[Telegram message from Ana Silva (@ana, user id 7)]')
+  assert.equal(senderLabel({ kind: 'telegram-user', channel: 'telegram', id: '8', name: 'Sam' }), '[Telegram message from Sam (user id 8)]')
+  assert.equal(senderLabel({ kind: 'telegram-user', channel: 'telegram', id: '9' }), '[Telegram message from user id 9]')
+  assert.equal(senderLabel({ kind: 'oidc-user', channel: 'web', id: 'x' }), undefined)
   assert.equal(senderLabel(undefined), undefined)
 })
 
-test('every Telegram prompt says who wrote it, once per forwarded batch', async () => {
+test('every Telegram prompt says who wrote it in a notice before it, once per forwarded batch', async () => {
   const run = await start()
   try {
     run.telegram.push({ message_thread_id: 1, text: 'hello', from: { id: 42, first_name: 'Ana', username: 'ana' } })
     await wait(200)
     const agent = run.host.live.get('session-1')
-    assert.equal(promptText(agent.received[0]), '[Telegram message from Ana (@ana, user id 42)]\nhello')
+    assert.equal(promptText(agent.received[0]), 'hello', 'the prompt holds only what the person wrote')
     assert.deepEqual(agent.received[0].source.principal, {
       kind: 'telegram-user',
       channel: 'telegram',
@@ -1385,14 +1386,16 @@ test('every Telegram prompt says who wrote it, once per forwarded batch', async 
       username: 'ana',
       chat: { id: '100', thread: 7001, name: 'New session' },
     })
+    assert.equal(agent.notices.length, 1)
+    assert.equal(promptText(agent.notices[0]), '[Telegram message from Ana (@ana, user id 42)]')
+    assert.deepEqual({ kind: agent.notices[0].source.kind, form: agent.notices[0].source.form }, { kind: 'telegram-sender', form: 'notice' })
     const before = agent.received.length
     run.telegram.push({ message_thread_id: 7001, text: 'one', forward_origin: { type: 'hidden_user', sender_user_name: 'A', date: 1 } })
     run.telegram.push({ message_thread_id: 7001, text: 'two', forward_origin: { type: 'hidden_user', sender_user_name: 'B', date: 2 } })
     await wait(1800)
     assert.equal(agent.received.length, before + 1)
-    const text = promptText(agent.received.at(-1))
-    assert.equal(text.match(/\[Telegram message from/gu).length, 1, 'one label for the batch')
-    assert.ok(text.startsWith(SENDER))
+    assert.equal(agent.notices.length, 2, 'one notice for the batch')
+    assert.doesNotMatch(promptText(agent.received.at(-1)), /\[Telegram message from/u)
   } finally {
     run.stop()
   }
@@ -1417,8 +1420,33 @@ test('a session opened for a topic is never blank and carries the topic title', 
     const before = run.telegram.calls.length
     run.telegram.push({ message_thread_id: 7100, text: 'real question' })
     await wait(200)
-    assert.equal(fresh.received.at(-1).content[0].text, `${SENDER}real question`, 'later prompts pass the gate')
+    assert.equal(fresh.received.at(-1).content[0].text, 'real question', 'later prompts pass the gate')
     assert.equal(run.telegram.calls.slice(before).filter((call) => String(call.body?.text ?? '').includes('belongs to the Telegram topic')).length, 0, 'the marker is not shown in the topic')
+  } finally {
+    run.stop()
+  }
+})
+
+test('without a title provider a topic session keeps its topic name, and no title starts with the sender line', async () => {
+  const run = await start()
+  try {
+    const agent = await openSessionTopic(run)
+    const first = (await run.readState()).topicNames['100:7001']
+    const titles = run.host.ctx.get('sessionTitle')
+    titles.registration = undefined
+    run.telegram.push({ message_thread_id: 7001, text: 'fix the empty sessions', from: { id: 42, first_name: 'Ana', username: 'ana' } })
+    await wait(200)
+    // DSH records the step's messages; its fallback title reads the first human one.
+    for (const message of [...agent.notices, agent.received.at(-1)]) agent.session.append('user/message', message)
+    agent.session.append('request/header', { header: {} })
+    await wait(50)
+    assert.deepEqual(titles.refreshed, [], 'no refresh: it would write the first-prompt fallback over the topic name')
+    assert.equal(agent.session.title, `Telegram-Annie-${first}`)
+    // Where DSH does fall back to the first prompt, it gets the person's words.
+    await titles.refresh(agent.session)
+    await wait(50)
+    assert.equal(agent.session.titleSource.kind, 'fallback')
+    assert.equal(agent.session.title, 'Telegram-Annie-fix the empty sessions')
   } finally {
     run.stop()
   }

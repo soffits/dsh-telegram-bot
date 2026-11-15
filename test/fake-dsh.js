@@ -7,23 +7,34 @@
  * Model how DSH starts a turn for a queued message: every follow-up opens a
  * turn (so the session is no longer blank), and `agent/pre-step` handlers may
  * reject it before any model request, in which case the message is never
- * recorded.
+ * recorded. Messages a handler adds with another source kind (notices) go
+ * to `agent.notices`; `received` holds the prompts as recorded.
  * @param agent - fake agent with `received`; gets `turns` and `rejected`.
  * @param events - the agent's event emitter.
  * @param message - the queued user message.
+ * @param globalEvents - host-wide emitter whose listeners also see agent events.
  */
-export function followupThroughGate(agent, events, message) {
+export function followupThroughGate(agent, events, message, globalEvents) {
   agent.turns = (agent.turns ?? 0) + 1
   agent.received.push(message)
-  const handlers = events.listeners('agent/pre-step')
+  const handlers = [...events.listeners('agent/pre-step'), ...(globalEvents?.listeners('agent/pre-step') ?? [])]
   const run = (index) => index < handlers.length
     ? Promise.resolve(handlers[index]({ agent, messages: [message] }, () => run(index + 1)))
-    : Promise.resolve({ kind: 'enter' })
+    : Promise.resolve({ kind: 'enter', messages: [message] })
   void run(0).then((decision) => {
-    if (decision?.kind !== 'reject') return
-    agent.received.splice(agent.received.indexOf(message), 1)
-    agent.rejected ??= []
-    agent.rejected.push(message)
+    const at = agent.received.indexOf(message)
+    if (at === -1) return
+    if (decision?.kind === 'reject') {
+      agent.received.splice(at, 1)
+      agent.rejected ??= []
+      agent.rejected.push(message)
+    } else if (Array.isArray(decision?.messages)) {
+      // What DSH records: the step's messages as the handlers left them;
+      // producer notices (source kinds other than user) are kept apart.
+      agent.received.splice(at, 1, ...decision.messages.filter((item) => item.source?.kind === 'user'))
+      agent.notices ??= []
+      agent.notices.push(...decision.messages.filter((item) => item.source?.kind !== 'user'))
+    }
   })
 }
 
@@ -41,6 +52,8 @@ export function makeTitleService() {
   }
   const service = {
     refreshed: [],
+    // DSH's private provider slot; set to undefined to run without a provider.
+    registration: { provider: { id: 'fake' }, closing: false },
     get: (session) => (typeof session.title === 'string'
       ? { title: session.title, source: session.titleSource ?? { kind: 'user' }, messageSeqs: session.titleSeqs ?? [] }
       : undefined),
@@ -50,6 +63,13 @@ export function makeTitleService() {
     },
     async refresh(session) {
       service.refreshed.push(session.id)
+      if (service.registration === undefined) {
+        // DSH's built-in fallback: the first words of the first human message, over any title.
+        const first = (session.events ?? []).find((event) => event.type === 'user/message' && event.data?.source?.kind === 'user')
+        const text = (first?.data.content ?? []).filter((block) => block.type === 'text').map((block) => block.text).join('\n')
+        write(session, { title: text.split(/\s+/u).filter(Boolean).slice(0, 5).join(' '), messageSeqs: [first?.seq ?? 1], source: { kind: 'fallback' } })
+        return service.get(session)
+      }
       write(session, { title: session.nextGeneratedTitle ?? 'Generated task', messageSeqs: [1], source: { kind: 'provider', provider: 'fake' } })
       return service.get(session)
     },

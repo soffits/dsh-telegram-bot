@@ -47,7 +47,7 @@ import { agentsListText, childState, collectSubagents, createAgentBoards, report
 import { deliveredToTopic, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor } from './topics.js'
 import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.js'
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
-import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference, senderLabel } from './message-context.js'
+import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference } from './message-context.js'
 import { createSentLog } from './sent-log.js'
 import { catalogKey, createModelCatalog, defaultModelOf, effortChoices, effortName, findModel, isGoneModel, modelByKey, modelName, pageOf, pickedSelection, providerByKey, sameSelection, sessionModelOf } from './models.js'
 import {
@@ -3583,7 +3583,8 @@ export function apply(ctx, config) {
   /**
    * Bring a bound session's title to "Telegram-<person>-<conversation title>"
    * (see `plannedTitle`). DSH writes the conversation part (its title
-   * provider, or the first-prompt fallback); before it exists a topic
+   * provider; without one, the first-prompt fallback in a chat without
+   * topics); before it exists a topic
    * session's title is "Telegram-<person>-<topic name>", set as a user title
    * so DSH's fallback does not replace it, and the bot asks DSH for the real
    * title at the first model request (see `startTopicTitle`). A title someone
@@ -3688,9 +3689,11 @@ export function apply(ctx, config) {
    * Ask DSH for a topic session's conversation title once the session has a
    * message and a model route, while its title is still the bot placeholder.
    * The placeholder is a user title, which stops DSH's automatic titling, so
-   * the bot starts it with `sessionTitle.refresh` (the registered provider,
-   * or DSH's fallback when none is). It waits for a `request/header` event
-   * because model providers take their route from the logged header.
+   * the bot starts it with `sessionTitle.refresh`. Without a registered
+   * provider it keeps the placeholder: refresh would then write DSH's
+   * first-prompt fallback over it, and the topic name says more than the
+   * first words of a prompt. It waits for a `request/header` event because
+   * model providers take their route from the logged header.
    * @param session - live session that logged a request header.
    */
   function startTopicTitle(session) {
@@ -3698,6 +3701,7 @@ export function apply(ctx, config) {
     const service = ctx.get('sessionTitle')
     // Without a topic there is no placeholder, so DSH's own titling runs.
     if (typeof topic?.threadId !== 'number' || typeof service?.refresh !== 'function' || titleRequests.has(session.id)) return
+    if (!hasTitleProvider(service)) return
     const current = service.get(session)
     const { person, names, people } = titleContext(session.id, topic.chatId, topic.threadId)
     if (current !== undefined && (current.source?.kind !== 'user' || !isPlaceholderTitle(current.title, names, [person, ...people]))) return
@@ -3711,6 +3715,17 @@ export function apply(ctx, config) {
       .then(() => service.refresh(session))
       .catch((error) => warn(`session title not generated for ${session.id}: ${messageOf(error)}`))
       .finally(() => titleRequests.delete(session.id))
+  }
+
+  /**
+   * Whether DSH has a title provider registered. The title service keeps its
+   * registration in a field with no public accessor.
+   * @param service - DSH `sessionTitle` service.
+   * @returns true when a provider would write the title.
+   */
+  function hasTitleProvider(service) {
+    const registration = service?.registration
+    return registration !== undefined && registration !== null && registration.closing !== true
   }
 
   /**
@@ -6040,9 +6055,8 @@ export function apply(ctx, config) {
    * @param signal - runtime lifetime.
    */
   async function dispatchPrompt(chatState, chatId, threadId, prompt, signal) {
-    // Say who is writing: several allowed users may share one bot.
-    const label = senderLabel(prompt.from)
-    if (label !== undefined) prompt = { ...prompt, text: prompt.text.length > 0 ? `${label}\n${prompt.text}` : label }
+    // Who is writing reaches the model as a notice before the prompt (see
+    // `senderNotice`): several allowed users may share one bot.
     rememberSender(chatId, prompt.messageId, prompt.from)
     const route = routeMessage({ threadId, inSession: typeof chatState.sessionId === 'string' })
     if (route === 'new-topic') {

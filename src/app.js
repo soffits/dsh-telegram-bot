@@ -35,8 +35,9 @@ import {
   toTelegramMarkdown,
   toolArg,
 } from './formatting.js'
-import { admitText } from './admission.js'
+import { admitText, promptRequestId } from './admission.js'
 import { STEER_REACTION, busyMode, clearTelegramInbox, hasPendingInput, steerPrompt } from './steer.js'
+import { createPrincipalTagger, sendPrincipal, telegramUserPrincipal } from './sender.js'
 import { loadState, STATE_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
@@ -129,6 +130,10 @@ export function apply(ctx, config) {
     })
   /** Ids of legacy follow-up messages the bridge submitted from Telegram. */
   const telegramMessageIds = new Set()
+  // Telegram senders by `<chatId>:<messageId>`, kept from routing until the
+  // prompt is handed to DSH (a topic binding or the queue may come between).
+  const promptSenders = new Map()
+  const principals = createPrincipalTagger()
 
   /**
    * Persist the chat → session mapping atomically.
@@ -2754,7 +2759,7 @@ export function apply(ctx, config) {
       }
       let requestId
       try {
-        requestId = await steerPrompt(ctx, agent, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text, attachments }, signal)
+        requestId = await steerPrompt(ctx, agent, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text, attachments, principal: promptPrincipal(chat, messageId) }, signal, principals)
       } catch (error) {
         // Not admitted: the bot's queue still delivers it after the turn.
         reportError('steer', error)
@@ -2846,14 +2851,16 @@ export function apply(ctx, config) {
       const agent = await ensureAgent(chat)
       await unarchiveForTopic(chat)
       let admitted = false
+      const principal = promptPrincipal(chat, messageId)
       if (nativeText) {
+        principals.remember(promptRequestId(chat.chatId, messageId), principal)
         admitted = admitText(ctx, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text }, signal)
         if (admitted !== false) await admitted
       }
       if (!admitted) {
         const id = randomUUID()
         telegramMessageIds.add(id)
-        agent.followup({ id, role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user' } })
+        agent.followup({ id, role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user', ...(principal === undefined ? {} : { principal }) } })
       }
       // The turn/end listener finalizes the Telegram turn. whenIdle is only a
       // fallback for the turn that started this epoch, never a queued turn.
@@ -3952,13 +3959,17 @@ export function apply(ctx, config) {
    *   line the model also reads, `from` the request's sender.
    * @returns the message source.
    */
-  function postSource({ header, threadId, topic, from, self }) {
+  function postSource({ header, chatId, threadId, topic, from, self }) {
     const job = typeof from?.job === 'string' && from.job.trim().length > 0 ? from.job.trim() : null
     const label = typeof from?.label === 'string' && from.label.trim().length > 0 ? from.label.trim() : null
+    const principal = sendPrincipal(from)
     return {
       kind: POST_SOURCE_KIND,
       form: 'notice',
       summary: header.slice(0, 120),
+      ...(principal === undefined ? {} : { principal }),
+      channel: 'telegram',
+      chatId: String(chatId),
       threadId,
       topic: topic ?? null,
       job,
@@ -4105,7 +4116,7 @@ export function apply(ctx, config) {
           id: randomUUID(),
           role: 'user',
           content,
-          source: postSource({ header, threadId, topic: target.name, from: request?.from, self }),
+          source: postSource({ header, chatId, threadId, topic: target.name, from: request?.from, self }),
         })
         recorded = true
       } catch (error) {
@@ -5874,6 +5885,36 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Keep who wrote a Telegram message until its prompt reaches DSH.
+   * @param chatId - Telegram chat.
+   * @param messageId - Telegram message id.
+   * @param from - Telegram `from` of the message.
+   */
+  function rememberSender(chatId, messageId, from) {
+    if (!Number.isSafeInteger(messageId) || from === undefined || from === null) return
+    const key = `${chatId}:${messageId}`
+    promptSenders.delete(key)
+    promptSenders.set(key, from)
+    if (promptSenders.size > 1024) promptSenders.delete(promptSenders.keys().next().value)
+  }
+
+  /**
+   * The sender of a Telegram message, recorded on its prompt's source.
+   * @param chat - the topic the prompt runs in.
+   * @param messageId - Telegram message id.
+   * @returns the principal, or undefined when the sender is not known.
+   */
+  function promptPrincipal(chat, messageId) {
+    const from = promptSenders.get(`${chat.chatId}:${messageId}`)
+    if (from === undefined) return undefined
+    return telegramUserPrincipal(from, {
+      chatId: chat.chatId,
+      threadId: chat.threadId,
+      topic: typeof chat.threadId === 'number' ? topicNameFor(chat.chatId, chat.threadId) : undefined,
+    })
+  }
+
+  /**
    * Route one prompt: a new topic from All, the workspace picker in a topic
    * without a session, or a turn in the bound session.
    * @param chatState - topic state.
@@ -5886,6 +5927,7 @@ export function apply(ctx, config) {
     // Say who is writing: several allowed users may share one bot.
     const label = senderLabel(prompt.from)
     if (label !== undefined) prompt = { ...prompt, text: prompt.text.length > 0 ? `${label}\n${prompt.text}` : label }
+    rememberSender(chatId, prompt.messageId, prompt.from)
     const route = routeMessage({ threadId, inSession: typeof chatState.sessionId === 'string' })
     if (route === 'new-topic') {
       await createNewSessionTopic(chatId, threadId, signal, defaultWorkspaceCwd(), prompt.text, prompt.attachments, prompt.messageId)
@@ -6527,6 +6569,8 @@ export function apply(ctx, config) {
     return () => outbox.stop()
   }, 'dsh-telegram-bot: outbox')
 
+  // Record each Telegram sender on the prompt the session controller built for it.
+  ctx.on('agent/pre-step', (payload, next) => principals.preStep(payload, next), { global: true })
   // Host-wide feeds: every session's events, whichever client started the
   // turn. Only sessions bound to a topic are mirrored.
   ctx.on('session/event', (session, event) => {

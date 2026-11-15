@@ -52,20 +52,24 @@ function hasRequest(agent, requestId) {
  * dropped. A request id already admitted is skipped, so it is never sent twice.
  * @param ctx - plugin context.
  * @param agent - the session's live agent.
- * @param prompt - `{ sessionId, chatId, messageId, text, attachments }`.
+ * @param prompt - `{ sessionId, chatId, messageId, text, attachments, principal }`;
+ *   `principal` is the sender recorded on the message's source.
  * @param signal - request lifetime.
+ * @param tagger - remembers the principal of a prompt the session controller
+ *   builds (see `createPrincipalTagger`).
  * @returns the request id, or `undefined` when this DSH cannot steer.
  */
-export async function steerPrompt(ctx, agent, { sessionId, chatId, messageId, text, attachments = [] }, signal) {
+export async function steerPrompt(ctx, agent, { sessionId, chatId, messageId, text, attachments = [], principal }, signal, tagger) {
   const requestId = steerRequestId(chatId, messageId)
   const content = [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments]
   const controller = ctx.get('sessionController')
   if (attachments.length === 0 && content.length > 0 && typeof controller?.prompt === 'function') {
+    tagger?.remember(requestId, principal)
     await controller.prompt({ sessionId, requestId, mode: 'steer', content }, signal)
     return requestId
   }
   if (hasRequest(agent, requestId)) return requestId
-  const message = { id: randomUUID(), role: 'user', content, source: { kind: 'user', rpcId: requestId } }
+  const message = { id: randomUUID(), role: 'user', content, source: { kind: 'user', rpcId: requestId, ...(principal === undefined ? {} : { principal }) } }
   if (typeof agent?.steer === 'function') agent.steer(message)
   else if (typeof agent?.send === 'function') agent.send(message, 'next-step', true)
   else return undefined

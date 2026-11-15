@@ -44,7 +44,7 @@ import { publishStatus } from './status.js'
 import { messageAnswer, turnAnswer } from './final-text.js'
 import { createOutbox } from './outbox.js'
 import { agentsListText, childState, collectSubagents, createAgentBoards, reportOf } from './agents.js'
-import { deliveredToTopic, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor } from './topics.js'
+import { deliveredToTopic, hasSenderLine, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, leadingWords, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor, withoutSenderLine } from './topics.js'
 import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.js'
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference } from './message-context.js'
@@ -88,7 +88,7 @@ export function apply(ctx, config) {
   /** Invalidates a start that was overtaken by stop/restart. */
   let startEpoch = 0
   /** Durable chat → session mapping. */
-  let state = { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, directChats: {}, directTopics: {}, goalPanels: {}, pickedModels: {} }
+  let state = { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, directChats: {}, directTopics: {}, goalPanels: {}, pickedModels: {}, migrations: {} }
   /** Serializes state-file writes. */
   let stateWrite = Promise.resolve()
   /** Diagnostic counter for topic creation attempts. */
@@ -3647,6 +3647,7 @@ export function apply(ctx, config) {
     const query = ctx.get('sessionQuery')
     if (ctx.get('sessionTitle') === undefined) return
     await learnChatNames(signal)
+    await repairSenderTitles(signal)
     for (const [key, sessionId] of Object.entries(state.threads)) {
       if (signal.aborted) return
       const topic = topicOfSession(sessionId)
@@ -3667,6 +3668,83 @@ export function apply(ctx, config) {
         if (!signal.aborted) warn(`session title not migrated for ${sessionId}: ${messageOf(error)}`)
       }
     }
+  }
+
+  /** DSH's first-prompt title budget, for services that do not expose theirs. */
+  const FALLBACK_TITLE_LIMITS = { fallbackMaxWords: 5, fallbackMaxBytes: 40 }
+
+  /**
+   * Retitle every session, bound or not, whose first-prompt title was built
+   * from the sender line versions before 0.6.1 put at the top of each prompt.
+   * The new title is "Telegram-<person>-<first words>", from the same prompt
+   * with that line removed, cut like DSH's fallback and kept as a fallback
+   * title, so a title provider can still replace it. Runs on each connect
+   * until one pass repairs everything it found; titles someone typed are
+   * left alone.
+   * @param signal - cancellation.
+   */
+  async function repairSenderTitles(signal) {
+    const query = ctx.get('sessionQuery')
+    if (state.migrations?.senderTitles === true) return
+    if (typeof query?.listSessions !== 'function' || typeof query.readTitleSnapshots !== 'function' || typeof query.readSession !== 'function') return
+    const ids = (await query.listSessions(signal)).map((record) => record.header.id)
+    let failed = false
+    // A session whose log cannot be read cannot be retitled either; skip it.
+    for (const result of await query.readTitleSnapshots(ids, signal)) {
+      if (signal.aborted) return
+      if (result?.status !== 'fulfilled') continue
+      const sessionId = result.sessionId
+      const current = result.value?.title
+      if (current?.source?.kind !== 'fallback' || !hasSenderLine(current.title)) continue
+      try {
+        const { title, person } = await repairedSenderTitle(sessionId, current)
+        const agent = ctx.get('agents')?.get(sessionId) ?? await openForTitle(sessionId)
+        if (agent?.session === undefined) throw new Error('no live session to retitle')
+        agent.session.append('session/title', {
+          title,
+          messageSeqs: Array.isArray(current.messageSeqs) ? [...current.messageSeqs] : [],
+          source: { kind: 'fallback' },
+        })
+        if (state.sessions[sessionId] !== undefined) rememberTitlePerson(sessionId, person)
+      } catch (error) {
+        failed = true
+        if (!signal.aborted) warn(`sender-line title not repaired for ${sessionId}: ${messageOf(error)}`)
+      }
+    }
+    if (failed || signal.aborted) return
+    state.migrations = { ...state.migrations, senderTitles: true }
+    await persistState()
+  }
+
+  /**
+   * The repaired title of a session titled from a sender line.
+   * @param sessionId - DSH session id.
+   * @param current - its title snapshot.
+   * @returns `{ title, person }`: "Telegram-<person>-<first words>" of the
+   *   prompt the title came from, and the person label in it.
+   */
+  async function repairedSenderTitle(sessionId, current) {
+    const { events } = await ctx.get('sessionQuery').readSession(sessionId)
+    const seq = Array.isArray(current.messageSeqs) ? current.messageSeqs[0] : undefined
+    const prompts = events.filter((event) => event?.type === 'user/message' && event.data?.source?.kind === 'user')
+    const prompt = prompts.find((event) => event.seq === seq) ?? prompts.find((event) => promptText(event).trim().length > 0)
+    const { text, userId } = withoutSenderLine(promptText(prompt))
+    const record = state.sessions[sessionId]
+    const principalChat = Number(prompt?.data?.source?.principal?.chat?.id)
+    const chatId = typeof record?.chatId === 'number' ? record.chatId : (Number.isSafeInteger(principalChat) ? principalChat : userId)
+    const person = chatId === undefined ? undefined : personOf(chatId)
+    if (person === undefined) throw new Error('no chat known for its prompt')
+    const limits = { ...FALLBACK_TITLE_LIMITS, ...ctx.get('sessionTitle')?.config }
+    return { title: sessionTitleOf(person, leadingWords(text, limits.fallbackMaxWords, limits.fallbackMaxBytes)), person }
+  }
+
+  /**
+   * The text of a logged user message.
+   * @param event - `user/message` event, or undefined.
+   * @returns its text blocks joined by newlines.
+   */
+  function promptText(event) {
+    return (event?.data?.content ?? []).filter((block) => block?.type === 'text').map((block) => block.text).join('\n')
   }
 
   /**

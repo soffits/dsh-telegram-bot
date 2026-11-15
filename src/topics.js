@@ -58,21 +58,55 @@ export function isPlaceholderTitle(title, names, people = []) {
 }
 
 /**
- * Head of the sender line earlier versions prefixed to every Telegram prompt.
- * A DSH-generated title whose task part starts with it is a cut-off sender
- * line, not a real conversation title: the bot's own text leaked into DSH's
- * title fallback (0.6.1 moved the line into its own notice message).
+ * Head of the sender line versions before 0.6.1 put at the top of every
+ * Telegram prompt. DSH's first-prompt title fallback took its first words, so
+ * sessions from then carry titles like "Telegram-Ana-[Telegram message from
+ * Ana (@ana," or "Chat-1 · [Telegram message from Ana (@ana,".
  */
-const LEGACY_SENDER_HEAD = '[Telegram message from '
+export const SENDER_LINE_HEAD = '[Telegram message from '
 
 /**
- * Whether the task extracted from a title is a cut-off sender line left by
- * an earlier version. Such titles are repaired by rename, like placeholders.
- * @param task - the task part, as returned by `titleTask`.
- * @returns true for a cut-off sender line.
+ * Whether a title was built from a sender line instead of the person's words.
+ * @param title - current session title.
+ * @returns true when the title carries the sender-line head.
  */
-export function isLegacySenderTitle(task) {
-  return typeof task === 'string' && task.startsWith(LEGACY_SENDER_HEAD)
+export function hasSenderLine(title) {
+  return typeof title === 'string' && title.includes(SENDER_LINE_HEAD)
+}
+
+/**
+ * Split an old prompt into its sender line and the person's own text.
+ * @param text - prompt text as logged.
+ * @returns `{ text, userId }`: the text without a leading sender line, and
+ *   the Telegram user id that line named (undefined without one).
+ */
+export function withoutSenderLine(text) {
+  if (typeof text !== 'string' || !text.startsWith(SENDER_LINE_HEAD)) return { text: typeof text === 'string' ? text : '', userId: undefined }
+  const end = text.indexOf('\n')
+  const line = end === -1 ? text : text.slice(0, end)
+  const id = /user id (-?\d+)\)?\]$/u.exec(line)?.[1]
+  return { text: end === -1 ? '' : text.slice(end + 1), userId: id === undefined ? undefined : Number(id) }
+}
+
+/**
+ * The leading words of a prompt within a word and UTF-8 byte budget, cut the
+ * way DSH cuts its first-prompt title, without splitting a character.
+ * @param text - prompt text.
+ * @param maxWords - most whitespace-separated words.
+ * @param maxBytes - most UTF-8 bytes.
+ * @returns one trimmed line, possibly empty.
+ */
+export function leadingWords(text, maxWords, maxBytes) {
+  const words = String(text ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/gu, ' ').split(/\s+/u).filter(Boolean).slice(0, maxWords).join(' ')
+  let output = ''
+  let used = 0
+  for (const character of words) {
+    const bytes = Buffer.byteLength(character, 'utf8')
+    if (used + bytes > maxBytes) break
+    output += character
+    used += bytes
+  }
+  return output.trimEnd()
 }
 
 /**
@@ -104,11 +138,6 @@ export function titleTask(title, names, people = []) {
  * stops DSH's own fallback from replacing it); a generated title gets the
  * prefix by re-appending it with the same source, so automatic titling keeps
  * running. A title someone typed is left alone.
- *
- * A title whose task part is a cut-off sender line (earlier versions
- * prefixed each prompt with one, and DSH's title fallback took its first
- * words) is also renamed to the placeholder, so the next request regenerates
- * a real title through `sessionTitle.refresh`.
  * @param current - the latest title snapshot (`{ title, source }`), if any.
  * @param options - `person`, the label for the chat now; `names`, topic names
  *   the title may carry, current first (empty for a chat without topics);
@@ -122,14 +151,11 @@ export function plannedTitle(current, { person, names = [], people = [] }) {
     return placeholder === undefined ? { kind: 'none' } : { kind: 'rename', title: placeholder }
   }
   const title = current.title
-  const task = titleTask(title, names, labels)
-  if (placeholder !== undefined && title !== placeholder && isLegacySenderTitle(task)) {
-    return { kind: 'rename', title: placeholder }
-  }
   if (current.source?.kind === 'user') {
     const stale = placeholder !== undefined && title !== placeholder && isPlaceholderTitle(title, names, labels)
     return stale ? { kind: 'rename', title: placeholder } : { kind: 'none' }
   }
+  const task = titleTask(title, names, labels)
   const wanted = task.length > 0 ? sessionTitleOf(person, task) : (placeholder ?? sessionTitleOf(person, ''))
   return wanted === title ? { kind: 'none' } : { kind: 'append', title: wanted }
 }

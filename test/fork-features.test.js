@@ -10,7 +10,7 @@ import { STATUS_DIR } from '../src/constants.js'
 import { followupThroughGate, makeAgentModel, makeTitleService } from './fake-dsh.js'
 import { senderLabel } from '../src/sender.js'
 import { enqueue, waitForResult } from '../src/outbox.js'
-import { isAutoCommandTopic, isLegacySenderTitle, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, titleTask, topicNameOf } from '../src/topics.js'
+import { hasSenderLine, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, leadingWords, plannedTitle, resolveSendTarget, sessionTitleOf, titleTask, topicNameOf, withoutSenderLine } from '../src/topics.js'
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -1762,30 +1762,75 @@ test('plannedTitle moves every earlier form to the current one and leaves typed 
   assert.deepEqual(plannedTitle(provider('Plan a trip'), plain), { kind: 'append', title: 'Telegram-Mara-Plan a trip' })
 })
 
-test('plannedTitle repairs titles left by an older sender-line prefix', () => {
-  // Earlier versions prefixed each prompt with "[Telegram message from ...]".
-  // DSH's title fallback kept its first words, and `syncTopicTitle` then
-  // re-prefixed "Telegram-<person>-", so sessions ended up with titles like
-  // "Telegram-Ana-[Telegram message from Ana (@ana,". Repair them by renaming
-  // to the placeholder, so the next request regenerates a real title.
-  const context = { person: 'Ana', names: ['Chat-1', 'topic 7'], people: [] }
-  const fallback = (title) => ({ title, source: { kind: 'fallback' } })
-  const user = (title) => ({ title, source: { kind: 'user' } })
+test('sender-line helpers find the leaked line and the words after it', () => {
+  assert.equal(hasSenderLine('Telegram-Ana-[Telegram message from Ana (@ana,'), true)
+  assert.equal(hasSenderLine('Chat-1 · [Telegram message from Ana (@ana,'), true)
+  assert.equal(hasSenderLine('Telegram-Ana-Fix the mirror'), false)
+  assert.deepEqual(withoutSenderLine('[Telegram message from Ana (@ana, user id 42)]\nfix the mirror'), { text: 'fix the mirror', userId: 42 })
+  assert.deepEqual(withoutSenderLine('[Telegram message from user id 42]'), { text: '', userId: 42 })
+  assert.deepEqual(withoutSenderLine('plain words'), { text: 'plain words', userId: undefined })
+  assert.equal(leadingWords('  one two\nthree four five six ', 5, 40), 'one two three four five')
+  // CJK text has no spaces: the byte budget cuts it, never inside a character.
+  assert.equal(leadingWords('你在做的事情都做的怎么样了喵', 5, 40), '你在做的事情都做的怎么样了')
+})
 
-  assert.equal(isLegacySenderTitle('[Telegram message from Ana (@ana, user id 1)]'), true)
-  assert.equal(isLegacySenderTitle('[Telegram message from Ana (@ana,'), true, 'a cut-off line')
-  assert.equal(isLegacySenderTitle('Chat-1'), false)
-  assert.equal(isLegacySenderTitle(''), false)
-
-  const broken = 'Telegram-Ana-[Telegram message from Ana (@ana, user id 1)]'
-  assert.deepEqual(plannedTitle(fallback(broken), context), { kind: 'rename', title: 'Telegram-Ana-Chat-1' })
-  assert.deepEqual(plannedTitle(fallback('Telegram-Ana-[Telegram message from Ana (@ana,'), context), { kind: 'rename', title: 'Telegram-Ana-Chat-1' })
-  // Also when the title source came back as a user rename.
-  assert.deepEqual(plannedTitle(user(broken), context), { kind: 'rename', title: 'Telegram-Ana-Chat-1' })
-  // Idempotent: once renamed to the placeholder nothing more happens.
-  assert.deepEqual(plannedTitle(user('Telegram-Ana-Chat-1'), context), { kind: 'none' })
-  // A chat without topics has no placeholder to fall back to; the title is left alone.
-  assert.deepEqual(plannedTitle(fallback(broken), { person: 'Ana', names: [], people: [] }), { kind: 'none' })
+test('on start every session titled from the old sender line is retitled from its own words, once', async () => {
+  const sender = (name, id) => `[Telegram message from ${name} (@${name.toLowerCase()}, user id ${id})]`
+  const prompt = (seq, text, source = { kind: 'user' }) => ({ type: 'user/message', seq, data: { role: 'user', content: [{ type: 'text', text }], source } })
+  const logs = {
+    // Bound topic session, title already carrying the current prefix.
+    'session-bound': [prompt(16, 'workspace instructions', { kind: 'system-reminder' }), prompt(17, `${sender('Ana', 100)}\nhow is the work going`)],
+    // No longer bound, old "<topic> · " form; the person comes from the sender line.
+    'session-old': [prompt(3, 'notice', { kind: 'telegram-post' }), prompt(19, `${sender('Ana', 100)}\n你在做的事情都做的怎么样了喵`)],
+    // Unbound, the chat comes from the recorded principal.
+    'session-principal': [prompt(5, `${sender('Mara', 7)}\nplan the trip to Banff please now`, { kind: 'user', principal: { kind: 'telegram-user', id: '7', chat: { id: '200' } } })],
+    // A title someone typed, even with the line in it, stays.
+    'session-typed': [prompt(4, `${sender('Ana', 100)}\nhello`)],
+    'session-fine': [prompt(4, 'hello')],
+  }
+  const snapshots = {
+    'session-bound': { title: 'Telegram-Ana-[Telegram message from Ana (@ana,', source: { kind: 'fallback' }, messageSeqs: [17] },
+    'session-old': { title: 'Chat-1 · [Telegram message from Ana (@ana,', source: { kind: 'fallback' }, messageSeqs: [19] },
+    'session-principal': { title: '[Telegram message from Mara (@mara,', source: { kind: 'fallback' }, messageSeqs: [5] },
+    'session-typed': { title: 'Telegram-Ana-[Telegram message from Ana (@ana,', source: { kind: 'user' }, messageSeqs: [] },
+    'session-fine': { title: 'Telegram-Ana-hello', source: { kind: 'fallback' }, messageSeqs: [4] },
+  }
+  const initial = {
+    sessions: { 'session-bound': { sessionId: 'session-bound', chatId: 100, threadId: 7100, title: '', cwd: '/tmp/default-workspace', updatedAt: 1 } },
+    threads: { '100:7100': 'session-bound' },
+    topicNames: { '100:7100': 'Chat-1' },
+  }
+  let scans = 0
+  const run = await start({ userNames: { 100: 'Ana', 200: 'Mara' } }, initial, ({ host }) => {
+    for (const [id, title] of Object.entries(snapshots)) host.titleSnapshots.set(id, title)
+    Object.assign(host.services.sessionQuery, {
+      listSessions: async () => Object.keys(logs).map((id) => ({ header: { id }, live: false, persisted: true })),
+      readTitleSnapshots: async (ids) => {
+        scans += 1
+        return ids.map((id) => ({ sessionId: id, status: 'fulfilled', value: { session: { id }, title: host.live.get(id)?.session.title === undefined ? snapshots[id] : { title: host.live.get(id).session.title, source: host.live.get(id).session.titleSource, messageSeqs: host.live.get(id).session.titleSeqs } } }))
+      },
+      readSession: async (id) => ({ session: { id }, inheritedEventCount: 0, events: logs[id] }),
+    })
+  })
+  try {
+    await wait(250)
+    const session = (id) => run.host.live.get(id)?.session
+    assert.equal(session('session-bound').title, 'Telegram-Ana-how is the work going')
+    assert.equal(session('session-bound').titleSource.kind, 'fallback', 'kept as a fallback title, so a title provider can still replace it')
+    assert.deepEqual(session('session-bound').titleSeqs, [17])
+    assert.equal(session('session-old').title, 'Telegram-Ana-你在做的事情都做的怎么样了')
+    assert.equal(session('session-principal').title, 'Telegram-Mara-plan the trip to Banff')
+    assert.equal(run.host.live.has('session-typed'), false, 'a typed title is left alone')
+    assert.equal(run.host.live.has('session-fine'), false)
+    for (const id of ['session-bound', 'session-old', 'session-principal']) assert.ok(!session(id).title.includes('[Telegram message from'))
+    const state = await run.readState()
+    assert.equal(state.migrations.senderTitles, true, 'a clean pass is recorded')
+    assert.equal(state.sessions['session-bound'].titlePerson, 'Ana')
+    assert.equal(scans, 1)
+    assert.equal(run.telegram.calls.filter((call) => call.method === 'editForumTopic').length, 0, 'topics are never renamed')
+  } finally {
+    run.stop()
+  }
 })
 
 /** Uploads into one topic, as `[method, filename]`. */

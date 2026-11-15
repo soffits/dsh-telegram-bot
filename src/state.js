@@ -39,12 +39,13 @@ async function loadState() {
         directChats: parsed.directChats !== null && typeof parsed.directChats === 'object' && !Array.isArray(parsed.directChats) ? parsed.directChats : {},
         directTopics: parsed.directTopics !== null && typeof parsed.directTopics === 'object' && !Array.isArray(parsed.directTopics) ? parsed.directTopics : {},
         goalPanels: parsed.goalPanels !== null && typeof parsed.goalPanels === 'object' && !Array.isArray(parsed.goalPanels) ? parsed.goalPanels : (parsed.goalPins !== null && typeof parsed.goalPins === 'object' && !Array.isArray(parsed.goalPins) ? parsed.goalPins : {}),
+        migrations: parsed.migrations !== null && typeof parsed.migrations === 'object' && !Array.isArray(parsed.migrations) ? parsed.migrations : {},
       }
     }
   } catch {
     // Missing or corrupt state is nonfatal; the next session creates a mapping.
   }
-  return { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, chatNames: {}, directChats: {}, directTopics: {}, goalPanels: {} }
+  return { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, chatNames: {}, directChats: {}, directTopics: {}, goalPanels: {}, migrations: {} }
 }
 
 export { STATE_PATH, loadState }

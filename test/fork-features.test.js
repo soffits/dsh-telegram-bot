@@ -10,7 +10,7 @@ import { STATUS_DIR } from '../src/constants.js'
 import { followupThroughGate, makeAgentModel, makeTitleService } from './fake-dsh.js'
 import { senderLabel } from '../src/sender.js'
 import { enqueue, waitForResult } from '../src/outbox.js'
-import { isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, titleTask, topicNameOf } from '../src/topics.js'
+import { isAutoCommandTopic, isLegacySenderTitle, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, titleTask, topicNameOf } from '../src/topics.js'
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -1760,6 +1760,32 @@ test('plannedTitle moves every earlier form to the current one and leaves typed 
   const plain = { person: 'Mara', names: [], people: [] }
   assert.deepEqual(plannedTitle(undefined, plain), { kind: 'none' })
   assert.deepEqual(plannedTitle(provider('Plan a trip'), plain), { kind: 'append', title: 'Telegram-Mara-Plan a trip' })
+})
+
+test('plannedTitle repairs titles left by an older sender-line prefix', () => {
+  // Earlier versions prefixed each prompt with "[Telegram message from ...]".
+  // DSH's title fallback kept its first words, and `syncTopicTitle` then
+  // re-prefixed "Telegram-<person>-", so sessions ended up with titles like
+  // "Telegram-Ana-[Telegram message from Ana (@ana,". Repair them by renaming
+  // to the placeholder, so the next request regenerates a real title.
+  const context = { person: 'Ana', names: ['Chat-1', 'topic 7'], people: [] }
+  const fallback = (title) => ({ title, source: { kind: 'fallback' } })
+  const user = (title) => ({ title, source: { kind: 'user' } })
+
+  assert.equal(isLegacySenderTitle('[Telegram message from Ana (@ana, user id 1)]'), true)
+  assert.equal(isLegacySenderTitle('[Telegram message from Ana (@ana,'), true, 'a cut-off line')
+  assert.equal(isLegacySenderTitle('Chat-1'), false)
+  assert.equal(isLegacySenderTitle(''), false)
+
+  const broken = 'Telegram-Ana-[Telegram message from Ana (@ana, user id 1)]'
+  assert.deepEqual(plannedTitle(fallback(broken), context), { kind: 'rename', title: 'Telegram-Ana-Chat-1' })
+  assert.deepEqual(plannedTitle(fallback('Telegram-Ana-[Telegram message from Ana (@ana,'), context), { kind: 'rename', title: 'Telegram-Ana-Chat-1' })
+  // Also when the title source came back as a user rename.
+  assert.deepEqual(plannedTitle(user(broken), context), { kind: 'rename', title: 'Telegram-Ana-Chat-1' })
+  // Idempotent: once renamed to the placeholder nothing more happens.
+  assert.deepEqual(plannedTitle(user('Telegram-Ana-Chat-1'), context), { kind: 'none' })
+  // A chat without topics has no placeholder to fall back to; the title is left alone.
+  assert.deepEqual(plannedTitle(fallback(broken), { person: 'Ana', names: [], people: [] }), { kind: 'none' })
 })
 
 /** Uploads into one topic, as `[method, filename]`. */

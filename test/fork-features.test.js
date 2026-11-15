@@ -2229,3 +2229,51 @@ test('the model picker lists providers, then their models, and a pick switches t
     run.stop()
   }
 })
+
+test('subagents of a Telegram turn show in one status message, and /agents lists them with their report', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(250)
+    const parent = run.host.live.get('session-1')
+    parent.whenIdle = () => new Promise(() => {})
+    const catalog = []
+    run.host.services.subagents = { listChildren: async (id) => (id === 'session-1' ? [...catalog] : []) }
+    run.telegram.push({ message_thread_id: 7001, text: 'research this' })
+    await wait(250)
+    const child = run.host.makeAgent('child-a', '/tmp/default-workspace')
+    child.session.header.parentSession = 'session-1'
+    child.status = 'running'
+    catalog.push({ id: 'child-a', label: 'Research prices', createdAt: Date.now(), mode: 'one-shot' })
+    const before = run.telegram.calls.length
+    child.emit('subagent/start', { runId: 'run-a', provider: 'spawn', id: 'child-a', local: true })
+    await wait(1700)
+    const posted = run.telegram.calls.slice(before).filter((call) => call.method === 'sendMessage' && String(call.body.text).startsWith('🤖'))
+    assert.equal(posted.length, 1, 'one status message')
+    assert.equal(posted[0].body.message_thread_id, 7001)
+    assert.equal(posted[0].body.disable_notification, true)
+    assert.equal(posted[0].body.text, '🤖 1 subagent · 1 running\n⏳ Research prices · claude-opus-5-5 · <1m')
+    child.status = 'idle'
+    child.emit('subagent/end', { runId: 'run-a', provider: 'spawn', id: 'child-a', local: true, stopReason: 'completed' })
+    await wait(1700)
+    const edited = run.telegram.calls.slice(before).filter((call) => call.method === 'editMessageText' && call.body.message_id === posted[0].result.message_id)
+    assert.equal(edited.length, 1)
+    assert.match(edited[0].body.text, /^🤖 1 subagent · all done\n✓ Research prices · claude-opus-5-5 · \d+s$/u)
+    // The topic's turn ends; /agents reads the catalog and the child's log.
+    parent.emit('session/event', { id: 'session-1' }, { type: 'turn/start', data: { turn: 2 } })
+    parent.emit('session/event', { id: 'session-1' }, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+    await wait(250)
+    const query = run.host.services.sessionQuery
+    query.observeSession = async () => ({ projections: { values: { subagentTiming: { settledMs: 75_000, lastTurnCompleted: true } } }, [Symbol.dispose]() {} })
+    query.readSurface = async (id) => ({ events: id !== 'child-a' ? [] : [
+      { type: 'assistant/message', data: { message: { content: [{ type: 'tool-call', name: 'send_message', arguments: JSON.stringify({ agent_id: 'session-1', message: 'Found three stores with it.' }) }] } } },
+    ] })
+    const listed = run.telegram.calls.length
+    run.telegram.push({ message_thread_id: 7001, text: '/agents' })
+    await wait(300)
+    const reply = texts(run.telegram.calls.slice(listed), 7001).find((text) => text.startsWith('🤖 Subagents'))
+    assert.equal(reply, '🤖 Subagents:\n\n✓ Research prices\n   done · claude-opus-5-5 · 1m 15s · just now\n   “Found three stores with it.”')
+  } finally {
+    run.stop()
+  }
+})

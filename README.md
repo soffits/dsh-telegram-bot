@@ -37,6 +37,15 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Leave **Disallow users
 - Automatic goal rounds of a topic's session are shown in the topic like a Telegram turn, with thinking, tool calls and the final answer, also when **Show turns from other clients** is off. Their approvals and questions are answered in the topic.
 - While a turn runs in a topic's session (started from Telegram or shown from another client), that topic shows "typing…". Each topic shows its own; it stops when the turn ends, fails or is stopped.
 - Reasoning and tool calls are shown as temporary messages and removed after the answer. Each tool-call entry is capped at two lines.
+- Subagents show in the topic. When a turn the topic shows starts subagents, one quiet status message lists them, each with its description, model and running time, and is edited in place as they start and finish (✓ done, ✗ failed with the reason). Changes that land within about 1.5 seconds share one edit, and running times are refreshed at most once a minute, which keeps well inside Telegram's edit limits. Subagents started by subagents are listed under their parent. Once all of them are done the message stays as it is, and the next subagent opens a new one. For example:
+
+  ```
+  🤖 3 subagents · 1 running
+  ✓ Compare flight prices · claude-opus-5-5 · 2m 14s
+  ↳ ✓ Check baggage rules · claude-haiku-4-5 · 41s
+  ⏳ Find a hotel near the venue · deepseek-v4-flash · 3m
+  ```
+- `/agents` lists the session's running and most recent subagents (up to eight, nested ones included), with their state, model, time, when they started and the beginning of their last report (the last message they sent their parent, or their final answer). It reads DSH's saved sessions, so it also covers subagents from before a restart; one cut off by a restart shows as interrupted.
 - Inline controls for model, reasoning effort, permission mode and context usage. The model picker offers every provider and model of the Web UI's model picker (provider first, then its models, with paging) and switches the session the way the Web UI does, which also makes the pick the default for new sessions. The panel always shows the model the session runs now; `/new` starts the next session on that model.
 - Tool approvals with **Deny** / **Allow** buttons.
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
@@ -45,7 +54,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Leave **Disallow users
 - Every prompt from Telegram starts with a line naming the sender, such as `[Telegram message from Ana Silva (@ana, user id 123)]`, so the agent knows who is writing when several allowed users share the bot. Prompts typed in the Web UI are not labelled. The sender is also recorded as data on the prompt's source as `principal`, the field DSH uses for the caller behind a user message: `{ kind: 'telegram-user', channel: 'telegram', id: '123', name: 'Ana Silva', username: 'ana', chat: { id, thread, name } }`, where `chat` is the chat, its topic thread and the topic's name. Scripts that read session logs can use it instead of parsing the line.
 - Replies, quotes and forwards keep their context. The agent sees the text of the replied-to message (or only the quoted part), who wrote it and when; a replied-to photo or document is attached too. A forwarded message is labelled with its origin (person, hidden account, group or channel with a message link) and original date. Several messages forwarded together become one prompt, and forwarded text never runs as a command. Long quoted text is cut at about 2,000 characters with a note.
 - Replies to messages sent into a topic by a script, job, plugin or another session (see [Send to a topic](#send-to-a-topic)) also carry the full original text, when it was sent, and the sending session and job, even if the topic has moved to a new session since.
-- `/new`, `/workspace`, `/last`, `/goal`, `/rename`, `/topic`, `/fork`, `/clear`, `/stop`, `/restart`, `/status` and `/menu`.
+- `/new`, `/workspace`, `/last`, `/agents`, `/goal`, `/rename`, `/topic`, `/fork`, `/clear`, `/stop`, `/restart`, `/status` and `/menu`.
 - `/goal` shows the current DSH goal and the command hints. `/goal <objective>` creates or replaces the goal and starts working immediately; `/goal edit <objective>` updates the objective and resumes a paused, blocked or disarmed goal; `/goal pause`, `/goal resume` and `/goal clear` manage the current goal. `/goal <objective>` and `/goal edit <objective>` replace the current panel with one fresh message; later goal changes edit that message in place. The panel is never pinned.
 - `/new` in a session topic starts a fresh DSH session in the same workspace and binds it to the same topic; the previous session stays in DSH. In All it opens a new session topic.
 - One session is bound to at most one topic: binding it to a new topic releases the old one.

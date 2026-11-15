@@ -1814,7 +1814,7 @@ test('title repair helpers find the bot text and the words after it', () => {
   assert.equal(withoutContextBlocks('just words'), 'just words')
   assert.equal(leadingWords('  one two\nthree four five six ', 5, 40), 'one two three four five')
   // CJK text has no spaces: the byte budget cuts it, never inside a character.
-  assert.equal(leadingWords('你在做的事情都做的怎么样了喵', 5, 40), '你在做的事情都做的怎么样了')
+  assert.equal(leadingWords('今天天气很好我们一起去公园散步吧', 5, 40), '今天天气很好我们一起去公园')
 })
 
 test('on start every session titled from bot text is retitled from the words sent, once', async () => {
@@ -1824,7 +1824,7 @@ test('on start every session titled from bot text is retitled from the words sen
     // Bound topic session, title already carrying the current prefix.
     'session-bound': [prompt(16, 'workspace instructions', { kind: 'system-reminder' }), prompt(17, `${sender('Ana', 100)}\nhow is the work going`)],
     // No longer bound, old "<topic> · " form; the person comes from the sender line.
-    'session-old': [prompt(3, 'notice', { kind: 'telegram-post' }), prompt(19, `${sender('Ana', 100)}\n你在做的事情都做的怎么样了喵`)],
+    'session-old': [prompt(3, 'notice', { kind: 'telegram-post' }), prompt(19, `${sender('Ana', 100)}\n今天天气很好我们一起去公园散步吧`)],
     // Unbound, the chat comes from the recorded principal.
     'session-principal': [prompt(5, `${sender('Mara', 7)}\nplan the trip to Banff please now`, { kind: 'user', principal: { kind: 'telegram-user', id: '7', chat: { id: '200' } } })],
     // Replying to the bot, the person's words after the context blocks.
@@ -1870,7 +1870,7 @@ test('on start every session titled from bot text is retitled from the words sen
     assert.equal(session('session-bound').title, 'Telegram-Ana-how is the work going')
     assert.equal(session('session-bound').titleSource.kind, 'fallback', 'kept as a fallback title, so a title provider can still replace it')
     assert.deepEqual(session('session-bound').titleSeqs, [17])
-    assert.equal(session('session-old').title, 'Telegram-Ana-你在做的事情都做的怎么样了')
+    assert.equal(session('session-old').title, 'Telegram-Ana-今天天气很好我们一起去公园')
     assert.equal(session('session-principal').title, 'Telegram-Mara-plan the trip to Banff')
     assert.equal(session('session-reply').title, 'Telegram-Ana-which effort level is it')
     assert.equal(session('session-reply-061').title, 'Telegram-Ana-good point')

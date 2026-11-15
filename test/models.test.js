@@ -9,7 +9,7 @@ test('a session that is not running reports its recorded model and releases the 
     get: (name) => (name === 'sessionQuery'
       ? {
           observeSession: async () => ({
-            projections: { values: { modelSelection: { lastUsed: { provider: 'aocro-antigravity', model: 'gemini-4-argon-high' }, next: { provider: 'anthropic', model: 'claude-opus-5-5', reasoningEffort: 'medium' } } } },
+            projections: { values: { modelSelection: { lastUsed: { provider: 'example-gateway', model: 'gemini-pro-high' }, next: { provider: 'anthropic', model: 'claude-opus-5-5', reasoningEffort: 'medium' } } } },
             [Symbol.dispose]() { disposed += 1 },
           }),
         }

@@ -10,7 +10,7 @@ import { STATUS_DIR } from '../src/constants.js'
 import { followupThroughGate, makeAgentModel, makeTitleService } from './fake-dsh.js'
 import { senderLabel } from '../src/sender.js'
 import { enqueue, waitForResult } from '../src/outbox.js'
-import { hasSenderLine, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, leadingWords, plannedTitle, resolveSendTarget, sessionTitleOf, titleTask, topicNameOf, withoutSenderLine } from '../src/topics.js'
+import { hasBotPreamble, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, leadingWords, plannedTitle, resolveSendTarget, sessionTitleOf, titleTask, topicNameOf, withoutContextBlocks, withoutSenderLine } from '../src/topics.js'
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -1098,9 +1098,10 @@ test('a long send from a job is recorded with its sender, and a reply after /new
       reply_to_message: { message_id: result.messageIds.at(-1), date: 1, chat: { id: 100 }, from: { id: 1, is_bot: true, first_name: 'testbot' }, message_thread_id: 7100, text: 'word899' },
     })
     await wait(250)
-    const text = promptText(fresh.received.at(-1))
-    assert.match(text, /\[The replied-to message was posted by the bot on behalf of another sender \(sent [^;]+; by job "Morning digest"; from DSH session session-cron; \d+ Telegram messages; recorded in session session-notify, not this one\)\. Full text:\]\n> word0 word1 /u)
-    assert.match(text, /word899\n\(For more context, open session session-cron or session-notify\.\)\n\nthanks$/u)
+    assert.equal(promptText(fresh.received.at(-1)), 'thanks', 'the prompt holds only what the person wrote')
+    const notice = promptText(fresh.notices.at(-1))
+    assert.match(notice, /\[The replied-to message was posted by the bot on behalf of another sender \(sent [^;]+; by job "Morning digest"; from DSH session session-cron; \d+ Telegram messages; recorded in session session-notify, not this one\)\. Full text:\]\n> word0 word1 /u)
+    assert.match(notice, /word899\n\(For more context, open session session-cron or session-notify\.\)$/u)
     // A reply to an ordinary bot message adds no such block.
     run.telegram.push({
       message_thread_id: 7100,
@@ -1109,7 +1110,8 @@ test('a long send from a job is recorded with its sender, and a reply after /new
       reply_to_message: { message_id: 9999, date: 1, chat: { id: 100 }, from: { id: 1, is_bot: true, first_name: 'testbot' }, message_thread_id: 7100, text: 'an answer' },
     })
     await wait(250)
-    assert.doesNotMatch(promptText(fresh.received.at(-1)), /on behalf of/u)
+    assert.equal(promptText(fresh.received.at(-1)), 'and this?')
+    assert.doesNotMatch(promptText(fresh.notices.at(-1)), /on behalf of/u)
   } finally {
     run.stop()
   }
@@ -1176,8 +1178,8 @@ test('a reply carries the replied-to text, its author and its photo', async () =
     })
     await wait(250)
     const last = agent.received.at(-1)
-    const text = promptText(last)
-    assert.match(text, /^\[Replying to a message from the assistant \(this bot\) \(sent 2025-11-08 11:06 UTC; contains a photo, attached\)\]\n> Weekly chart\n\nwhat does this show\?$/u)
+    assert.equal(promptText(last), 'what does this show?')
+    assert.match(promptText(agent.notices.at(-1)), /^\[Telegram message from [^\n]+\]\n\[Replying to a message from the assistant \(this bot\) \(sent 2025-11-08 11:06 UTC; contains a photo, attached\)\]\n> Weekly chart$/u)
     assert.equal(last.content.filter((block) => block.type === 'image').length, 1)
     assert.ok(run.telegram.calls.some((call) => call.method === 'getFile' && call.body.file_id === 'large'))
   } finally {
@@ -1211,9 +1213,10 @@ test('a partial quote replaces the full text, and the topic root is not a reply'
       },
     })
     await wait(250)
-    const text = promptText(agent.received.at(-1))
-    assert.match(text, /^\[Replying to a message from Sam \(@sam\) \(sent [^)]+\); the user quoted only this part\]\n> the second step\n\nis this right\?$/u)
-    assert.doesNotMatch(text, /third step/u)
+    assert.equal(promptText(agent.received.at(-1)), 'is this right?')
+    const notice = promptText(agent.notices.at(-1))
+    assert.match(notice, /\n\[Replying to a message from Sam \(@sam\) \(sent [^)]+\); the user quoted only this part\]\n> the second step$/u)
+    assert.doesNotMatch(notice, /third step/u)
   } finally {
     run.stop()
   }
@@ -1229,7 +1232,8 @@ test('a reply to a mirrored Web prompt is not shown as an assistant message', as
       reply_to_message: { message_id: 502, date: 1, chat: { id: 100 }, from: { id: 1, is_bot: true }, text: '🖥 From Web:\nsummarize the logs' },
     })
     await wait(250)
-    assert.match(promptText(agent.received.at(-1)), /^\[Replying to a message from the Web UI \(a user prompt this bot mirrored into the chat, not an assistant answer\)/u)
+    assert.equal(promptText(agent.received.at(-1)), 'and this one too')
+    assert.match(promptText(agent.notices.at(-1)), /\n\[Replying to a message from the Web UI \(a user prompt this bot mirrored into the chat, not an assistant answer\)/u)
   } finally {
     run.stop()
   }
@@ -1259,9 +1263,11 @@ test('several forwarded messages become one prompt and never run as commands', a
     await wait(1800)
     assert.equal(agent.received.length, before + 1, 'one prompt for the whole batch')
     const text = promptText(agent.received.at(-1))
-    assert.match(text, /\[Forwarded message from channel "Project News" \(@projnews\) \(originally sent [^;]+; https:\/\/t\.me\/projnews\/88\)\]\n> Release notes are out/u)
-    assert.match(text, /\[Forwarded message from Sam \(originally sent [^)]+\)\]\n> \/new/u)
-    assert.match(text, /\[Forwarded message from Alex \(account hidden\) \(originally sent [^;]+; contains a video, not attached\)\]\n> clip/u)
+    // The first forward's origin is in the notice, so the prompt starts with its text.
+    assert.match(promptText(agent.notices.at(-1)), /\n\[Forwarded message from channel "Project News" \(@projnews\) \(originally sent [^;]+; https:\/\/t\.me\/projnews\/88\)\]$/u)
+    assert.match(text, /^Release notes are out\n\n/u)
+    assert.match(text, /\[Forwarded message from Sam \(originally sent [^)]+\)\]\n\/new/u)
+    assert.match(text, /\[Forwarded message from Alex \(account hidden\) \(originally sent [^;]+; contains a video, not attached\)\]\nclip$/u)
     assert.equal(run.host.created.length, 1, 'a forwarded /new is not a command')
   } finally {
     run.stop()
@@ -1447,6 +1453,36 @@ test('without a title provider a topic session keeps its topic name, and no titl
     await wait(50)
     assert.equal(agent.session.titleSource.kind, 'fallback')
     assert.equal(agent.session.title, 'Telegram-Annie-fix the empty sessions')
+  } finally {
+    run.stop()
+  }
+})
+
+test('a reply or forward as the first message titles the session from the words sent, not the bot context', async () => {
+  const run = await start()
+  try {
+    const agent = await openSessionTopic(run)
+    const titles = run.host.ctx.get('sessionTitle')
+    titles.registration = undefined
+    agent.session.events.length = 0
+    run.telegram.push({
+      message_thread_id: 7001,
+      is_topic_message: true,
+      text: 'can you check this',
+      reply_to_message: { message_id: 600, date: 1, chat: { id: 100 }, from: { id: 77, first_name: 'Sam' }, text: 'the leak sensor is offline' },
+    })
+    await wait(250)
+    const notice = agent.notices.at(-1)
+    assert.equal(notice.source.kind, 'telegram-sender')
+    assert.match(promptText(notice), /\n\[Replying to a message from Sam \(sent [^)]+\)\]\n> the leak sensor is offline$/u, 'the model still sees what was replied to')
+    // DSH records the step's messages; its fallback title reads the first human one.
+    for (const message of [notice, agent.received.at(-1)]) agent.session.append('user/message', message)
+    await titles.refresh(agent.session)
+    assert.equal(agent.session.title, 'Telegram-Annie-can you check this')
+    run.telegram.push({ message_thread_id: 7001, text: 'Release notes are out', forward_origin: { type: 'user', sender_user: { id: 77, first_name: 'Sam' }, date: 1 } })
+    await wait(1800)
+    assert.equal(promptText(agent.received.at(-1)), 'Release notes are out', "a forward's text is its content; where it came from is in the notice")
+    assert.match(promptText(agent.notices.at(-1)), /\n\[Forwarded message from Sam \(originally sent [^)]+\)\]$/u)
   } finally {
     run.stop()
   }
@@ -1762,19 +1798,26 @@ test('plannedTitle moves every earlier form to the current one and leaves typed 
   assert.deepEqual(plannedTitle(provider('Plan a trip'), plain), { kind: 'append', title: 'Telegram-Mara-Plan a trip' })
 })
 
-test('sender-line helpers find the leaked line and the words after it', () => {
-  assert.equal(hasSenderLine('Telegram-Ana-[Telegram message from Ana (@ana,'), true)
-  assert.equal(hasSenderLine('Chat-1 · [Telegram message from Ana (@ana,'), true)
-  assert.equal(hasSenderLine('Telegram-Ana-Fix the mirror'), false)
+test('title repair helpers find the bot text and the words after it', () => {
+  assert.equal(hasBotPreamble('Telegram-Ana-[Telegram message from Ana (@ana,'), true)
+  assert.equal(hasBotPreamble('Chat-1 · [Telegram message from Ana (@ana,'), true)
+  assert.equal(hasBotPreamble('Telegram-Ana-[Replying to a message from'), true)
+  assert.equal(hasBotPreamble('Telegram-Ana-Fix the mirror'), false)
   assert.deepEqual(withoutSenderLine('[Telegram message from Ana (@ana, user id 42)]\nfix the mirror'), { text: 'fix the mirror', userId: 42 })
   assert.deepEqual(withoutSenderLine('[Telegram message from user id 42]'), { text: '', userId: 42 })
   assert.deepEqual(withoutSenderLine('plain words'), { text: 'plain words', userId: undefined })
+  const reply = '[Replying to a message from the assistant (this bot) (sent 2026-11-13 14:45 UTC)]\n> first line\n> \n> after a blank line'
+  const sent = '[The replied-to message was posted by the bot on behalf of another sender (sent 2026-11-13 14:45 UTC). Full text:]\n> first line\n(For more context, open session s1.)'
+  assert.equal(withoutContextBlocks(`${reply}\n\n${sent}\n\nwhich one\n\nsecond paragraph`), 'which one\n\nsecond paragraph')
+  assert.equal(withoutContextBlocks('[Forwarded message from Sam (originally sent 1970-01-01 00:00 UTC)]\n> Release notes\n> are out'), 'Release notes\nare out', "a forward's own text")
+  assert.equal(withoutContextBlocks('[Forwarded message from Sam (contains a photo, attached)]'), '')
+  assert.equal(withoutContextBlocks('just words'), 'just words')
   assert.equal(leadingWords('  one two\nthree four five six ', 5, 40), 'one two three four five')
   // CJK text has no spaces: the byte budget cuts it, never inside a character.
   assert.equal(leadingWords('你在做的事情都做的怎么样了喵', 5, 40), '你在做的事情都做的怎么样了')
 })
 
-test('on start every session titled from the old sender line is retitled from its own words, once', async () => {
+test('on start every session titled from bot text is retitled from the words sent, once', async () => {
   const sender = (name, id) => `[Telegram message from ${name} (@${name.toLowerCase()}, user id ${id})]`
   const prompt = (seq, text, source = { kind: 'user' }) => ({ type: 'user/message', seq, data: { role: 'user', content: [{ type: 'text', text }], source } })
   const logs = {
@@ -1784,6 +1827,12 @@ test('on start every session titled from the old sender line is retitled from it
     'session-old': [prompt(3, 'notice', { kind: 'telegram-post' }), prompt(19, `${sender('Ana', 100)}\n你在做的事情都做的怎么样了喵`)],
     // Unbound, the chat comes from the recorded principal.
     'session-principal': [prompt(5, `${sender('Mara', 7)}\nplan the trip to Banff please now`, { kind: 'user', principal: { kind: 'telegram-user', id: '7', chat: { id: '200' } } })],
+    // Replying to the bot, the person's words after the context blocks.
+    'session-reply': [prompt(17, `${sender('Ana', 100)}\n[Replying to a message from the assistant (this bot) (sent 2026-11-13 14:45 UTC)]\n> earlier answer\n> \n> more\n\n[The replied-to message was posted by the bot on behalf of another sender (sent 2026-11-13 14:45 UTC). Full text:]\n> earlier answer\n\nwhich effort level is it`)],
+    // Started in 0.6.1 with a reply: no sender line, the principal names the chat.
+    'session-reply-061': [prompt(6, '[Replying to a message from Sam (sent 1970-01-01 00:00 UTC)]\n> hi\n\ngood point', { kind: 'user', principal: { kind: 'telegram-user', id: '42', chat: { id: '100' } } })],
+    // Not from Telegram at all: no chat to name, left alone.
+    'session-web': [prompt(2, '[Replying to something]\n\nhello')],
     // A title someone typed, even with the line in it, stays.
     'session-typed': [prompt(4, `${sender('Ana', 100)}\nhello`)],
     'session-fine': [prompt(4, 'hello')],
@@ -1792,6 +1841,9 @@ test('on start every session titled from the old sender line is retitled from it
     'session-bound': { title: 'Telegram-Ana-[Telegram message from Ana (@ana,', source: { kind: 'fallback' }, messageSeqs: [17] },
     'session-old': { title: 'Chat-1 · [Telegram message from Ana (@ana,', source: { kind: 'fallback' }, messageSeqs: [19] },
     'session-principal': { title: '[Telegram message from Mara (@mara,', source: { kind: 'fallback' }, messageSeqs: [5] },
+    'session-reply': { title: 'Notify · [Telegram message from Ana (@ana,', source: { kind: 'fallback' }, messageSeqs: [17] },
+    'session-reply-061': { title: 'Telegram-Ana-[Replying to a message from', source: { kind: 'fallback' }, messageSeqs: [6] },
+    'session-web': { title: '[Replying to something]', source: { kind: 'fallback' }, messageSeqs: [2] },
     'session-typed': { title: 'Telegram-Ana-[Telegram message from Ana (@ana,', source: { kind: 'user' }, messageSeqs: [] },
     'session-fine': { title: 'Telegram-Ana-hello', source: { kind: 'fallback' }, messageSeqs: [4] },
   }
@@ -1820,11 +1872,14 @@ test('on start every session titled from the old sender line is retitled from it
     assert.deepEqual(session('session-bound').titleSeqs, [17])
     assert.equal(session('session-old').title, 'Telegram-Ana-你在做的事情都做的怎么样了')
     assert.equal(session('session-principal').title, 'Telegram-Mara-plan the trip to Banff')
+    assert.equal(session('session-reply').title, 'Telegram-Ana-which effort level is it')
+    assert.equal(session('session-reply-061').title, 'Telegram-Ana-good point')
+    assert.equal(run.host.live.has('session-web'), false, 'a session with no Telegram chat is left alone')
     assert.equal(run.host.live.has('session-typed'), false, 'a typed title is left alone')
     assert.equal(run.host.live.has('session-fine'), false)
-    for (const id of ['session-bound', 'session-old', 'session-principal']) assert.ok(!session(id).title.includes('[Telegram message from'))
+    for (const id of ['session-bound', 'session-old', 'session-principal', 'session-reply', 'session-reply-061']) assert.ok(!session(id).title.includes('['))
     const state = await run.readState()
-    assert.equal(state.migrations.senderTitles, true, 'a clean pass is recorded')
+    assert.equal(state.migrations.preambleTitles, true, 'a clean pass is recorded')
     assert.equal(state.sessions['session-bound'].titlePerson, 'Ana')
     assert.equal(scans, 1)
     assert.equal(run.telegram.calls.filter((call) => call.method === 'editForumTopic').length, 0, 'topics are never renamed')

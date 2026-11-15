@@ -11,9 +11,11 @@
  * known; the other fields depend on the kind. None carries a credential, so
  * all are safe in a session log.
  *
- * The model learns the sender from a notice message placed right before the
- * prompt, not from a line inside the prompt: DSH titles a session from the
- * first words of its first human message, and those must be the person's own.
+ * The model learns the sender, and the context of the message (what it
+ * replies to, where a forward comes from), from a notice message placed right
+ * before the prompt, not from lines inside the prompt: DSH titles a session
+ * from the first words of its first human message, and those must be the
+ * person's own.
  */
 
 import { randomUUID } from 'node:crypto'
@@ -109,21 +111,24 @@ export function senderLabel(principal) {
 }
 
 /**
- * The notice that names the sender of a prompt, for the step the prompt
- * enters: its own message with a producer source, so DSH's title input and
- * readers of human messages see only what the person wrote.
+ * The notice that comes before a prompt: who sent it and the context the bot
+ * adds around it. It is its own message with a producer source, so DSH's
+ * title input and readers of human messages see only what the person wrote.
  * @param message - a user message entering a step.
- * @returns the notice, or undefined when the message has no Telegram sender.
+ * @param context - context blocks for this prompt, if any (see `composePrompt`).
+ * @returns the notice, or undefined with neither a Telegram sender nor context.
  */
-export function senderNotice(message) {
+export function senderNotice(message, context) {
   if (message?.source?.kind !== 'user') return undefined
-  const text = senderLabel(message.source.principal)
-  if (text === undefined) return undefined
+  const label = senderLabel(message.source.principal)
+  const extra = typeof context === 'string' && context.trim().length > 0 ? context : undefined
+  if (label === undefined && extra === undefined) return undefined
+  const text = [label, extra].filter((part) => part !== undefined).join('\n')
   return deepFreeze({
     id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text }],
-    source: { kind: SENDER_NOTICE_KIND, form: 'notice', summary: text },
+    source: { kind: SENDER_NOTICE_KIND, form: 'notice', summary: label ?? text.split('\n')[0] },
   })
 }
 
@@ -146,20 +151,23 @@ function deepFreeze(value) {
 export function createPrincipalTagger(limit = MAX_PENDING_PRINCIPALS) {
   const pending = new Map()
   return {
-    /** Remember the sender of the prompt with this request id. */
-    remember(requestId, principal) {
-      if (typeof requestId !== 'string' || principal === undefined) return
+    /**
+     * Remember the sender and context of the prompt with this request id (or,
+     * for a message the bot builds itself, this message id).
+     */
+    remember(requestId, principal, context) {
+      if (typeof requestId !== 'string' || (principal === undefined && context === undefined)) return
       pending.delete(requestId)
-      pending.set(requestId, principal)
+      pending.set(requestId, { principal, context })
       if (pending.size > limit) pending.delete(pending.keys().next().value)
     },
-    /** Pending principals, for tests. */
+    /** Pending prompts, for tests. */
     get size() {
       return pending.size
     },
     /**
      * `agent/pre-step` listener: record remembered senders on the step's
-     * messages and put each Telegram sender's notice before their prompt.
+     * messages and put each prompt's notice (sender and context) before it.
      */
     async preStep(_payload, next) {
       const decision = await next()
@@ -168,14 +176,15 @@ export function createPrincipalTagger(limit = MAX_PENDING_PRINCIPALS) {
       const messages = []
       for (const original of decision.messages) {
         let message = original
-        const rpcId = message?.source?.kind === 'user' ? message.source.rpcId : undefined
-        const principal = typeof rpcId === 'string' ? pending.get(rpcId) : undefined
-        if (principal !== undefined && message.source.principal === undefined) {
-          pending.delete(rpcId)
-          message = withPrincipal(message, principal)
+        const user = message?.source?.kind === 'user'
+        const key = !user ? undefined : (typeof message.source.rpcId === 'string' && pending.has(message.source.rpcId) ? message.source.rpcId : message.id)
+        const entry = typeof key === 'string' ? pending.get(key) : undefined
+        if (entry !== undefined) pending.delete(key)
+        if (entry?.principal !== undefined && message.source.principal === undefined) {
+          message = withPrincipal(message, entry.principal)
           changed = true
         }
-        const notice = senderNotice(message)
+        const notice = senderNotice(message, entry?.context)
         if (notice !== undefined) {
           messages.push(notice)
           changed = true

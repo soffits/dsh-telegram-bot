@@ -2,6 +2,7 @@ import './setup-home.js'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { busyMode, clearTelegramInbox, hasPendingInput, steerPrompt } from '../src/steer.js'
+import { createPrincipalTagger } from '../src/sender.js'
 
 function fakeAgent(events = []) {
   return {
@@ -46,6 +47,27 @@ test('attachments go to agent.steer once per Telegram message', async () => {
   const recorded = fakeAgent([{ type: 'user/message', data: { source: { kind: 'user', rpcId: 'telegram:100:9' } } }])
   await steerPrompt(ctx, recorded, { sessionId: 's', chatId: 100, messageId: 9, text: '', attachments: [image] }, signal)
   assert.equal(recorded.steered.length, 0)
+})
+
+test('a steered prompt keeps its context for the notice before it, on both paths', async () => {
+  const principal = { kind: 'telegram-user', channel: 'telegram', id: '42', name: 'Ana' }
+  const context = '[Replying to a message from Kim (sent 1970-01-01 00:00 UTC)]\n> the plan'
+  const enter = (message) => ({ kind: 'enter', messages: [message] })
+  // Through the Session controller, which builds the message itself.
+  const viaController = createPrincipalTagger()
+  const ctx = { get: (name) => (name === 'sessionController' ? { prompt: async () => ({ accepted: true }) } : undefined) }
+  await steerPrompt(ctx, fakeAgent(), { sessionId: 's', chatId: 100, messageId: 7, text: 'agreed', principal, context }, signal, viaController)
+  const built = { id: 'm1', role: 'user', content: [{ type: 'text', text: 'agreed' }], source: { kind: 'user', rpcId: 'telegram:100:7' } }
+  const first = await viaController.preStep({}, async () => enter(built))
+  assert.equal(first.messages[0].content[0].text, `[Telegram message from Ana (user id 42)]\n${context}`)
+  assert.deepEqual(first.messages[1].content, [{ type: 'text', text: 'agreed' }])
+  // Straight into the agent's inbox, with an attachment.
+  const direct = createPrincipalTagger()
+  const agent = fakeAgent()
+  await steerPrompt({ get: () => undefined }, agent, { sessionId: 's', chatId: 100, messageId: 8, text: 'and this', attachments: [{ type: 'file' }], principal, context }, signal, direct)
+  const second = await direct.preStep({}, async () => enter(agent.steered[0]))
+  assert.match(second.messages[0].content[0].text, /\n\[Replying to a message from Kim/u)
+  assert.equal(second.messages[1].content[0].text, 'and this')
 })
 
 test('without steer or send the caller keeps the message', async () => {

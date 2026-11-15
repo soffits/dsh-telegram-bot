@@ -84,24 +84,29 @@ export function replyReference(message) {
 }
 
 /**
- * Build the prompt text for one message: context lines, then the message.
- * A forwarded message is shown in full inside its context block.
+ * Build the prompt for one message, split in two: the person's own words,
+ * and the context the bot adds around them (what they reply to, a message the
+ * bot posted for someone else, where a forward comes from). The context goes
+ * to the model in a notice before the prompt (see `senderNotice`), so the
+ * prompt, and the session title DSH takes from its first words, holds only
+ * what was sent. A forwarded message's text is its content and stays in the
+ * prompt; its origin is context.
  * @param message - Telegram message.
  * @param options - botId: this bot's user id; replyFile: outcome of attaching
  *   the replied-to file ('attached', 'too-large', 'failed'); ownFile: true when
  *   the message's own photo or document is attached; maxQuote: text limit;
  *   sent: the sent-message log entry the replied-to message belongs to;
  *   currentSession: the session now bound to the topic.
- * @returns the prompt text, possibly empty.
+ * @returns `{ context, text }`: the context blocks (undefined without any) and
+ *   the message text, possibly empty.
  */
 export function composePrompt(message, options = {}) {
-  const body = messageBody(message).trim()
-  const forward = describeForward(message, body, options)
+  const text = messageBody(message).trim()
+  const forward = describeForward(message, options)
   const reply = forward === undefined ? describeReply(message, options) : undefined
   const sent = reply === undefined ? undefined : describeSent(options.sent, { currentSession: options.currentSession })
   const blocks = [reply, sent, forward].filter((block) => block !== undefined)
-  if (forward === undefined && body.length > 0) blocks.push(body)
-  return blocks.join('\n\n')
+  return { context: blocks.length === 0 ? undefined : blocks.join('\n\n'), text }
 }
 
 /**
@@ -144,10 +149,10 @@ export function describeReply(message, options = {}) {
 }
 
 /**
- * Describe a forwarded message together with its content.
- * @returns the context block, or undefined when the message is not forwarded.
+ * Say where a forwarded message comes from; its text is the prompt itself.
+ * @returns the context line, or undefined when the message is not forwarded.
  */
-export function describeForward(message, body = messageBody(message).trim(), options = {}) {
+export function describeForward(message, options = {}) {
   const origin = originOf(message)
   if (origin === undefined) return undefined
   const details = []
@@ -156,8 +161,7 @@ export function describeForward(message, body = messageBody(message).trim(), opt
   if (link !== undefined) details.push(link)
   const media = mediaNote(message, options.ownFile === true ? 'attached' : undefined)
   if (media !== undefined) details.push(media)
-  const head = `[Forwarded message from ${describeOrigin(origin, message, options)}${details.length === 0 ? '' : ` (${details.join('; ')})`}]`
-  return body.length === 0 ? head : `${head}\n${quoteLines(body, options.maxQuote ?? QUOTE_LIMIT)}`
+  return `[Forwarded message from ${describeOrigin(origin, message, options)}${details.length === 0 ? '' : ` (${details.join('; ')})`}]`
 }
 
 /**

@@ -44,7 +44,7 @@ import { publishStatus } from './status.js'
 import { messageAnswer, turnAnswer } from './final-text.js'
 import { createOutbox } from './outbox.js'
 import { agentsListText, childState, collectSubagents, createAgentBoards, reportOf } from './agents.js'
-import { deliveredToTopic, hasSenderLine, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, leadingWords, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor, withoutSenderLine } from './topics.js'
+import { deliveredToTopic, hasBotPreamble, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, leadingWords, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor, withoutContextBlocks, withoutSenderLine } from './topics.js'
 import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.js'
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference } from './message-context.js'
@@ -131,7 +131,7 @@ export function apply(ctx, config) {
     })
   /** Ids of legacy follow-up messages the bridge submitted from Telegram. */
   const telegramMessageIds = new Set()
-  // Telegram senders by `<chatId>:<messageId>`, kept from routing until the
+  // Telegram senders and prompt context by `<chatId>:<messageId>`, kept from routing until the
   // prompt is handed to DSH (a topic binding or the queue may come between).
   const promptSenders = new Map()
   const principals = createPrincipalTagger()
@@ -2760,7 +2760,7 @@ export function apply(ctx, config) {
       }
       let requestId
       try {
-        requestId = await steerPrompt(ctx, agent, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text, attachments, principal: promptPrincipal(chat, messageId) }, signal, principals)
+        requestId = await steerPrompt(ctx, agent, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text, attachments, principal: promptPrincipal(chat, messageId), context: promptContext(chat, messageId) }, signal, principals)
       } catch (error) {
         // Not admitted: the bot's queue still delivers it after the turn.
         reportError('steer', error)
@@ -2853,14 +2853,16 @@ export function apply(ctx, config) {
       await unarchiveForTopic(chat)
       let admitted = false
       const principal = promptPrincipal(chat, messageId)
+      const context = promptContext(chat, messageId)
       if (nativeText) {
-        principals.remember(promptRequestId(chat.chatId, messageId), principal)
+        principals.remember(promptRequestId(chat.chatId, messageId), principal, context)
         admitted = admitText(ctx, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text }, signal)
         if (admitted !== false) await admitted
       }
       if (!admitted) {
         const id = randomUUID()
         telegramMessageIds.add(id)
+        principals.remember(id, principal, context)
         agent.followup({ id, role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user', ...(principal === undefined ? {} : { principal }) } })
       }
       // The turn/end listener finalizes the Telegram turn. whenIdle is only a
@@ -3647,7 +3649,7 @@ export function apply(ctx, config) {
     const query = ctx.get('sessionQuery')
     if (ctx.get('sessionTitle') === undefined) return
     await learnChatNames(signal)
-    await repairSenderTitles(signal)
+    await repairPreambleTitles(signal)
     for (const [key, sessionId] of Object.entries(state.threads)) {
       if (signal.aborted) return
       const topic = topicOfSession(sessionId)
@@ -3675,17 +3677,18 @@ export function apply(ctx, config) {
 
   /**
    * Retitle every session, bound or not, whose first-prompt title was built
-   * from the sender line versions before 0.6.1 put at the top of each prompt.
-   * The new title is "Telegram-<person>-<first words>", from the same prompt
-   * with that line removed, cut like DSH's fallback and kept as a fallback
-   * title, so a title provider can still replace it. Runs on each connect
-   * until one pass repairs everything it found; titles someone typed are
-   * left alone.
+   * from text earlier versions put at the top of each prompt: the sender line
+   * (before 0.6.1) and reply or forward context (before 0.6.2). The new title
+   * is "Telegram-<person>-<first words>", from the same prompt without that
+   * text, cut like DSH's fallback and kept as a fallback title, so a title
+   * provider can still replace it. Runs on each connect until one pass
+   * repairs everything it found; titles someone typed are left alone, and so
+   * is a session whose chat cannot be told from its prompt.
    * @param signal - cancellation.
    */
-  async function repairSenderTitles(signal) {
+  async function repairPreambleTitles(signal) {
     const query = ctx.get('sessionQuery')
-    if (state.migrations?.senderTitles === true) return
+    if (state.migrations?.preambleTitles === true) return
     if (typeof query?.listSessions !== 'function' || typeof query.readTitleSnapshots !== 'function' || typeof query.readSession !== 'function') return
     const ids = (await query.listSessions(signal)).map((record) => record.header.id)
     let failed = false
@@ -3695,9 +3698,11 @@ export function apply(ctx, config) {
       if (result?.status !== 'fulfilled') continue
       const sessionId = result.sessionId
       const current = result.value?.title
-      if (current?.source?.kind !== 'fallback' || !hasSenderLine(current.title)) continue
+      if (current?.source?.kind !== 'fallback' || !hasBotPreamble(current.title)) continue
       try {
-        const { title, person } = await repairedSenderTitle(sessionId, current)
+        const repaired = await repairedPreambleTitle(sessionId, current)
+        if (repaired === undefined) continue
+        const { title, person } = repaired
         const agent = ctx.get('agents')?.get(sessionId) ?? await openForTitle(sessionId)
         if (agent?.session === undefined) throw new Error('no live session to retitle')
         agent.session.append('session/title', {
@@ -3708,22 +3713,23 @@ export function apply(ctx, config) {
         if (state.sessions[sessionId] !== undefined) rememberTitlePerson(sessionId, person)
       } catch (error) {
         failed = true
-        if (!signal.aborted) warn(`sender-line title not repaired for ${sessionId}: ${messageOf(error)}`)
+        if (!signal.aborted) warn(`title not repaired for ${sessionId}: ${messageOf(error)}`)
       }
     }
     if (failed || signal.aborted) return
-    state.migrations = { ...state.migrations, senderTitles: true }
+    state.migrations = { ...state.migrations, preambleTitles: true }
     await persistState()
   }
 
   /**
-   * The repaired title of a session titled from a sender line.
+   * The repaired title of a session titled from text the bot added.
    * @param sessionId - DSH session id.
    * @param current - its title snapshot.
    * @returns `{ title, person }`: "Telegram-<person>-<first words>" of the
-   *   prompt the title came from, and the person label in it.
+   *   prompt the title came from, and the person label in it; undefined when
+   *   no Telegram chat is known for the session.
    */
-  async function repairedSenderTitle(sessionId, current) {
+  async function repairedPreambleTitle(sessionId, current) {
     const { events } = await ctx.get('sessionQuery').readSession(sessionId)
     const seq = Array.isArray(current.messageSeqs) ? current.messageSeqs[0] : undefined
     const prompts = events.filter((event) => event?.type === 'user/message' && event.data?.source?.kind === 'user')
@@ -3732,10 +3738,10 @@ export function apply(ctx, config) {
     const record = state.sessions[sessionId]
     const principalChat = Number(prompt?.data?.source?.principal?.chat?.id)
     const chatId = typeof record?.chatId === 'number' ? record.chatId : (Number.isSafeInteger(principalChat) ? principalChat : userId)
-    const person = chatId === undefined ? undefined : personOf(chatId)
-    if (person === undefined) throw new Error('no chat known for its prompt')
+    if (chatId === undefined || !Number.isSafeInteger(chatId)) return undefined
+    const person = personOf(chatId)
     const limits = { ...FALLBACK_TITLE_LIMITS, ...ctx.get('sessionTitle')?.config }
-    return { title: sessionTitleOf(person, leadingWords(text, limits.fallbackMaxWords, limits.fallbackMaxBytes)), person }
+    return { title: sessionTitleOf(person, leadingWords(withoutContextBlocks(text), limits.fallbackMaxWords, limits.fallbackMaxBytes)), person }
   }
 
   /**
@@ -6041,7 +6047,8 @@ export function apply(ctx, config) {
    * @param message - Telegram message.
    * @param signal - request lifetime.
    * @param currentSession - session bound to the message's topic, if any.
-   * @returns prompt text, attachment blocks and Telegram message id.
+   * @returns prompt text, its context for the notice before it, attachment
+   *   blocks, Telegram message id and sender.
    */
   async function promptFrom(message, signal, currentSession) {
     const attachments = []
@@ -6084,26 +6091,32 @@ export function apply(ctx, config) {
         warn(`sent-message lookup failed: ${messageOf(error)}`)
       }
     }
-    let text = composePrompt(message, { botId: me?.id, ownFile, replyFile, sent, currentSession })
+    let { context, text } = composePrompt(message, { botId: me?.id, ownFile, replyFile, sent, currentSession })
     // A recording speaks for itself through its transcript, a sticker through its note.
     if (ownFile && !forwarded && spokenMediaOf(message) === undefined && message.sticker === undefined && messageBody(message).trim().length === 0) {
-      const ask = tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
-      text = text.length === 0 ? ask : `${text}\n\n${ask}`
+      text = tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
     }
-    return { text, attachments, messageId: message.message_id, from: message.from }
+    // A prompt is never empty: with nothing else to send, the context is the prompt.
+    if (text.length === 0 && attachments.length === 0 && context !== undefined) {
+      text = context
+      context = undefined
+    }
+    return { text, context, attachments, messageId: message.message_id, from: message.from }
   }
 
   /**
-   * Keep who wrote a Telegram message until its prompt reaches DSH.
+   * Keep who wrote a Telegram message, and the context of its prompt, until
+   * the prompt reaches DSH.
    * @param chatId - Telegram chat.
-   * @param messageId - Telegram message id.
-   * @param from - Telegram `from` of the message.
+   * @param prompt - `{ messageId, from, context }` from `promptFrom`.
    */
-  function rememberSender(chatId, messageId, from) {
-    if (!Number.isSafeInteger(messageId) || from === undefined || from === null) return
+  function rememberPrompt(chatId, { messageId, from, context }) {
+    if (!Number.isSafeInteger(messageId)) return
+    const sender = from === null ? undefined : from
+    if (sender === undefined && context === undefined) return
     const key = `${chatId}:${messageId}`
     promptSenders.delete(key)
-    promptSenders.set(key, from)
+    promptSenders.set(key, { from: sender, context })
     if (promptSenders.size > 1024) promptSenders.delete(promptSenders.keys().next().value)
   }
 
@@ -6114,13 +6127,23 @@ export function apply(ctx, config) {
    * @returns the principal, or undefined when the sender is not known.
    */
   function promptPrincipal(chat, messageId) {
-    const from = promptSenders.get(`${chat.chatId}:${messageId}`)
+    const from = promptSenders.get(`${chat.chatId}:${messageId}`)?.from
     if (from === undefined) return undefined
     return telegramUserPrincipal(from, {
       chatId: chat.chatId,
       threadId: chat.threadId,
       topic: typeof chat.threadId === 'number' ? topicNameFor(chat.chatId, chat.threadId) : undefined,
     })
+  }
+
+  /**
+   * The context of a Telegram message's prompt, for the notice before it.
+   * @param chat - the topic the prompt runs in.
+   * @param messageId - Telegram message id.
+   * @returns the context blocks, or undefined.
+   */
+  function promptContext(chat, messageId) {
+    return promptSenders.get(`${chat.chatId}:${messageId}`)?.context
   }
 
   /**
@@ -6133,9 +6156,9 @@ export function apply(ctx, config) {
    * @param signal - runtime lifetime.
    */
   async function dispatchPrompt(chatState, chatId, threadId, prompt, signal) {
-    // Who is writing reaches the model as a notice before the prompt (see
-    // `senderNotice`): several allowed users may share one bot.
-    rememberSender(chatId, prompt.messageId, prompt.from)
+    // Who is writing, and what the message replies to or forwards, reach the
+    // model as a notice before the prompt (see `senderNotice`).
+    rememberPrompt(chatId, prompt)
     const route = routeMessage({ threadId, inSession: typeof chatState.sessionId === 'string' })
     if (route === 'new-topic') {
       await createNewSessionTopic(chatId, threadId, signal, defaultWorkspaceCwd(), prompt.text, prompt.attachments, prompt.messageId)
@@ -6175,11 +6198,15 @@ export function apply(ctx, config) {
       forwardBatches.delete(key)
       if (signal.aborted) return
       const prompts = batch.prompts
+      // The first forward's origin goes in the notice; later ones stay next
+      // to their own text, so each text keeps its origin.
+      const [first, ...rest] = prompts
       const merged = {
-        text: prompts.map((item) => item.text).filter((text) => text.length > 0).join('\n\n'),
+        text: [first.text, ...rest.map((item) => [item.context, item.text].filter((part) => typeof part === 'string' && part.length > 0).join('\n'))].filter((text) => text.length > 0).join('\n\n'),
+        context: first.context,
         attachments: prompts.flatMap((item) => item.attachments),
-        messageId: prompts[0].messageId,
-        from: prompts[0].from,
+        messageId: first.messageId,
+        from: first.from,
       }
       fireAndForget('forward-batch', () => dispatchPrompt(chatState, chatId, threadId, merged, signal))
     }, FORWARD_BATCH_MS)

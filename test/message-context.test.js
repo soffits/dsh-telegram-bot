@@ -7,17 +7,17 @@ const user = { id: 42, first_name: 'Owner' }
 
 test('long replied-to text is cut at a word with a note', () => {
   const words = Array.from({ length: 400 }, (_, index) => `word${index}`).join(' ')
-  const text = composePrompt({
+  const { context, text } = composePrompt({
     from: user,
     text: 'summary?',
     reply_to_message: { message_id: 3, date: 0, from: { id: 9, first_name: 'Kim' }, text: words },
   }, { maxQuote: 100 })
-  const lines = text.split('\n')
+  assert.equal(text, 'summary?', 'the prompt is only what the person wrote')
+  const lines = context.split('\n')
   assert.equal(lines[0], '[Replying to a message from Kim (sent 1970-01-01 00:00 UTC)]')
   assert.ok(lines[1].length <= 102)
   assert.match(lines[1], /word\d+$/u, 'cut between words')
   assert.match(lines[2], /^> \[…truncated, \d+ more characters\]$/u)
-  assert.equal(lines.at(-1), 'summary?')
 })
 
 test('the user replying to their own forwarded message sees both labels', () => {
@@ -58,19 +58,19 @@ test('a reply to another chat without a quote says the text is not visible', () 
 test('legacy forward fields are still understood', () => {
   const message = { from: user, text: 'old style', forward_from: { id: 5, first_name: 'Robin', is_bot: true }, forward_date: 0 }
   assert.equal(isForwarded(message), true)
-  assert.equal(composePrompt(message), '[Forwarded message from Robin, a bot (originally sent 1970-01-01 00:00 UTC)]\n> old style')
+  assert.deepEqual(composePrompt(message), { context: '[Forwarded message from Robin, a bot (originally sent 1970-01-01 00:00 UTC)]', text: 'old style' })
 })
 
 test('a forwarded photo notes the attachment and keeps an empty caption out', () => {
   const message = { from: user, photo: [{ file_id: 'p' }], forward_origin: { type: 'user', sender_user: user, date: 0 } }
-  assert.equal(composePrompt(message, { ownFile: true }), '[Forwarded message from the user themselves (originally sent 1970-01-01 00:00 UTC; contains a photo, attached)]')
+  assert.deepEqual(composePrompt(message, { ownFile: true }), { context: '[Forwarded message from the user themselves (originally sent 1970-01-01 00:00 UTC; contains a photo, attached)]', text: '' })
 })
 
 test('plain messages and topic roots add no context', () => {
-  assert.equal(composePrompt({ from: user, text: 'hi' }), 'hi')
+  assert.deepEqual(composePrompt({ from: user, text: 'hi' }), { context: undefined, text: 'hi' })
   const inTopic = { from: user, text: 'hi', is_topic_message: true, message_thread_id: 70, reply_to_message: { message_id: 70, date: 0, text: 'topic' } }
   assert.equal(repliedMessage(inTopic), undefined)
-  assert.equal(composePrompt(inTopic), 'hi')
+  assert.deepEqual(composePrompt(inTopic), { context: undefined, text: 'hi' })
 })
 
 const sentEntry = {
@@ -87,8 +87,9 @@ const sentEntry = {
 
 test('a reply to a message sent on behalf of a job shows the full text and its sender', () => {
   const message = { from: user, text: 'done', chat: { id: 100 }, reply_to_message: { message_id: 8, date: 0, from: { id: 1, is_bot: true, first_name: 'bot' }, text: 'Part two.' } }
-  const text = composePrompt(message, { botId: 1, sent: sentEntry, currentSession: 'session-new' })
-  assert.equal(text, [
+  const { context, text } = composePrompt(message, { botId: 1, sent: sentEntry, currentSession: 'session-new' })
+  assert.equal(text, 'done')
+  assert.equal(context, [
     '[Replying to a message from the assistant (this bot) (sent 1970-01-01 00:00 UTC)]',
     '> Part two.',
     '',
@@ -96,8 +97,6 @@ test('a reply to a message sent on behalf of a job shows the full text and its s
     '> Part one.',
     '> Part two.',
     '(For more context, open session session-sender or session-old.)',
-    '',
-    'done',
   ].join('\n'))
   assert.deepEqual(replyReference(message), { chatId: 100, messageId: 8 })
 })
@@ -109,7 +108,7 @@ test('a sent message recorded in the current session only names its sender', () 
 
 test('no sent entry adds nothing, and forwards have no reply reference', () => {
   const message = { from: user, text: 'ok', chat: { id: 100 }, reply_to_message: { message_id: 9, date: 0, from: { id: 1 }, text: 'hi' } }
-  assert.equal(composePrompt(message, { botId: 1 }), '[Replying to a message from the assistant (this bot) (sent 1970-01-01 00:00 UTC)]\n> hi\n\nok')
+  assert.deepEqual(composePrompt(message, { botId: 1 }), { context: '[Replying to a message from the assistant (this bot) (sent 1970-01-01 00:00 UTC)]\n> hi', text: 'ok' })
   assert.equal(replyReference({ ...message, forward_origin: { type: 'hidden_user', sender_user_name: 'x', date: 0 } }), undefined)
   assert.equal(replyReference({ from: user, text: 'plain' }), undefined)
 })

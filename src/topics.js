@@ -66,12 +66,20 @@ export function isPlaceholderTitle(title, names, people = []) {
 export const SENDER_LINE_HEAD = '[Telegram message from '
 
 /**
- * Whether a title was built from a sender line instead of the person's words.
- * @param title - current session title.
- * @returns true when the title carries the sender-line head.
+ * Heads of the context blocks versions before 0.6.2 put at the top of a
+ * prompt, before the person's words: a reply, a message the bot posted for
+ * someone else, a forward. They lead to titles the same way.
  */
-export function hasSenderLine(title) {
-  return typeof title === 'string' && title.includes(SENDER_LINE_HEAD)
+const CONTEXT_HEADS = ['[Replying to ', '[The replied-to message ', '[Forwarded message from ']
+
+/**
+ * Whether a title was built from text the bot added to a prompt (the sender
+ * line or a context block) instead of the person's words.
+ * @param title - current session title.
+ * @returns true when the title carries such a head.
+ */
+export function hasBotPreamble(title) {
+  return typeof title === 'string' && [SENDER_LINE_HEAD, ...CONTEXT_HEADS].some((head) => title.includes(head))
 }
 
 /**
@@ -86,6 +94,28 @@ export function withoutSenderLine(text) {
   const line = end === -1 ? text : text.slice(0, end)
   const id = /user id (-?\d+)\)?\]$/u.exec(line)?.[1]
   return { text: end === -1 ? '' : text.slice(end + 1), userId: id === undefined ? undefined : Number(id) }
+}
+
+/**
+ * The words a person sent in a prompt logged by an earlier version, without
+ * the context blocks the bot put before them. Blocks are separated by blank
+ * lines and quote their text line by line, so a quoted blank line is never
+ * empty. A forward's text was quoted inside its block; with nothing after the
+ * blocks, that text is what was sent.
+ * @param text - prompt text without its sender line.
+ * @returns the person's words, possibly empty.
+ */
+export function withoutContextBlocks(text) {
+  const blocks = String(text ?? '').split('\n\n')
+  let forwarded = ''
+  while (blocks.length > 0 && CONTEXT_HEADS.some((head) => blocks[0].startsWith(head))) {
+    const block = blocks.shift()
+    if (block.startsWith('[Forwarded message from ')) {
+      forwarded = block.split('\n').slice(1).filter((line) => line.startsWith('>')).map((line) => line.replace(/^> ?/u, '')).join('\n')
+    }
+  }
+  const rest = blocks.join('\n\n').trim()
+  return rest.length > 0 ? rest : forwarded.trim()
 }
 
 /**

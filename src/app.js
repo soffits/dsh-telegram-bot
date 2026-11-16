@@ -1821,7 +1821,7 @@ export function apply(ctx, config) {
             if (goals === undefined) return
             try {
               const view = goals.get(agent)
-              if (view === undefined) await clearGoalPanel(chat, bridgeAbort.signal)
+              if (view === undefined || !goalIsTelegram(chat, view.id)) await clearGoalPanel(chat, bridgeAbort.signal)
               else await renderGoalPanel(chat, view, bridgeAbort.signal, 'update-only')
             } catch (error) {
               reportError('goal-panel-change', error)
@@ -3003,6 +3003,7 @@ export function apply(ctx, config) {
    * user-initiated turn. The goal-round driver queues these turns itself.
    */
   function adoptGoalTurn(chat, source, turn = chat.pendingTurn) {
+    if (typeof source?.goalId !== 'string' || !goalIsTelegram(chat, source.goalId)) return false
     // The Host-wide mirror may have started showing this turn at its
     // turn/start, before its goal prompt said what it is. Nothing is in the
     // topic yet, so the goal path takes it over and the turn is shown once.
@@ -3107,7 +3108,7 @@ export function apply(ctx, config) {
         reply_markup: { inline_keyboard: keyboard },
       }, signal)
     } catch (error) {
-      if (!signal.aborted) warn(`sendKeyboard failed: ${messageOf(error)}`)
+      if (!signal.aborted) reportError('keyboard-send', error)
       return undefined
     }
   }
@@ -3230,18 +3231,25 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    * @param messageId - panel message to edit.
    */
-  async function sendMenu(chatId, threadId, chat, signal, messageId) {
+  async function sendMenu(chatId, threadId, chat, signal, messageId, forceNew = false) {
     try {
       const keyboard = await controlKeyboard(chat)
-      const target = messageId ?? chat.panelMessageId
-      if (target !== undefined && await editKeyboard(chatId, threadId, target, `<b>${tr('Session controls', 'Управление сессией')}</b>`, keyboard, signal)) {
-        chat.panelMessageId = target
-        return
+      if (!forceNew) {
+        const target = messageId ?? chat.panelMessageId
+        if (target !== undefined && await editKeyboard(chatId, threadId, target, `<b>${tr('Session controls', 'Управление сессией')}</b>`, keyboard, signal)) {
+          chat.panelMessageId = target
+          return
+        }
+      } else if (typeof chat.panelMessageId === 'number') {
+        // /menu asks for a visible panel, not a silent edit of an old one.
+        await deleteMessage(chatId, threadId, chat.panelMessageId)
+        chat.panelMessageId = undefined
       }
       const result = await sendKeyboard(chatId, threadId, `<b>${tr('Session controls', 'Управление сессией')}</b>`, keyboard, signal)
       if (typeof result?.message_id === 'number') chat.panelMessageId = result.message_id
+      else throw new Error('session controls message was not sent')
     } catch (error) {
-      if (!signal.aborted) warn(`sendMenu failed: ${messageOf(error)}`)
+      if (!signal.aborted) reportError('menu', error)
     }
   }
 
@@ -4719,7 +4727,7 @@ export function apply(ctx, config) {
     state.threads[`${chatId}:${threadId}`] = sessionId
     await persistState()
     forgetChatState(chatId, threadId)
-    await send(chatId, `📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
+    await send(chatId, `📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal, threadId)
     await deliverSessionTopic(record, chatId, signal)
     return record
   }
@@ -5225,6 +5233,10 @@ export function apply(ctx, config) {
     }
     delete state.threads[key]
     for (const [id] of records) delete state.sessions[id]
+    const dropped = new Set([sessionId, ...records.map(([id]) => id)])
+    for (const [goalId, origin] of Object.entries(state.goalOrigins ?? {})) {
+      if (dropped.has(origin?.sessionId)) delete state.goalOrigins[goalId]
+    }
     delete state.topicNames?.[key]
     delete state.directTopics?.[key]
     delete state.goalPanels?.[key]
@@ -5689,7 +5701,7 @@ export function apply(ctx, config) {
     }
     if (command === '/menu') {
       if (!inSession) await send(chat.id, tr('The menu is available in a session topic.', 'Меню доступно в topic сессии.'), signal, threadId)
-      else await sendMenu(chat.id, threadId, chatState, signal)
+      else await sendMenu(chat.id, threadId, chatState, signal, undefined, true)
       return
     }
     if (command === '/sessions') {
@@ -5926,6 +5938,7 @@ export function apply(ctx, config) {
             return
           }
           goals.clear(agent, { id: view.id, revision: view.revision })
+          await forgetGoalOrigin(view.id)
           await clearGoalPanel(chatState, signal)
           await send(
             chat.id,
@@ -5943,6 +5956,7 @@ export function apply(ctx, config) {
             return
           }
           view = goals.pause(agent, { id: view.id, revision: view.revision })
+          await markTelegramGoal(chatState, view)
           await renderGoalPanel(chatState, view, signal)
           return
         }
@@ -5956,10 +5970,12 @@ export function apply(ctx, config) {
             return
           }
           if (view.phase === 'active' && view.activation === 'armed') {
+            await markTelegramGoal(chatState, view)
             await renderGoalPanel(chatState, view, signal)
             return
           }
           view = goals.resume(agent, { id: view.id, revision: view.revision })
+          await markTelegramGoal(chatState, view)
           await renderGoalPanel(chatState, view, signal)
           return
         }
@@ -5969,8 +5985,12 @@ export function apply(ctx, config) {
             return
           }
           if (view === undefined || view.phase === 'complete') {
-            if (view !== undefined) goals.clear(agent, { id: view.id, revision: view.revision })
+            if (view !== undefined) {
+              goals.clear(agent, { id: view.id, revision: view.revision })
+              await forgetGoalOrigin(view.id)
+            }
             view = goals.create(agent, { objective })
+            await markTelegramGoal(chatState, view)
             await renderGoalPanel(chatState, view, signal, 'fresh')
             return
           }
@@ -5984,6 +6004,7 @@ export function apply(ctx, config) {
               warn(`goal resume after edit failed: ${messageOf(error)}`)
             }
           }
+          await markTelegramGoal(chatState, view)
           await renderGoalPanel(chatState, view, signal, 'fresh')
           return
         }
@@ -6003,10 +6024,12 @@ export function apply(ctx, config) {
               warn(`goal resume after replace failed: ${messageOf(error)}`)
             }
           }
+          await markTelegramGoal(chatState, view)
           await renderGoalPanel(chatState, view, signal, 'fresh')
           return
         }
         view = goals.create(agent, { objective })
+        await markTelegramGoal(chatState, view)
         await renderGoalPanel(chatState, view, signal, 'fresh')
       } catch (error) {
         await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
@@ -6504,14 +6527,46 @@ export function apply(ctx, config) {
   }
 
   /** Show the current goal before a new assistant generation starts. */
+  /** @returns whether a goal was started or driven from this Telegram topic. */
+  function goalIsTelegram(chatState, goalId) {
+    const origin = typeof goalId === 'string' ? state.goalOrigins?.[goalId] : undefined
+    return origin !== undefined && origin.sessionId === chatState.sessionId
+  }
+
+  /** Remember that work on this goal started in a Telegram topic. */
+  async function markTelegramGoal(chatState, view) {
+    if (typeof view?.id !== 'string' || typeof chatState.sessionId !== 'string') return
+    state.goalOrigins ??= {}
+    for (const [id, origin] of Object.entries(state.goalOrigins)) {
+      if (origin?.sessionId === chatState.sessionId && id !== view.id) delete state.goalOrigins[id]
+    }
+    state.goalOrigins[view.id] = {
+      sessionId: chatState.sessionId,
+      chatId: chatState.chatId,
+      threadId: chatState.threadId,
+      at: Date.now(),
+    }
+    await persistState()
+  }
+
+  /** Drop the Telegram origin of a cleared goal. */
+  async function forgetGoalOrigin(goalId) {
+    if (typeof goalId !== 'string' || state.goalOrigins?.[goalId] === undefined) return
+    delete state.goalOrigins[goalId]
+    await persistState()
+  }
+
   async function showGoalBeforeTurn(chatState) {
     const goals = ctx.get('goals')
     if (goals === undefined || typeof chatState.sessionId !== 'string') return
     try {
       const agent = ctx.get('agents')?.get(chatState.sessionId) ?? await ensureAgent(chatState)
       const view = goals.get(agent)
-      if (view === undefined) await clearGoalPanel(chatState, bridgeAbort.signal)
-      else await renderGoalPanel(chatState, view, bridgeAbort.signal)
+      if (view === undefined || !goalIsTelegram(chatState, view.id)) {
+        await clearGoalPanel(chatState, bridgeAbort.signal)
+        return
+      }
+      await renderGoalPanel(chatState, view, bridgeAbort.signal)
     } catch (error) {
       warn(`goal panel before turn failed: ${messageOf(error)}`)
     }

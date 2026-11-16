@@ -12,7 +12,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'upstream-0.3.0-merge',
+  codeRevision: 'upstream-sender-principal-merge',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,

@@ -8,11 +8,17 @@ import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
 import { followupThroughGate } from './fake-dsh.js'
+import { catalogKey } from '../src/models.js'
 
 function makeAgent(id, cwd, idleMs) {
   const events = new EventEmitter()
+  const model = { value: { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' } }
   return {
     session: { id, header: { cwd }, append() {} },
+    model: {
+      current() { return model.value },
+      select(selection) { model.value = selection },
+    },
     ctx: { on: (...args) => events.on(...args) },
     events,
     status: 'idle',
@@ -48,8 +54,45 @@ function makeContext(agent) {
       blockedReason: { code: 'test', message: 'blocked' },
     },
   }
+  const modelSelects = []
+  const permissionSets = []
   const services = {
     credentials: { resolve: async () => ({ value: 'TEST_TOKEN' }) },
+    permissionPresets: {
+      defaultPreset: 'workspace-write',
+      current: () => 'workspace-write',
+      set: (_session, value) => { permissionSets.push(value) },
+    },
+    sessionController: {
+      create: async () => ({ sessionId: agent.session.id }),
+      resolveAgent: async () => ({ agent }),
+      fork: async () => ({ sessionId: 'session-fork' }),
+      modelCatalog: async () => ({
+        default: { provider: 'deepseek-official', model: 'deepseek-flash' },
+        routableProviders: ['deepseek-official'],
+        failures: [],
+        groups: [{
+          id: 'deepseek-official',
+          name: 'DeepSeek',
+          models: [
+            { id: 'deepseek-flash', name: 'DeepSeek Flash' },
+            {
+              id: 'deepseek-v4-pro',
+              name: 'DeepSeek Pro',
+              reasoning: {
+                defaultEffort: 'high',
+                efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }],
+              },
+            },
+          ],
+        }],
+      }),
+      selectModel: async (request) => {
+        modelSelects.push(request)
+        agent.model.select(request)
+        return { selected: { provider: request.provider, model: request.model, reasoningEffort: request.reasoningEffort } }
+      },
+    },
     goals: {
       get: () => goalState.current,
       create: (_agent, { objective }) => {
@@ -87,16 +130,12 @@ function makeContext(agent) {
       },
     },
     agents: { get: () => undefined, create: async () => ({ agent }), resume: async () => ({ agent }) },
-    sessionController: {
-      create: async () => ({ sessionId: agent.session.id }),
-      resolveAgent: async () => ({ agent }),
-      fork: async () => ({ sessionId: 'session-fork' }),
-    },
     sessionQuery: {
       listSessions: async () => [],
       readTitleSnapshot: async () => ({ title: { title: 'Generated title' } }),
       readSurface: async () => ({ events: [] }),
       readSession: async () => ({ events: [] }),
+      observeSession: async () => ({ projections: { values: { modelSelection: { next: agent.model.current() } } } }),
     },
     workspaceRegistry: {
       list: () => [{ id: 'workspace-default', path: '/tmp/default-workspace', title: 'default-workspace', attachSession() {} }],
@@ -116,6 +155,8 @@ function makeContext(agent) {
     logs,
     goalCalls,
     goalState,
+    modelSelects,
+    permissionSets,
     cleanup: () => { for (const fn of cleanups) fn?.() },
   }
 }
@@ -222,6 +263,8 @@ async function runScenario(updates, idleMs = 20, waitMs = 400, afterReady) {
       logs: context.logs,
       goalCalls: context.goalCalls,
       goalState: context.goalState,
+      modelSelects: context.modelSelects,
+      permissionSets: context.permissionSets,
       cleanup: context.cleanup,
     }
   } catch (error) {
@@ -245,6 +288,16 @@ const topicAt = (updateId, threadId, text, delay = 100) => ({
   delay,
   update_id: updateId,
   message: { message_id: updateId + 1, date: 1, chat: { id: 100, type: 'private' }, from: { id: 42 }, message_thread_id: threadId, text },
+})
+const callbackAt = (updateId, threadId, data, delay = 150) => ({
+  delay,
+  update_id: updateId,
+  callback_query: {
+    id: `callback-${updateId}`,
+    from: { id: 42 },
+    data,
+    message: { message_id: 1, date: 1, chat: { id: 100, type: 'private' }, message_thread_id: threadId },
+  },
 })
 const topicFile = (threadId, delay = 100) => ({
   delay,
@@ -286,7 +339,7 @@ test('fork creates one new topic with the requested name', async () => {
     assert.equal(topics.length, 2, 'initial topic plus fork topic')
     assert.equal(topics[1].body.name, 'branch')
     const opened = result.calls.filter((call) => call.method === 'sendMessage' && /Session opened/u.test(call.body.text))
-    assert.deepEqual(opened.map((call) => [call.body.chat_id, call.body.message_thread_id]), [[100, undefined]], 'the fork notice goes to All of the chat that forked')
+    assert.deepEqual(opened.map((call) => [call.body.chat_id, call.body.message_thread_id]), [[100, 7002]], 'the fork notice goes to the new topic')
     assert.equal(result.logs.filter((line) => line.startsWith('W ') && !line.includes('getUpdates failed')).length, 0, result.logs.join('\n'))
   } finally {
     result.cleanup()
@@ -338,7 +391,35 @@ test('/goal replaces a non-complete goal', async () => {
       && call.body.text.includes('🎯 <b>Goal</b>')
       && call.body.text.includes('new task'))
     assert.equal(newPanels.length, 1, '/goal posts exactly one new panel')
-    assert.ok(result.calls.some((call) => call.method === 'deleteMessage'), 'the old panel is removed')
+    assert.ok(result.calls.some((call) => call.method === 'sendMessage' && call.body?.text?.includes('🎯 <b>Goal</b>')), 'the Telegram goal panel is posted')
+  } finally {
+    result.cleanup()
+  }
+})
+
+test('/menu sends or updates the session controls', async () => {
+  const result = await runScenario([all('hello'), topicAt(2, 7001, '/menu', 250)], 20, 1000)
+  try {
+    assert.ok(result.calls.some((call) =>
+      (call.method === 'sendMessage' || call.method === 'editMessageText')
+      && typeof call.body?.text === 'string'
+      && call.body.text.includes('Session controls')), 'the session controls panel is rendered')
+  } finally {
+    result.cleanup()
+  }
+})
+
+test('Telegram model, effort and permission changes write the session', async () => {
+  const result = await runScenario([
+    all('hello'),
+    callbackAt(2, 7001, `ms:${catalogKey('deepseek-official', 'deepseek-v4-pro')}`, 200),
+    callbackAt(3, 7001, 'e:low', 400),
+    callbackAt(4, 7001, 'p:read-only', 600),
+  ], 20, 1700)
+  try {
+    assert.ok(result.modelSelects.some((request) => request.model === 'deepseek-v4-pro'), 'the model is selected on the session')
+    assert.ok(result.modelSelects.some((request) => request.reasoningEffort === 'low'), 'the effort is selected on the session')
+    assert.ok(result.permissionSets.includes('read-only'), 'the permission preset is set on the session')
   } finally {
     result.cleanup()
   }

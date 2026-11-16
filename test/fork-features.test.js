@@ -610,9 +610,10 @@ test('scheduled turns are labelled, and mirroring can be turned off', async () =
   }
 })
 
-test('a goal round of a topic session is shown once, through the goal path, with or without mirroring', async () => {
+test('a goal round of a goal from the topic is shown once, through the goal path, with or without mirroring', async () => {
+  const goalOrigins = { 'goal-1': { sessionId: 'session-1', chatId: 100, threadId: 7001, at: 1 } }
   for (const mirrorTurns of [true, false]) {
-    const run = await start({ mirrorTurns })
+    const run = await start({ mirrorTurns }, { goalOrigins })
     try {
       run.telegram.push({ message_thread_id: 1, text: 'hello' })
       await wait(200)
@@ -631,6 +632,23 @@ test('a goal round of a topic session is shown once, through the goal path, with
     } finally {
       run.stop()
     }
+  }
+})
+
+test('a goal round of a goal started elsewhere stays out of the topic while mirroring is off', async () => {
+  const run = await start({ mirrorTurns: false })
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const agent = run.host.live.get('session-1')
+    const before = run.telegram.calls.length
+    const goal = { id: 'goal-msg-1', role: 'user', content: [{ type: 'text', text: '<goal_round>' }], source: { kind: 'goal', goalId: 'goal-web', revision: 1, round: 1 } }
+    await playExternalTurn(agent, 4, goal, 'web goal answer')
+    await wait(150)
+    const calls = run.telegram.calls.slice(before).filter((call) => call.body?.message_thread_id === 7001)
+    assert.ok(!calls.some((call) => String(call.body.text ?? '').includes('web goal answer')), 'a Web goal round is not shown')
+  } finally {
+    run.stop()
   }
 })
 

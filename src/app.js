@@ -45,7 +45,7 @@ import { publishStatus } from './status.js'
 import { answerSegments, isInterjection, messageAnswer, turnAnswer } from './final-text.js'
 import { createOutbox } from './outbox.js'
 import { agentsListText, childState, collectSubagents, createAgentBoards, reportOf } from './agents.js'
-import { deliveredToTopic, hasBotPreamble, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, leadingWords, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor, uploadMethod, withoutContextBlocks, withoutSenderLine } from './topics.js'
+import { deliveredToTopic, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor, uploadMethod } from './topics.js'
 import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.js'
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, describeForward, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference } from './message-context.js'
@@ -89,7 +89,7 @@ export function apply(ctx, config) {
   /** Invalidates a start that was overtaken by stop/restart. */
   let startEpoch = 0
   /** Durable chat → session mapping. */
-  let state = { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, directChats: {}, directTopics: {}, goalPanels: {}, pickedModels: {}, migrations: {} }
+  let state = { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, directChats: {}, directTopics: {}, goalPanels: {}, pickedModels: {} }
   /** Serializes state-file writes. */
   let stateWrite = Promise.resolve()
   /** Diagnostic counter for topic creation attempts. */
@@ -3670,25 +3670,6 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Learn the names of chats the bot has bound sessions in but never heard
-   * from since this version, so their titles get a name instead of an id.
-   * @param signal - cancellation.
-   */
-  async function learnChatNames(signal) {
-    const configured = userNamesOf()
-    const chatIds = new Set(Object.values(state.sessions).map((record) => record?.chatId).filter((id) => typeof id === 'number'))
-    for (const chatId of chatIds) {
-      if (signal.aborted) return
-      if (configured[String(chatId)] !== undefined || state.chatNames?.[String(chatId)] !== undefined) continue
-      try {
-        rememberChatName(await call('getChat', { chat_id: chatId }, signal, 10_000))
-      } catch (error) {
-        if (!signal.aborted) warn(`chat name not read for ${chatId}: ${messageOf(error)}`)
-      }
-    }
-  }
-
-  /**
    * The chat a session is bound to: a topic, or a chat without topics.
    * @param sessionId - DSH session id.
    * @returns `{ chatId, threadId }` (threadId undefined without topics), or undefined.
@@ -3772,134 +3753,6 @@ export function apply(ctx, config) {
     if (record === undefined || record.titlePerson === person) return
     record.titlePerson = person
     void persistState()
-  }
-
-  /**
-   * Move every bound session's title to the current form once the bot is
-   * connected, so the sidebar shows where each session comes from without
-   * waiting for it to be used. Titles are read from the session log first;
-   * only a session whose title changes is opened. Topics are never renamed.
-   * @param signal - cancellation.
-   */
-  async function migrateSessionTitles(signal) {
-    const query = ctx.get('sessionQuery')
-    if (ctx.get('sessionTitle') === undefined) return
-    await learnChatNames(signal)
-    await repairPreambleTitles(signal)
-    for (const [key, sessionId] of Object.entries(state.threads)) {
-      if (signal.aborted) return
-      const topic = topicOfSession(sessionId)
-      if (topic === undefined || `${topic.chatId}:${topic.threadId ?? 0}` !== key) continue
-      try {
-        const live = ctx.get('agents')?.get(sessionId)
-        if (live?.session === undefined && typeof query?.readTitleSnapshot === 'function') {
-          const observed = await query.readTitleSnapshot(sessionId, signal)
-          const context = titleContext(sessionId, topic.chatId, topic.threadId)
-          if (plannedTitle(observed?.title, context).kind === 'none') {
-            rememberTitlePerson(sessionId, context.person)
-            continue
-          }
-        }
-        const agent = live ?? await openForTitle(sessionId)
-        if (agent?.session !== undefined) syncTopicTitle(agent.session, topic.chatId, topic.threadId)
-      } catch (error) {
-        if (!signal.aborted) warn(`session title not migrated for ${sessionId}: ${messageOf(error)}`)
-      }
-    }
-  }
-
-  /** DSH's first-prompt title budget, for services that do not expose theirs. */
-  const FALLBACK_TITLE_LIMITS = { fallbackMaxWords: 5, fallbackMaxBytes: 40 }
-
-  /**
-   * Retitle every session, bound or not, whose first-prompt title was built
-   * from text earlier versions put at the top of each prompt: the sender line
-   * (before 0.6.1) and reply or forward context (before 0.6.2). The new title
-   * is "Telegram-<person>-<first words>", from the same prompt without that
-   * text, cut like DSH's fallback and kept as a fallback title, so a title
-   * provider can still replace it. Runs on each connect until one pass
-   * repairs everything it found; titles someone typed are left alone, and so
-   * is a session whose chat cannot be told from its prompt.
-   * @param signal - cancellation.
-   */
-  async function repairPreambleTitles(signal) {
-    const query = ctx.get('sessionQuery')
-    if (state.migrations?.preambleTitles === true) return
-    if (typeof query?.listSessions !== 'function' || typeof query.readTitleSnapshots !== 'function' || typeof query.readSession !== 'function') return
-    const ids = (await query.listSessions(signal)).map((record) => record.header.id)
-    let failed = false
-    // A session whose log cannot be read cannot be retitled either; skip it.
-    for (const result of await query.readTitleSnapshots(ids, signal)) {
-      if (signal.aborted) return
-      if (result?.status !== 'fulfilled') continue
-      const sessionId = result.sessionId
-      const current = result.value?.title
-      if (current?.source?.kind !== 'fallback' || !hasBotPreamble(current.title)) continue
-      try {
-        const repaired = await repairedPreambleTitle(sessionId, current)
-        if (repaired === undefined) continue
-        const { title, person } = repaired
-        const agent = ctx.get('agents')?.get(sessionId) ?? await openForTitle(sessionId)
-        if (agent?.session === undefined) throw new Error('no live session to retitle')
-        agent.session.append('session/title', {
-          title,
-          messageSeqs: Array.isArray(current.messageSeqs) ? [...current.messageSeqs] : [],
-          source: { kind: 'fallback' },
-        })
-        if (state.sessions[sessionId] !== undefined) rememberTitlePerson(sessionId, person)
-      } catch (error) {
-        failed = true
-        if (!signal.aborted) warn(`title not repaired for ${sessionId}: ${messageOf(error)}`)
-      }
-    }
-    if (failed || signal.aborted) return
-    state.migrations = { ...state.migrations, preambleTitles: true }
-    await persistState()
-  }
-
-  /**
-   * The repaired title of a session titled from text the bot added.
-   * @param sessionId - DSH session id.
-   * @param current - its title snapshot.
-   * @returns `{ title, person }`: "Telegram-<person>-<first words>" of the
-   *   prompt the title came from, and the person label in it; undefined when
-   *   no Telegram chat is known for the session.
-   */
-  async function repairedPreambleTitle(sessionId, current) {
-    const { events } = await ctx.get('sessionQuery').readSession(sessionId)
-    const seq = Array.isArray(current.messageSeqs) ? current.messageSeqs[0] : undefined
-    const prompts = events.filter((event) => event?.type === 'user/message' && event.data?.source?.kind === 'user')
-    const prompt = prompts.find((event) => event.seq === seq) ?? prompts.find((event) => promptText(event).trim().length > 0)
-    const { text, userId } = withoutSenderLine(promptText(prompt))
-    const record = state.sessions[sessionId]
-    const principalChat = Number(prompt?.data?.source?.principal?.chat?.id)
-    const chatId = typeof record?.chatId === 'number' ? record.chatId : (Number.isSafeInteger(principalChat) ? principalChat : userId)
-    if (chatId === undefined || !Number.isSafeInteger(chatId)) return undefined
-    const person = personOf(chatId)
-    const limits = { ...FALLBACK_TITLE_LIMITS, ...ctx.get('sessionTitle')?.config }
-    return { title: sessionTitleOf(person, leadingWords(withoutContextBlocks(text), limits.fallbackMaxWords, limits.fallbackMaxBytes)), person }
-  }
-
-  /**
-   * The text of a logged user message.
-   * @param event - `user/message` event, or undefined.
-   * @returns its text blocks joined by newlines.
-   */
-  function promptText(event) {
-    return (event?.data?.content ?? []).filter((block) => block?.type === 'text').map((block) => block.text).join('\n')
-  }
-
-  /**
-   * Open a bound session only to change its title, through the Web session
-   * controller as the Web UI's rename does. Unlike `ensureAgent`, a failure
-   * leaves the binding alone. Without a controller the session keeps its
-   * title until it is next used.
-   * @param sessionId - DSH session id.
-   * @returns the live agent, or undefined.
-   */
-  async function openForTitle(sessionId) {
-    const controller = sessionControllerOf()
-    return controller === undefined ? undefined : resolveThroughController(controller, sessionId)
   }
 
   /** Sessions whose first conversation title is being generated. */
@@ -6697,7 +6550,6 @@ export function apply(ctx, config) {
         void publishCommands(tokenLifetime.signal)
         void unpinLegacyGoalPanels(tokenLifetime.signal)
         void checkForumConfiguration(me, tokenLifetime.signal)
-        void migrateSessionTitles(tokenLifetime.signal).catch((error) => warn(`session titles not migrated: ${messageOf(error)}`))
         void notifyAll(
           `🟢 <b>${tr('Telegram bot enabled', 'Telegram-бот включён')}</b>\n` +
             `@${escapeHtml(me.username ?? String(me.id))}\n` +

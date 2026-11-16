@@ -23,12 +23,6 @@ export const TITLE_SOURCE = 'Telegram'
 /** Joins the source, the person and the task in a session title. */
 const TITLE_JOIN = '-'
 
-/** Joined a topic name and the task in titles of earlier versions. */
-const LEGACY_SEPARATOR = ' · '
-
-/** The title form the oldest versions gave topic sessions: "TG · <topic name>". */
-const LEGACY_PREFIX = 'TG · '
-
 /**
  * The DSH title of a bot session: "Telegram-<person>-<task>". Before DSH has
  * titled the conversation, a topic's name stands in for the task.
@@ -44,8 +38,7 @@ export function sessionTitleOf(person, task) {
 
 /**
  * Whether a title is a placeholder the bot set before any conversation title
- * existed, in this version's form or an earlier one: "Telegram-<person>-<topic
- * name>", a bare topic name, or "TG · <topic name>".
+ * existed: "Telegram-<person>-<topic name>", or a bare topic name.
  * @param title - current session title.
  * @param names - topic names the title may carry (current and earlier).
  * @param people - person labels the title may carry (current and earlier).
@@ -53,95 +46,13 @@ export function sessionTitleOf(person, task) {
  */
 export function isPlaceholderTitle(title, names, people = []) {
   if (typeof title !== 'string') return false
-  if (title.startsWith(LEGACY_PREFIX) || names.includes(title)) return true
+  if (names.includes(title)) return true
   return people.some((person) => names.some((name) => sessionTitleOf(person, name) === title))
 }
 
 /**
- * Head of the sender line versions before 0.6.1 put at the top of every
- * Telegram prompt. DSH's first-prompt title fallback took its first words, so
- * sessions from then carry titles like "Telegram-Ana-[Telegram message from
- * Ana (@ana," or "Chat-1 · [Telegram message from Ana (@ana,".
- */
-export const SENDER_LINE_HEAD = '[Telegram message from '
-
-/**
- * Heads of the context blocks versions before 0.6.2 put at the top of a
- * prompt, before the person's words: a reply, a message the bot posted for
- * someone else, a forward. They lead to titles the same way.
- */
-const CONTEXT_HEADS = ['[Replying to ', '[The replied-to message ', '[Forwarded message from ']
-
-/**
- * Whether a title was built from text the bot added to a prompt (the sender
- * line or a context block) instead of the person's words.
- * @param title - current session title.
- * @returns true when the title carries such a head.
- */
-export function hasBotPreamble(title) {
-  return typeof title === 'string' && [SENDER_LINE_HEAD, ...CONTEXT_HEADS].some((head) => title.includes(head))
-}
-
-/**
- * Split an old prompt into its sender line and the person's own text.
- * @param text - prompt text as logged.
- * @returns `{ text, userId }`: the text without a leading sender line, and
- *   the Telegram user id that line named (undefined without one).
- */
-export function withoutSenderLine(text) {
-  if (typeof text !== 'string' || !text.startsWith(SENDER_LINE_HEAD)) return { text: typeof text === 'string' ? text : '', userId: undefined }
-  const end = text.indexOf('\n')
-  const line = end === -1 ? text : text.slice(0, end)
-  const id = /user id (-?\d+)\)?\]$/u.exec(line)?.[1]
-  return { text: end === -1 ? '' : text.slice(end + 1), userId: id === undefined ? undefined : Number(id) }
-}
-
-/**
- * The words a person sent in a prompt logged by an earlier version, without
- * the context blocks the bot put before them. Blocks are separated by blank
- * lines and quote their text line by line, so a quoted blank line is never
- * empty. A forward's text was quoted inside its block; with nothing after the
- * blocks, that text is what was sent.
- * @param text - prompt text without its sender line.
- * @returns the person's words, possibly empty.
- */
-export function withoutContextBlocks(text) {
-  const blocks = String(text ?? '').split('\n\n')
-  let forwarded = ''
-  while (blocks.length > 0 && CONTEXT_HEADS.some((head) => blocks[0].startsWith(head))) {
-    const block = blocks.shift()
-    if (block.startsWith('[Forwarded message from ')) {
-      forwarded = block.split('\n').slice(1).filter((line) => line.startsWith('>')).map((line) => line.replace(/^> ?/u, '')).join('\n')
-    }
-  }
-  const rest = blocks.join('\n\n').trim()
-  return rest.length > 0 ? rest : forwarded.trim()
-}
-
-/**
- * The leading words of a prompt within a word and UTF-8 byte budget, cut the
- * way DSH cuts its first-prompt title, without splitting a character.
- * @param text - prompt text.
- * @param maxWords - most whitespace-separated words.
- * @param maxBytes - most UTF-8 bytes.
- * @returns one trimmed line, possibly empty.
- */
-export function leadingWords(text, maxWords, maxBytes) {
-  const words = String(text ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/gu, ' ').split(/\s+/u).filter(Boolean).slice(0, maxWords).join(' ')
-  let output = ''
-  let used = 0
-  for (const character of words) {
-    const bytes = Buffer.byteLength(character, 'utf8')
-    if (used + bytes > maxBytes) break
-    output += character
-    used += bytes
-  }
-  return output.trimEnd()
-}
-
-/**
- * The conversation part of a title, without the source, person or topic-name
- * prefix the bot added in this or an earlier version.
+ * The conversation part of a title, without the source and person prefix the
+ * bot added.
  * @param title - current session title.
  * @param names - topic names an earlier-form prefix may carry.
  * @param people - person labels a prefix may carry.
@@ -154,9 +65,6 @@ export function titleTask(title, names, people = []) {
     const head = sessionTitleOf(person, '')
     if (title === head) return ''
     if (title.startsWith(`${head}${TITLE_JOIN}`)) return title.slice(head.length + TITLE_JOIN.length).trim()
-  }
-  for (const name of [...names].sort((a, b) => b.length - a.length)) {
-    if (title.startsWith(`${name}${LEGACY_SEPARATOR}`)) return title.slice(name.length + LEGACY_SEPARATOR.length).trim()
   }
   return title
 }

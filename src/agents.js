@@ -1,13 +1,18 @@
 /**
  * Subagent activity in Telegram topics.
  *
- * When a turn the topic is showing starts subagents, one status message lists
- * them (description, model, elapsed time) and is edited in place as they
- * start and finish. Changes that land close together share one edit, and a
- * running board is refreshed at most once a minute so its times move. Once
- * every subagent on it is done the message is left as it is; the next
- * subagent opens a new one. Subagents started by subagents count under the
- * topic of the session at the top of the chain.
+ * Each topic has at most one status card listing the subagents its session
+ * started (description, model, elapsed time), across turns: a subagent
+ * started while the card still shows running ones joins it. The card is
+ * edited in place as they start and finish; changes that land close together
+ * share one edit, and a running card is refreshed once a minute so its times
+ * move. While anything runs the card stays the last message of the topic:
+ * Telegram cannot pin a message to the bottom, so when any message lands
+ * below it the card is sent again, silently, and the old copy deleted (the
+ * usual "sticky message" approach of chat bots). Once every subagent on it is
+ * done the card is left where it is as the final state; the next subagent
+ * opens a new one. Subagents started by subagents are listed under their
+ * parent, in the topic of the session at the top of the chain.
  *
  * `/agents` lists a session's subagents from DSH's durable catalogs, so it
  * also works after a restart.
@@ -213,43 +218,31 @@ export function agentsListText(rows, total, now, tr = (en) => en) {
 }
 
 /**
- * Track subagent runs and keep one status message per batch in the topic.
+ * Track subagent runs and keep one status card per topic, at its bottom.
  * @param deps - Host and Telegram access:
  *   - `parentOf(sessionId)`: the parent session id of a live session, or undefined.
- *   - `topicOf(sessionId)`: the topic state a session is bound to, or undefined.
- *   - `turnOf(topic)`: a key for the turn the topic is showing, or undefined when none.
+ *   - `topicOf(sessionId)`: the topic state (`{ key }`) a session is bound to, or undefined.
+ *   - `showsTurn(topic)`: whether the topic is showing a turn now; a new card opens only then.
  *   - `labelOf(parentId, childId)`: the child's description from its parent's catalog.
  *   - `modelOf(childId)`: the child's model id.
- *   - `post(topic, text)`: send a message, resolves to its id or undefined.
+ *   - `post(topic, text)`: send a message silently, resolves to its id or undefined.
  *   - `edit(topic, messageId, text)`: resolves to `ok`, `gone` (send a new one) or `failed` (try later).
+ *   - `remove(topic, messageId)`: delete a message.
  *   - `reportError(scope, error)`, `tr(en, ru)`, `now()`, `delayMs`, `tickMs`.
- * @returns `{ onStart, onEnd, dispose, boards }`.
+ * @returns `{ onStart, onEnd, noteMessage, dispose, boards }`; `noteMessage(topicKey, messageId)`
+ *   is called for every message that lands in a topic, so the card can follow it down.
  */
 export function createAgentBoards(deps) {
   const {
-    parentOf, topicOf, turnOf, labelOf, modelOf, post, edit, reportError,
+    parentOf, topicOf, showsTurn, labelOf, modelOf, post, edit, remove, reportError,
     tr = (en) => en, now = Date.now, delayMs = EDIT_DELAY_MS, tickMs = TICK_MS,
   } = deps
-  /** Open boards by topic key, oldest first. */
+  /** The open card of each topic, by topic key. */
   const open = new Map()
   let disposed = false
 
-  function boardsOf(key) {
-    let list = open.get(key)
-    if (list === undefined) {
-      list = []
-      open.set(key, list)
-    }
-    return list
-  }
-
   function closeBoard(board) {
-    const list = open.get(board.topic.key)
-    if (list !== undefined) {
-      const index = list.indexOf(board)
-      if (index !== -1) list.splice(index, 1)
-      if (list.length === 0) open.delete(board.topic.key)
-    }
+    if (open.get(board.topic.key) === board) open.delete(board.topic.key)
     if (board.tick !== undefined) clearInterval(board.tick)
     board.tick = undefined
   }
@@ -276,14 +269,50 @@ export function createAgentBoards(deps) {
     }))
   }
 
+  /** Entries in start order, each nested subagent right under its parent. */
+  function displayOrder(board) {
+    const entries = [...board.entries.values()]
+    const ids = new Set(entries.map((entry) => entry.id))
+    const children = new Map()
+    for (const entry of entries) {
+      const parent = ids.has(entry.parentId) ? entry.parentId : undefined
+      if (!children.has(parent)) children.set(parent, [])
+      children.get(parent).push(entry)
+    }
+    const ordered = []
+    const seen = new Set()
+    const walk = (parent) => {
+      for (const entry of children.get(parent) ?? []) {
+        if (seen.has(entry)) continue
+        seen.add(entry)
+        ordered.push(entry)
+        walk(entry.id)
+      }
+    }
+    walk(undefined)
+    // A cycle cannot come from DSH's parent links; keep any entry it would hide.
+    for (const entry of entries) if (!seen.has(entry)) ordered.push(entry)
+    return ordered
+  }
+
+  /** Whether a message landed in the topic after the card. */
+  function buried(board) {
+    return board.messageId !== undefined && board.latestSeen > board.messageId
+  }
+
   async function publish(board) {
     if (disposed) return
     await fillLabels(board)
-    const entries = [...board.entries.values()]
+    const entries = displayOrder(board)
     const done = entries.every((entry) => entry.endedAt !== undefined)
-    // Freeze before any wait, so a subagent starting meanwhile opens a new board.
+    // Freeze before any wait, so a subagent starting meanwhile opens a new card.
     if (done) closeBoard(board)
     const text = boardText(entries, now(), tr)
+    // A finished card stays where it is as the final state.
+    if (!done && buried(board)) {
+      await repost(board, text)
+      return
+    }
     if (text === board.lastText) return
     if (board.messageId !== undefined) {
       const outcome = await edit(board.topic, board.messageId, text)
@@ -292,7 +321,7 @@ export function createAgentBoards(deps) {
         return
       }
       if (outcome !== 'gone') {
-        // A running board retries with its next change or tick; a finished
+        // A running card retries with its next change or tick; a finished
         // one has neither, so it tries once more after a pause.
         if (done) {
           await new Promise((resolve) => { setTimeout(resolve, delayMs * 4).unref?.() })
@@ -302,11 +331,20 @@ export function createAgentBoards(deps) {
       }
       board.messageId = undefined
     }
+    await repost(board, text)
+  }
+
+  /** Send the card as the newest message, then delete the copy above. */
+  async function repost(board, text) {
+    const previous = board.messageId
     const messageId = await post(board.topic, text)
-    if (messageId !== undefined) {
-      board.messageId = messageId
-      board.lastText = text
-    }
+    if (messageId === undefined) return
+    board.messageId = messageId
+    board.lastText = text
+    board.latestSeen = Math.max(board.latestSeen, messageId)
+    if (previous !== undefined) await Promise.resolve(remove(board.topic, previous)).catch(() => {})
+    // Something landed while the card was being sent: follow it down.
+    if (buried(board) && open.get(board.topic.key) === board) schedule(board)
   }
 
   /**
@@ -317,35 +355,24 @@ export function createAgentBoards(deps) {
     if (disposed || typeof info?.id !== 'string') return
     const parentId = parentOf(info.id)
     let topic
-    const ancestors = []
+    let depth = 1
     let current = parentId
-    for (let depth = 0; depth < MAX_DEPTH && typeof current === 'string'; depth += 1) {
+    for (let hop = 0; hop < MAX_DEPTH && typeof current === 'string'; hop += 1) {
       topic = topicOf(current)
       if (topic !== undefined) break
-      ancestors.push(current)
+      depth += 1
       current = parentOf(current)
     }
     if (topic === undefined) return
-    const list = boardsOf(topic.key)
-    // A nested subagent joins the board that shows its nearest ancestor.
-    let board
-    for (const ancestor of ancestors) {
-      board = list.find((candidate) => [...candidate.entries.values()].some((entry) => entry.id === ancestor))
-      if (board !== undefined) break
-    }
+    let board = open.get(topic.key)
     if (board === undefined) {
-      const turn = turnOf(topic)
-      if (turn === undefined) {
-        if (list.length === 0) open.delete(topic.key)
-        return
-      }
-      board = list.find((candidate) => candidate.turn === turn)
-      if (board === undefined) {
-        board = { topic, turn, entries: new Map(), messageId: undefined, lastText: undefined, timer: undefined, tick: undefined, chain: Promise.resolve() }
-        list.push(board)
-        board.tick = setInterval(() => schedule(board), tickMs)
-        board.tick.unref?.()
-      }
+      // A nested subagent belongs to a chain the topic already shows; a
+      // top-level one opens a card only while the topic shows a turn.
+      if (depth === 1 && !showsTurn(topic)) return
+      board = { topic, entries: new Map(), messageId: undefined, lastText: undefined, latestSeen: 0, timer: undefined, tick: undefined, chain: Promise.resolve() }
+      open.set(topic.key, board)
+      board.tick = setInterval(() => schedule(board), tickMs)
+      board.tick.unref?.()
     }
     const entry = {
       id: info.id,
@@ -353,7 +380,7 @@ export function createAgentBoards(deps) {
       label: tr(`subagent ${info.id.slice(0, 8)}`, `субагент ${info.id.slice(0, 8)}`),
       labelKnown: false,
       model: '',
-      depth: ancestors.length + 1,
+      depth,
       startedAt: now(),
       endedAt: undefined,
       stopReason: undefined,
@@ -370,30 +397,38 @@ export function createAgentBoards(deps) {
    */
   function onEnd(info) {
     const key = info?.runId ?? info?.id
-    for (const list of open.values()) {
-      for (const board of list) {
-        const entry = board.entries.get(key)
-        if (entry === undefined || entry.endedAt !== undefined) continue
-        entry.endedAt = now()
-        entry.stopReason = info.stopReason
-        schedule(board)
-        return
-      }
+    for (const board of open.values()) {
+      const entry = board.entries.get(key)
+      if (entry === undefined || entry.endedAt !== undefined) continue
+      entry.endedAt = now()
+      entry.stopReason = info.stopReason
+      schedule(board)
+      return
     }
+  }
+
+  /**
+   * A message landed in a topic (sent by anyone, the bot included).
+   * @param topicKey - the topic's key.
+   * @param messageId - the Telegram message id; ids grow within a chat.
+   */
+  function noteMessage(topicKey, messageId) {
+    const board = open.get(topicKey)
+    if (board === undefined || !Number.isSafeInteger(messageId)) return
+    board.latestSeen = Math.max(board.latestSeen, messageId)
+    if (buried(board)) schedule(board)
   }
 
   function dispose() {
     disposed = true
-    for (const list of open.values()) {
-      for (const board of list) {
-        if (board.timer !== undefined) clearTimeout(board.timer)
-        if (board.tick !== undefined) clearInterval(board.tick)
-      }
+    for (const board of open.values()) {
+      if (board.timer !== undefined) clearTimeout(board.timer)
+      if (board.tick !== undefined) clearInterval(board.tick)
     }
     open.clear()
   }
 
-  return { onStart, onEnd, dispose, boards: open }
+  return { onStart, onEnd, noteMessage, dispose, boards: open }
 }
 
 /**

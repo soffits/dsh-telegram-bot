@@ -2361,14 +2361,15 @@ export function apply(ctx, config) {
     try {
       const agent = await ensureAgent(chat)
       const principal = promptPrincipal(chat, messageId)
+      const envelope = promptEnvelope(chat, messageId)
       let admitted = false
       if (nativeText) {
-        principals.remember(promptRequestId(chat.chatId, messageId), principal)
+        principals.remember(promptRequestId(chat.chatId, messageId), principal, envelope)
         admitted = admitText(ctx, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text }, signal)
         if (admitted !== false) await admitted
       }
       if (!admitted) {
-        agent.followup({ id: randomUUID(), role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user', ...(principal === undefined ? {} : { principal }) } })
+        agent.followup({ id: randomUUID(), role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user', ...(principal === undefined ? {} : { principal }), ...(envelope === undefined ? {} : { envelope }) } })
       }
       // The turn/end listener finalizes the Telegram turn. whenIdle is only a
       // fallback for the turn that started this epoch, never a queued turn.
@@ -4415,24 +4416,25 @@ export function apply(ctx, config) {
       const ask = tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
       text = text.length === 0 ? ask : `${text}\n\n${ask}`
     }
-    return { text, attachments, messageId: message.message_id, from: message.from }
+    // An edited message counts from its edit.
+    return { text, attachments, messageId: message.message_id, from: message.from, date: message.edit_date ?? message.date }
   }
 
   /**
    * Keep who wrote a Telegram message until its prompt reaches DSH; a new
    * topic, a session choice or the queue may come in between.
    */
-  function rememberSender(chatId, messageId, from) {
+  function rememberSender(chatId, messageId, from, date) {
     if (!Number.isSafeInteger(messageId) || from === undefined || from === null) return
     const key = `${chatId}:${messageId}`
     promptSenders.delete(key)
-    promptSenders.set(key, from)
+    promptSenders.set(key, { from, date })
     if (promptSenders.size > MAX_PENDING_PRINCIPALS) promptSenders.delete(promptSenders.keys().next().value)
   }
 
   /** The sender of a Telegram message as the principal for its prompt. */
   function promptPrincipal(chat, messageId) {
-    const from = promptSenders.get(`${chat.chatId}:${messageId}`)
+    const from = promptSenders.get(`${chat.chatId}:${messageId}`)?.from
     if (from === undefined) return undefined
     return telegramUserPrincipal(from, {
       chatId: chat.chatId,
@@ -4442,11 +4444,21 @@ export function apply(ctx, config) {
   }
 
   /**
+   * When a Telegram message was sent, as metadata on its prompt
+   * (`source.envelope.sentAt`, Unix milliseconds). The text is not changed;
+   * a renderer can show it to the model.
+   */
+  function promptEnvelope(chat, messageId) {
+    const date = promptSenders.get(`${chat.chatId}:${messageId}`)?.date
+    return typeof date === 'number' && Number.isFinite(date) ? { sentAt: date * 1000 } : undefined
+  }
+
+  /**
    * Route one prompt: a new topic from All, a session in the current topic,
    * or a turn in the bound session.
    */
   async function dispatchPrompt(chatState, chatId, threadId, prompt, signal) {
-    rememberSender(chatId, prompt.messageId, prompt.from)
+    rememberSender(chatId, prompt.messageId, prompt.from, prompt.date)
     const route = routeMessage({ threadId, inSession: typeof chatState.sessionId === 'string' })
     if (route === 'new-topic') {
       await createNewSessionTopic(chatId, threadId, signal, defaultWorkspaceCwd(), prompt.text, prompt.attachments, prompt.messageId)

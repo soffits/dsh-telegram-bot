@@ -1,7 +1,7 @@
 import './setup-home.js'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createPrincipalTagger, telegramUserPrincipal, withPrincipal } from '../src/sender.js'
+import { createPrincipalTagger, telegramUserPrincipal, withEnvelope, withPrincipal } from '../src/sender.js'
 
 test('a Telegram user principal names the user and the topic, without empty fields', () => {
   assert.deepEqual(
@@ -45,4 +45,18 @@ test('the tagger records a remembered sender once, on the matching request only'
   tagger.remember('x', principal)
   tagger.remember('y', principal)
   assert.equal(tagger.size, 2)
+})
+
+test('the send time goes on source.envelope, the text stays as sent', async () => {
+  const tagger = createPrincipalTagger()
+  const principal = { kind: 'telegram-user', channel: 'telegram', id: '42' }
+  const prompt = { id: 'a', role: 'user', content: [{ type: 'text', text: 'hi' }], source: { kind: 'user', rpcId: 'telegram:100:7' } }
+  tagger.remember('telegram:100:7', principal, { sentAt: 1_772_440_872_000 })
+  const decision = await tagger.preStep({}, async () => ({ kind: 'enter', messages: [prompt] }))
+  assert.equal(decision.messages.length, 1)
+  assert.deepEqual(decision.messages[0].source, { kind: 'user', rpcId: 'telegram:100:7', principal, envelope: { sentAt: 1_772_440_872_000 } })
+  assert.deepEqual(decision.messages[0].content, prompt.content)
+  assert.equal(withEnvelope(prompt, undefined), prompt)
+  const kept = withEnvelope({ ...prompt, source: { ...prompt.source, envelope: { sentAt: 1 } } }, { sentAt: 2 })
+  assert.deepEqual(kept.source.envelope, { sentAt: 1 })
 })

@@ -65,21 +65,34 @@ function deepFreeze(value) {
 }
 
 /**
+ * A frozen copy of a message whose source records facts about the message
+ * itself, such as when it was sent (`{ sentAt }`, Unix milliseconds).
+ * @param message - the user message.
+ * @param envelope - the facts, or undefined.
+ * @returns the copy; the message itself without facts or when it already has them.
+ */
+export function withEnvelope(message, envelope) {
+  if (envelope === undefined || message.source.envelope !== undefined) return message
+  return Object.freeze({ ...message, source: Object.freeze({ ...message.source, envelope: deepFreeze(envelope) }) })
+}
+
+/**
  * Principals for prompts the bot hands to DSH's session controller, which
- * builds the message itself. The bot remembers the sender by request id
- * before the hand-over; `preStep`, an `agent/pre-step` listener, records it
- * on the message as it enters a step, so it is in the session log with the
- * message (DSH lets that hook replace the messages of a step).
+ * builds the message itself. The bot remembers the sender (and when the
+ * message was sent) by request id before the hand-over; `preStep`, an
+ * `agent/pre-step` listener, records them on the message as it enters a
+ * step, so they are in the session log with the message (DSH lets that hook
+ * replace the messages of a step).
  * @param limit - most principals remembered at once.
  */
 export function createPrincipalTagger(limit = MAX_PENDING_PRINCIPALS) {
   const pending = new Map()
   return {
-    /** Remember the sender of the prompt with this request id. */
-    remember(requestId, principal) {
+    /** Remember the sender of the prompt with this request id, and its envelope if any. */
+    remember(requestId, principal, envelope) {
       if (typeof requestId !== 'string' || principal === undefined) return
       pending.delete(requestId)
-      pending.set(requestId, principal)
+      pending.set(requestId, { principal, envelope })
       if (pending.size > limit) pending.delete(pending.keys().next().value)
     },
     /** Pending principals, for tests. */
@@ -93,11 +106,11 @@ export function createPrincipalTagger(limit = MAX_PENDING_PRINCIPALS) {
       let changed = false
       const messages = decision.messages.map((message) => {
         const rpcId = message?.source?.kind === 'user' ? message.source.rpcId : undefined
-        const principal = typeof rpcId === 'string' ? pending.get(rpcId) : undefined
-        if (principal === undefined || message.source.principal !== undefined) return message
+        const entry = typeof rpcId === 'string' ? pending.get(rpcId) : undefined
+        if (entry === undefined || message.source.principal !== undefined) return message
         pending.delete(rpcId)
         changed = true
-        return withPrincipal(message, principal)
+        return withEnvelope(withPrincipal(message, entry.principal), entry.envelope)
       })
       return changed ? { ...decision, messages } : decision
     },

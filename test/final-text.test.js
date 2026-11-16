@@ -1,7 +1,7 @@
 import './setup-home.js'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { messageAnswer, turnAnswer } from '../src/final-text.js'
+import { answerSegments, messageAnswer, turnAnswer } from '../src/final-text.js'
 
 const text = (value) => ({ type: 'text', text: value })
 const call = { type: 'tool-call', id: 'c1', name: 'bash', input: {} }
@@ -26,4 +26,25 @@ test('a turn keeps the answers of its tool-free messages, in order', () => {
   assert.equal(turnAnswer(events, 2), 'First answer.\n\nAnswer to the steer.')
   assert.equal(turnAnswer(events, 3), '')
   assert.equal(turnAnswer(undefined, 2), '')
+})
+
+test('a message sent into a running turn splits its answers; context messages do not', () => {
+  const user = (id, kind = 'user') => ({ type: 'user/message', data: { id, role: 'user', content: [text(id)], source: { kind } } })
+  const events = [
+    { type: 'turn/start', data: { turn: 2 } },
+    user('prompt'),
+    user('clock', 'time-context'),
+    message(2, text('Let me look.'), call),
+    message(2, text('First answer.')),
+    user('posted', 'telegram-post'),
+    user('also this'),
+    message(2, text('Answer to the interjection.')),
+    { type: 'turn/end', data: { turn: 2 } },
+    user('next prompt'),
+    message(3, text('Next turn.')),
+  ]
+  assert.deepEqual(answerSegments(events, 2), ['First answer.', 'Answer to the interjection.'])
+  assert.equal(turnAnswer(events, 2), 'Answer to the interjection.')
+  assert.deepEqual(answerSegments(events.slice(0, 7), 2), ['First answer.', ''], 'just taken: nothing below it yet')
+  assert.deepEqual(answerSegments(events, 3), ['Next turn.'])
 })

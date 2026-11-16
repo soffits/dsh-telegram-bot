@@ -8,8 +8,10 @@
  * A message that called a tool is mid-chain, so its text goes. The last block,
  * not all of them: Claude Code through dsh-oh-my-claude puts every text block
  * of its own tool loop into one message, with its tools recorded beside it.
- * Answers of several tool-free messages in one turn (a steer answered after a
- * first answer) are all kept, in order.
+ * Answers of several tool-free messages in one turn are kept, in order, up to
+ * a message someone sent into the running turn (an interjection): the topic
+ * shows that message where it was sent, so the answers before it stay above
+ * it and the answers after it go below (`answerSegments`).
  */
 
 /**
@@ -28,18 +30,50 @@ export function messageAnswer(message) {
 }
 
 /**
- * The answer of one turn, read from the session's durable events.
+ * Whether a recorded user message is one a person or a scheduled task sent,
+ * not context a plugin added.
+ * @param message - a `user/message` event's data.
+ */
+export function isInterjection(message) {
+  const kind = message?.source?.kind
+  return kind === 'user' || kind === 'schedule'
+}
+
+/**
+ * The answers of one turn, split at messages sent into it after it started
+ * replying: one string per part, earliest first.
  * @param events - session events (`{ type, data }`).
  * @param turn - DSH turn number.
- * @returns the answers of the turn's messages joined by blank lines, or '' when none.
+ * @returns at least one string; '' for a part with no answer.
+ */
+export function answerSegments(events, turn) {
+  const segments = [[]]
+  if (!Array.isArray(events) || turn === undefined) return ['']
+  let replied = false
+  for (const event of events) {
+    if (event?.type === 'turn/end' && event.data?.turn === turn) break
+    if (event?.type === 'assistant/message') {
+      if (event.data?.turn !== turn) {
+        if (replied) break
+        continue
+      }
+      replied = true
+      const answer = messageAnswer(event.data?.message ?? event.data)
+      if (answer.length > 0) segments.at(-1).push(answer)
+      continue
+    }
+    if (replied && event?.type === 'user/message' && isInterjection(event.data)) segments.push([])
+  }
+  return segments.map((answers) => answers.join('\n\n'))
+}
+
+/**
+ * The answer a turn's last reply message shows: its answers after the last
+ * message sent into it.
+ * @param events - session events (`{ type, data }`).
+ * @param turn - DSH turn number.
+ * @returns the answers joined by blank lines, or '' when none.
  */
 export function turnAnswer(events, turn) {
-  if (!Array.isArray(events) || turn === undefined) return ''
-  const answers = []
-  for (const event of events) {
-    if (event?.type !== 'assistant/message' || event.data?.turn !== turn) continue
-    const answer = messageAnswer(event.data?.message ?? event.data)
-    if (answer.length > 0) answers.push(answer)
-  }
-  return answers.join('\n\n')
+  return answerSegments(events, turn).at(-1)
 }

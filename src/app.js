@@ -37,7 +37,7 @@ import {
 } from './formatting.js'
 import { admitText, promptRequestId } from './admission.js'
 import { STEER_REACTION, busyMode, clearTelegramInbox, hasPendingInput, steerPrompt } from './steer.js'
-import { createPrincipalTagger, senderSession, sendPrincipal, telegramUserPrincipal } from './sender.js'
+import { createPrincipalTagger, postPrincipal, senderSession, telegramUserPrincipal } from './sender.js'
 import { clientTimeZone, formatTelegramDate, resolveTimeZone } from './clock.js'
 import { loadState, STATE_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
@@ -4194,19 +4194,21 @@ export function apply(ctx, config) {
    * `form: 'notice'` with `summary` is how DSH's Chat shows it when the
    * bot's client is not loaded: a one-line notice row. The bot's client
    * draws it in full, pictures included, on the assistant's side.
-   * @param post - `{ header, threadId, topic, from, self }`; `header` is the
-   *   line the model also reads, `from` the request's sender.
+   * The model reads who sent it and where from `principal` (rendered by
+   * dsh-message-context), never from the text.
+   * @param post - `{ summary, chatId, threadId, topic, from, self }`;
+   *   `summary` is the notice row's label, `from` the request's sender.
    * @returns the message source.
    */
-  function postSource({ header, chatId, threadId, topic, from, self }) {
+  function postSource({ summary, chatId, threadId, topic, from, self }) {
     const job = typeof from?.job === 'string' && from.job.trim().length > 0 ? from.job.trim() : null
     const label = typeof from?.label === 'string' && from.label.trim().length > 0 ? from.label.trim() : null
-    const principal = sendPrincipal(from)
+    const principal = postPrincipal(from, { id: String(chatId), thread: threadId, ...(topic == null ? {} : { name: topic }) })
     return {
       kind: POST_SOURCE_KIND,
       form: 'notice',
-      summary: header.slice(0, 120),
-      ...(principal === undefined ? {} : { principal }),
+      summary: summary.slice(0, 120),
+      principal,
       channel: 'telegram',
       chatId: String(chatId),
       threadId,
@@ -4351,9 +4353,9 @@ export function apply(ctx, config) {
         const self = sessionId === request?.from?.sessionId
         const label = self ? ' by this session' : sender.length > 0 ? ` by ${sender}` : ''
         const where = target.name === undefined ? `topic ${threadId}` : `topic "${target.name}"`
-        const header = `Sent to the Telegram ${where}${label}`
-        const stickerLine = sticker === undefined ? '' : `\n[Sticker ${describeSticker(sticker)}]`
-        const content = [{ type: 'text', text: `[${header}]${text.trim().length > 0 ? `\n${text.trim()}` : ''}${stickerLine}` }]
+        const summary = `Sent to the Telegram ${where}${label}`
+        const body = [text.trim(), sticker === undefined ? '' : `[Sticker ${describeSticker(sticker)}]`].filter((part) => part.length > 0).join('\n')
+        const content = body.length > 0 ? [{ type: 'text', text: body }] : []
         content.push(...await recordedFiles(files))
         if (sticker !== undefined) content.push(...await recordedSticker(sticker, signal))
         // Recording never starts a turn. The model reads it as user-role
@@ -4362,7 +4364,7 @@ export function apply(ctx, config) {
           id: randomUUID(),
           role: 'user',
           content,
-          source: postSource({ header, chatId, threadId, topic: target.name, from: request?.from, self }),
+          source: postSource({ summary, chatId, threadId, topic: target.name, from: request?.from, self }),
         })
         recorded = true
       } catch (error) {

@@ -1,7 +1,7 @@
 import './setup-home.js'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createPrincipalTagger, senderSession, sendPrincipal, telegramUserPrincipal, withMetadata } from '../src/sender.js'
+import { postPrincipal, createPrincipalTagger, senderSession, sendPrincipal, telegramUserPrincipal, withMetadata } from '../src/sender.js'
 
 test('a Telegram user principal names the user and the topic, without empty fields', () => {
   assert.deepEqual(
@@ -79,4 +79,10 @@ test('only a dsh-session principal names a sending session', () => {
   assert.equal(senderSession({ kind: 'dsh-session', channel: 'dsh', id: ' ' }), undefined)
   assert.equal(senderSession({ kind: 'oidc-user', channel: 'web', id: 'sub' }), undefined)
   assert.equal(senderSession(undefined), undefined)
+})
+
+test('a post names its sender and the topic it went to, and a nameless send is still not a person', () => {
+  assert.deepEqual(postPrincipal({ job: 'Digest' }, { id: '100', thread: 7, name: 'Notify' }),
+    { kind: 'cron-job', channel: 'cron', id: 'Digest', name: 'Digest', chat: { channel: 'telegram', id: '100', thread: 7, name: 'Notify' } })
+  assert.equal(postPrincipal(undefined, { id: '100', thread: 7 }).kind, 'external')
 })

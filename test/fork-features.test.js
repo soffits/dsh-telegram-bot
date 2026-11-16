@@ -880,13 +880,13 @@ test('the Host service posts into a topic by thread id and records it in the bou
     assert.equal(agent.received.length, 0, 'no turn is started')
     assert.equal(agent.injected.length, 1)
     const content = agent.injected[0].content
-    assert.match(content[0].text, /^\[Sent to the Telegram topic "Notify" by backup job\]\nBackup \*\*done\*\*/)
+    assert.equal(content[0].text, 'Backup **done**', 'the text is only what was sent; who and where are metadata')
     assert.equal(content[1].type, 'file')
     assert.deepEqual(agent.injected[0].source, {
       kind: 'telegram-post',
       form: 'notice',
       summary: 'Sent to the Telegram topic "Notify" by backup job',
-      principal: { kind: 'external', channel: 'external', id: 'backup job', name: 'backup job' },
+      principal: { kind: 'external', channel: 'external', id: 'backup job', name: 'backup job', chat: { channel: 'telegram', id: '100', thread: 7100, name: 'Notify' } },
       channel: 'telegram',
       chatId: '100',
       threadId: 7100,
@@ -1007,7 +1007,8 @@ test('send({ to, text, files, from }) takes a thread id and names the job and it
     const result = await run.host.provided.telegramTopics.send({ to: '7100', text: 'Nothing new today', files: [], from: { job: 'Check-in', sessionId: 'session-job' } })
     assert.equal(result.threadId, 7100)
     assert.equal(result.recorded, true)
-    assert.match(agent.injected[0].content[0].text, /^\[Sent to the Telegram topic "Notify" by job "Check-in" from session session-job\]\nNothing new today$/u)
+    assert.equal(agent.injected[0].content[0].text, 'Nothing new today')
+    assert.deepEqual(agent.injected[0].source.principal, { kind: 'cron-job', channel: 'cron', id: 'Check-in', name: 'Check-in', sessionId: 'session-job', chat: { channel: 'telegram', id: '100', thread: 7100, name: 'Notify' } })
     const { kind, job, label, fromSession, self } = agent.injected[0].source
     assert.deepEqual({ kind, job, label, fromSession, self }, { kind: 'telegram-post', job: 'Check-in', label: null, fromSession: 'session-job', self: false })
   } finally {
@@ -1026,7 +1027,7 @@ test('a renamed topic keeps its thread id after /new, and the name only labels i
     const result = await run.host.provided.telegramTopics.send({ to: '7100', text: 'after new' })
     assert.equal(result.threadId, 7100)
     assert.equal(result.sessionId, 'session-1')
-    assert.match(run.host.live.get('session-1').injected[0].content[0].text, /^\[Sent to the Telegram topic "Alerts"\]/u)
+    assert.equal(run.host.live.get('session-1').injected[0].source.principal.chat.name, 'Alerts')
     assert.deepEqual(run.host.provided.telegramTopics.topics(), [{ chatId: 100, threadId: 7100, name: 'Alerts', sessionId: 'session-1' }])
   } finally {
     run.stop()
@@ -1041,7 +1042,8 @@ test('the agent tool and the file spool use the same path', async () => {
     assert.ok(tool, 'tool registered')
     const own = await tool.execute({ thread: '7100', text: 'from my own session' }, { agent: { id: 'session-notify' } })
     assert.equal(own.recorded, true, 'the sending session gets its own copy, so the Web UI shows it')
-    assert.match(agent.injected[0].content[0].text, /^\[Sent to the Telegram topic "Notify" by this session\]\nfrom my own session$/u)
+    assert.equal(agent.injected[0].content[0].text, 'from my own session')
+    assert.equal(agent.injected[0].source.principal.kind, 'dsh-session')
     const other = await tool.execute({ thread: '7100', text: 'from elsewhere' }, { agent: { id: 'session-other' } })
     assert.equal(other.recorded, true)
     const id = await enqueue({ to: '7100', text: 'from cron', from: { label: 'cron' } })
@@ -1078,7 +1080,7 @@ test('a session sending into its own topic records the pictures and files it sen
     assert.equal(agent.received.length, 0, 'no turn is started')
     assert.equal(agent.injected.length, 1, 'a running session gets the copy at its next step')
     const [header, ...blocks] = agent.injected[0].content
-    assert.equal(header.text, '[Sent to the Telegram topic "Notify" by this session]\nlook')
+    assert.equal(header.text, 'look')
     assert.deepEqual(blocks.map((block) => [block.type, block.attachment.mediaType ?? null, block.attachment.name]), [
       ['image', 'image/png', 'cat.png'],
       ['image', 'image/gif', 'dance.gif'],
@@ -1129,7 +1131,7 @@ test('an idle session gets a send appended at once; a picture DSH refuses stays 
     const messages = agent.session.events.filter((event) => event.type === 'user/message')
     assert.equal(messages.length, 1)
     const content = messages[0].data.content
-    assert.match(content[0].text, /^\[Sent to the Telegram topic "Notify" by job "Digest" from session session-job\]\ndaily$/u)
+    assert.equal(content[0].text, 'daily')
     assert.equal(content[1].type, 'file')
     assert.equal(content[1].attachment.name, 'huge.png')
     assert.deepEqual(content[2], { type: 'text', text: '[File broken.bin was sent but could not be stored here: disk full]' })
@@ -1148,8 +1150,9 @@ test('a long send from a job is recorded with its sender, and a reply after /new
     assert.ok(result.messageIds.length >= 2, 'split into several messages')
     assert.equal(result.recorded, true)
     assert.equal(old.received.length, 0, 'no turn is started')
-    assert.match(old.injected[0].content[0].text, /^\[Sent to the Telegram topic "Notify" by job "Morning digest" from session session-cron\]\nword0 /u)
-    assert.deepEqual(old.injected[0].source.principal, { kind: 'cron-job', channel: 'cron', id: 'Morning digest', name: 'Morning digest', sessionId: 'session-cron' })
+    assert.match(old.injected[0].content[0].text, /^word0 /u)
+    assert.equal(old.injected[0].source.principal.name, 'Morning digest')
+    assert.deepEqual(old.injected[0].source.principal, { kind: 'cron-job', channel: 'cron', id: 'Morning digest', name: 'Morning digest', sessionId: 'session-cron', chat: { channel: 'telegram', id: '100', thread: 7100, name: 'Notify' } })
     run.telegram.push({ message_thread_id: 7100, text: '/new' })
     await wait(200)
     const fresh = run.host.live.get('session-1')
@@ -1196,7 +1199,8 @@ test('a known topic without a session gets one like /new, and a session that can
     assert.equal(opened.turns, 1, 'never left blank')
     assert.equal(opened.received.length, 0)
     assert.equal(opened.session.title, 'Telegram-Ana-Loose', 'the configured name, before Telegram has named the chat')
-    assert.match(opened.injected[0].content[0].text, /^\[Sent to the Telegram topic "Loose" by job "probe"\]\nhello$/u)
+    assert.equal(opened.injected[0].content[0].text, 'hello')
+    assert.equal(opened.injected[0].source.principal.chat.name, 'Loose')
     const state = await run.readState()
     assert.equal(state.threads['100:7200'], 'session-1')
   } finally {
@@ -2156,7 +2160,7 @@ test('telegram_sticker finds, views, loads sets and sends stickers into a topic'
     // The bound session's own sticker is recorded the same way.
     const own = await tool.execute({ action: 'send', id: 'U-SET-2', thread: '7100' }, { agent: { id: 'session-notify' } })
     assert.equal(own.recorded, true)
-    assert.match(agent.injected.at(-1).content[0].text, /^\[Sent to the Telegram topic "Notify" by this session\]\n\[Sticker 😻/u)
+    assert.match(agent.injected.at(-1).content[0].text, /^\[Sticker 😻/u)
     assert.equal(agent.injected.at(-1).content[1].type, 'image')
   } finally {
     run.stop()

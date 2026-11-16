@@ -80,6 +80,19 @@ export function sendPrincipal(from) {
 }
 
 /**
+ * The sender of a message the bot posted into a topic, with where it went:
+ * the principal of the post's copy in the bound session. A send that names
+ * no sender is still marked as not typed by a person.
+ * @param from - the request's `{ job, jobId, sessionId, label }`.
+ * @param chat - `{ id, thread, name }` of the topic it was posted to.
+ * @returns the principal.
+ */
+export function postPrincipal(from, chat) {
+  const sender = sendPrincipal(from) ?? { kind: 'external', channel: 'external', id: 'unnamed', name: 'an unnamed sender' }
+  return { ...sender, chat: { channel: 'telegram', ...chat } }
+}
+
+/**
  * The DSH session that sent a prompt, when its recorded sender is one: an
  * agent's brief or follow-up (`open_session`, `prompt_session`), which DSH
  * otherwise shows like something the owner typed in the Web UI.

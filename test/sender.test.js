@@ -1,7 +1,7 @@
 import './setup-home.js'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createPrincipalTagger, senderLabel, senderNotice, senderSession, sendPrincipal, telegramUserPrincipal, withPrincipal } from '../src/sender.js'
+import { createPrincipalTagger, senderSession, sendPrincipal, telegramUserPrincipal, withMetadata } from '../src/sender.js'
 
 test('a Telegram user principal names the user and the topic, without empty fields', () => {
   assert.deepEqual(
@@ -22,30 +22,34 @@ test('a send names its job, else its session, else its label', () => {
   assert.equal(sendPrincipal(undefined), undefined)
 })
 
-test('withPrincipal keeps the message and freezes the copy', () => {
+test('withMetadata keeps the message, freezes the copy and never overwrites a field', () => {
   const message = Object.freeze({ id: 'm', role: 'user', content: [], source: Object.freeze({ kind: 'user', rpcId: 'r' }) })
-  const copy = withPrincipal(message, { kind: 'telegram-user', channel: 'telegram', id: '1' })
-  assert.deepEqual(copy, { ...message, source: { kind: 'user', rpcId: 'r', principal: { kind: 'telegram-user', channel: 'telegram', id: '1' } } })
-  assert.ok(Object.isFrozen(copy) && Object.isFrozen(copy.source) && Object.isFrozen(copy.source.principal))
-  assert.equal(withPrincipal(message, undefined), message)
+  const principal = { kind: 'telegram-user', channel: 'telegram', id: '1' }
+  const envelope = { sentAt: 1000 }
+  const copy = withMetadata(message, { principal, envelope })
+  assert.deepEqual(copy, { ...message, source: { kind: 'user', rpcId: 'r', principal, envelope } })
+  assert.ok(Object.isFrozen(copy) && Object.isFrozen(copy.source) && Object.isFrozen(copy.source.principal) && Object.isFrozen(copy.source.envelope))
+  assert.equal(withMetadata(message, {}), message)
+  assert.equal(withMetadata(copy, { principal: { kind: 'other', id: '2' }, envelope: { sentAt: 5 } }), copy, 'recorded fields win')
 })
 
-test('the tagger records a remembered sender once, on the matching request only', async () => {
+test('the tagger records remembered metadata once, on the matching request only, and adds no message', async () => {
   const tagger = createPrincipalTagger(2)
   const principal = { kind: 'telegram-user', channel: 'telegram', id: '42' }
+  const envelope = { sentAt: 1_772_462_460_000, replyTo: { from: { role: 'assistant' }, text: 'hi' } }
   const ours = { id: 'a', role: 'user', content: [], source: { kind: 'user', rpcId: 'telegram:100:5' } }
   const other = { id: 'b', role: 'user', content: [], source: { kind: 'user', rpcId: 'web-1' } }
   const context = { id: 'c', role: 'user', content: [], source: { kind: 'time-context' } }
-  tagger.remember('telegram:100:5', { principal })
+  tagger.remember('telegram:100:5', { principal, envelope })
   const enter = (messages) => tagger.preStep({ messages }, async () => ({ kind: 'enter', messages }))
   const decision = await enter([context, ours, other])
+  assert.equal(decision.messages.length, 3, 'no notice: rendering is the renderer\'s job')
   assert.equal(decision.messages[0], context)
-  assert.equal(decision.messages[1].source.kind, 'telegram-sender', 'the sender notice goes right before the prompt')
-  assert.equal(decision.messages[1].content[0].text, '[Telegram message from user id 42]')
-  assert.deepEqual(decision.messages[2].source.principal, principal)
-  assert.equal(decision.messages[2].id, 'a')
-  assert.equal(decision.messages[2].content.length, 0, 'the prompt itself is unchanged')
-  assert.equal(decision.messages[3], other)
+  assert.deepEqual(decision.messages[1].source.principal, principal)
+  assert.deepEqual(decision.messages[1].source.envelope, envelope)
+  assert.equal(decision.messages[1].id, 'a')
+  assert.equal(decision.messages[1].content.length, 0, 'the prompt itself is unchanged')
+  assert.equal(decision.messages[2], other)
   assert.equal(tagger.size, 0)
   const again = [ours]
   assert.equal((await enter(again)).messages[0], ours)
@@ -59,27 +63,13 @@ test('the tagger records a remembered sender once, on the matching request only'
   assert.equal(tagger.size, 2)
 })
 
-test('the sender line says when the message was sent, with or without a known sender', () => {
-  const ana = { kind: 'telegram-user', channel: 'telegram', id: '42', name: 'Ana', username: 'ana' }
-  const sentAt = 'Mon 2026-03-02 09:41 UTC+01:00'
-  assert.equal(senderLabel(ana, sentAt), '[Telegram message from Ana (@ana, user id 42), sent Mon 2026-03-02 09:41 UTC+01:00]')
-  assert.equal(senderLabel(ana), '[Telegram message from Ana (@ana, user id 42)]')
-  assert.equal(senderLabel(undefined, sentAt), '[Telegram message, sent Mon 2026-03-02 09:41 UTC+01:00]')
-  assert.equal(senderLabel(undefined, ' '), undefined)
-  const prompt = { id: 'p', role: 'user', content: [], source: { kind: 'user', principal: ana } }
-  const notice = senderNotice(prompt, { context: '[Forwarded message from Kim]', sentAt })
-  assert.equal(notice.content[0].text, `[Telegram message from Ana (@ana, user id 42), sent ${sentAt}]\n[Forwarded message from Kim]`)
-  assert.equal(notice.source.summary, `[Telegram message from Ana (@ana, user id 42), sent ${sentAt}]`)
-  assert.equal(senderNotice({ ...prompt, source: { kind: 'time-context' } }, { sentAt }), undefined)
-})
-
-test('the tagger keeps a send time remembered without a sender', async () => {
+test('the tagger keeps an envelope remembered without a sender', async () => {
   const tagger = createPrincipalTagger()
-  tagger.remember('telegram:1:2', { sentAt: 'Tue 2026-03-03 07:15 UTC+01:00' })
+  tagger.remember('telegram:1:2', { envelope: { sentAt: 5000 } })
   const prompt = { id: 'p', role: 'user', content: [], source: { kind: 'user', rpcId: 'telegram:1:2' } }
   const decision = await tagger.preStep({}, async () => ({ kind: 'enter', messages: [prompt] }))
-  assert.equal(decision.messages[0].content[0].text, '[Telegram message, sent Tue 2026-03-03 07:15 UTC+01:00]')
-  assert.equal(decision.messages[1], prompt)
+  assert.equal(decision.messages.length, 1)
+  assert.deepEqual(decision.messages[0].source, { kind: 'user', rpcId: 'telegram:1:2', envelope: { sentAt: 5000 } })
   tagger.remember('nothing', {})
   assert.equal(tagger.size, 0)
 })

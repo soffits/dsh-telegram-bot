@@ -1,14 +1,9 @@
 /**
- * Describe what an incoming Telegram message replies to, quotes or forwards,
- * as short labelled plain text the agent reads before the message itself.
+ * What an incoming Telegram message replies to, quotes or forwards, as
+ * metadata for the message's `source.envelope`. The model reads it through a
+ * renderer such as dsh-message-context; the message text stays as sent.
  */
 import { formatTelegramDate } from './clock.js'
-
-/** Longest quoted or forwarded text passed to the agent, in characters. */
-export const QUOTE_LIMIT = 2000
-
-/** Longest text of a message sent on someone's behalf passed to the agent, in characters. */
-export const SENT_TEXT_LIMIT = 8000
 
 /** Largest file Telegram lets a bot download (getFile). */
 export const DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
@@ -87,74 +82,81 @@ export function replyReference(message) {
 }
 
 /**
- * Build the prompt for one message, split in two: the person's own words,
- * and the context the bot adds around them (what they reply to, a message the
- * bot posted for someone else, where a forward comes from). The context goes
- * to the model in a notice before the prompt (see `senderNotice`), so the
- * prompt, and the session title DSH takes from its first words, holds only
- * what was sent. A forwarded message's text is its content and stays in the
- * prompt; its origin is context.
+ * Build the prompt for one message: the person's own words, and what the
+ * message replies to or was forwarded from as metadata for the message's
+ * `source.envelope` (see dsh-message-context for the contract). Nothing is
+ * added to the text, so the prompt, and the session title DSH takes from its
+ * first words, holds only what was sent. A forwarded message's text is its
+ * content and stays in the prompt; its origin is metadata.
  * @param message - Telegram message.
  * @param options - botId: this bot's user id; replyFile: outcome of attaching
  *   the replied-to file ('attached', 'too-large', 'failed'); ownFile: true when
- *   the message's own photo or document is attached; maxQuote: text limit;
- *   sent: the sent-message log entry the replied-to message belongs to;
- *   currentSession: the session now bound to the topic; formatDate: turns a
- *   Telegram time (Unix seconds) into text, UTC when absent.
- * @returns `{ context, text }`: the context blocks (undefined without any) and
- *   the message text, possibly empty.
+ *   the message's own photo or document is attached; sent: the sent-message
+ *   log entry the replied-to message belongs to; currentSession: the session
+ *   now bound to the topic; formatDate: turns a Telegram time (Unix seconds)
+ *   into text, UTC when absent.
+ * @returns `{ text, replyTo, forwardedFrom }`: the message text, possibly
+ *   empty, and the envelope fields (undefined when the message has none).
  */
 export function composePrompt(message, options = {}) {
   const text = messageBody(message).trim()
-  const forward = describeForward(message, options)
-  const reply = forward === undefined ? describeReply(message, options) : undefined
-  const sent = reply === undefined ? undefined : describeSent(options.sent, { currentSession: options.currentSession, formatDate: options.formatDate })
-  const blocks = [reply, sent, forward].filter((block) => block !== undefined)
-  return { context: blocks.length === 0 ? undefined : blocks.join('\n\n'), text }
+  const forwardedFrom = forwardInfo(message, options)
+  const reply = forwardedFrom === undefined ? replyInfo(message, options) : undefined
+  const replyTo = reply === undefined ? undefined : withSent(reply, options.sent, options)
+  return { text, replyTo, forwardedFrom }
 }
 
 /**
- * Describe the replied-to or externally replied message, if any.
- * @returns the context block, or undefined.
+ * What the message replies to, as `envelope.replyTo`.
+ * @returns `{ from, sentAt, text, quoted, details }` (fields only when known), or undefined.
  */
-export function describeReply(message, options = {}) {
-  const limit = options.maxQuote ?? QUOTE_LIMIT
+export function replyInfo(message, options = {}) {
   const quote = typeof message?.quote?.text === 'string' && message.quote.text.trim().length > 0 ? message.quote.text : undefined
   const target = repliedMessage(message)
   if (target !== undefined) {
-    const details = [`sent ${formatDate(target.date, options)}`]
+    const { from, details } = senderOf(target, message, options)
     const origin = originOf(target)
     if (origin !== undefined) details.push(`forwarded from ${describeOrigin(origin, message, options)}${origin.date === undefined ? '' : `, originally sent ${formatDate(origin.date, options)}`}`)
     const media = mediaNote(target, options.replyFile)
     if (media !== undefined) details.push(media)
-    const text = quote ?? messageBody(target)
-    const label = quote === undefined ? '' : '; the user quoted only this part'
-    const head = `[Replying to a message from ${describeSender(target, message, options)} (${details.join('; ')})${label}]`
-    return text.trim().length === 0 ? head : `${head}\n${quoteLines(text, limit)}`
+    return compact({ from, sentAt: epochMs(target.date), text: nonBlank(quote ?? messageBody(target)), quoted: quote === undefined ? undefined : true, details })
   }
   const external = message?.external_reply
   if (external === undefined || external === null) {
-    if (message?.reply_to_story !== undefined) return '[Replying to a Telegram story]'
-    return undefined
+    return message?.reply_to_story === undefined ? undefined : { details: ['a Telegram story'] }
   }
   const details = []
-  if (external.origin !== undefined) {
-    details.push(`from ${describeOrigin(external.origin, message, options)}`)
-    if (external.origin.date !== undefined) details.push(`sent ${formatDate(external.origin.date, options)}`)
-  }
-  if (external.chat !== undefined && external.origin?.type !== 'channel') details.push(`in ${chatName(external.chat)}`)
+  if (external.chat !== undefined && external.origin?.type !== 'channel') details.push(`in another chat, ${chatName(external.chat)}`)
+  else details.push('in another chat')
   const link = messageLink(external.chat, external.message_id)
   if (link !== undefined) details.push(link)
   const media = mediaNote(external, options.replyFile)
   if (media !== undefined) details.push(media)
-  const head = `[Replying to a message from another chat${details.length === 0 ? '' : ` (${details.join('; ')})`}${quote === undefined ? '' : '; the user quoted this part'}]`
-  if (quote !== undefined) return `${head}\n${quoteLines(quote, limit)}`
-  return `${head}\n(The bot cannot see the text of messages in other chats unless the user quotes it.)`
+  if (quote === undefined) details.push('the bot cannot see the text of messages in other chats unless the sender quotes it')
+  const origin = external.origin === undefined ? undefined : originParty(external.origin, message, options)
+  return compact({ from: origin?.from, sentAt: epochMs(external.origin?.date), text: quote, quoted: quote === undefined ? undefined : true, details: [...(origin?.details ?? []), ...details] })
 }
 
 /**
- * Say where a forwarded message comes from; its text is the prompt itself.
- * @returns the context line, or undefined when the message is not forwarded.
+ * Where a forwarded message comes from, as `envelope.forwardedFrom`.
+ * @returns `{ from, sentAt, details }`, or undefined when the message is not forwarded.
+ */
+export function forwardInfo(message, options = {}) {
+  const origin = originOf(message)
+  if (origin === undefined) return undefined
+  const { from, details } = originParty(origin, message, options)
+  const link = origin.type === 'channel' ? messageLink(origin.chat, origin.message_id) : undefined
+  if (link !== undefined) details.push(link)
+  const media = mediaNote(message, options.ownFile === true ? 'attached' : undefined)
+  if (media !== undefined) details.push(media)
+  return compact({ from, sentAt: epochMs(origin.date), details })
+}
+
+/**
+ * Say where a forwarded message comes from, as a line of text. Used only
+ * where several forwards are sent as one prompt: the first one's origin is
+ * metadata, each later one keeps its origin next to its own text.
+ * @returns the line, or undefined when the message is not forwarded.
  */
 export function describeForward(message, options = {}) {
   const origin = originOf(message)
@@ -169,36 +171,110 @@ export function describeForward(message, options = {}) {
 }
 
 /**
- * Describe a message the bot sent into a topic on someone's behalf (a script,
- * a job, a plugin or another session): who sent it, when, where it was
- * recorded, and its full text, which may span several Telegram messages.
- * @param sent - entry from the sent-message log.
- * @param options - currentSession: session now bound to the topic; limit: text
- *   limit; formatDate: as in `composePrompt`.
- * @returns the context block, or undefined.
+ * A reply to a message the bot sent into a topic on someone's behalf (a
+ * script, a job, a plugin or another session): the sender, time and full text
+ * come from the sent-message log, since the message may span several
+ * Telegram messages and its real author is not the bot.
+ * @param reply - the reply from `replyInfo`.
+ * @param sent - entry from the sent-message log, if the replied-to message is in it.
+ * @param options - currentSession: session now bound to the topic.
+ * @returns the reply, with the log entry's facts when there is one.
  */
-export function describeSent(sent, options = {}) {
-  if (sent === undefined || sent === null) return undefined
-  const details = []
-  const time = Date.parse(sent.sentAt ?? '')
-  details.push(Number.isFinite(time) ? `sent ${formatDate(time / 1000, options)}` : 'sent at an unknown time')
-  if (typeof sent.job === 'string' && sent.job.length > 0) details.push(`by job "${sent.job}"`)
-  if (typeof sent.fromSession === 'string' && sent.fromSession.length > 0) details.push(`from DSH session ${sent.fromSession}`)
-  else if (typeof sent.label === 'string' && sent.label.length > 0 && sent.job == null) details.push(`by ${sent.label}`)
+export function withSent(reply, sent, options = {}) {
+  if (sent === undefined || sent === null) return reply
+  const details = ['posted by the bot on behalf of another sender']
   if (Array.isArray(sent.messageIds) && sent.messageIds.length > 1) details.push(`${sent.messageIds.length} Telegram messages`)
   if (sent.sticker !== undefined && sent.sticker !== null) details.push(`with sticker ${[sent.sticker.emoji, sent.sticker.setName === null || sent.sticker.setName === undefined ? undefined : `from set "${sent.sticker.setName}"`, `(${sent.sticker.id})`].filter(Boolean).join(' ')}`)
   if (Array.isArray(sent.files) && sent.files.length > 0) details.push(`with ${sent.files.length === 1 ? 'file' : 'files'} ${sent.files.map((name) => `"${name}"`).join(', ')}`)
   const bound = typeof sent.boundSession === 'string' ? sent.boundSession : undefined
   if (bound !== undefined && sent.recorded === true && bound !== options.currentSession) details.push(`recorded in session ${bound}, not this one`)
   else if (bound === undefined) details.push('the topic had no session then')
-  const head = `[The replied-to message was posted by the bot on behalf of another sender (${details.join('; ')}). Full text:]`
-  const body = typeof sent.text === 'string' && sent.text.trim().length > 0
-    ? quoteLines(sent.text, options.limit ?? SENT_TEXT_LIMIT) + (sent.textCut > 0 ? `\n> […${sent.textCut} more characters not kept]` : '')
-    : '> (no text)'
   const sessions = [sent.fromSession, bound !== options.currentSession && sent.recorded === true ? bound : undefined]
     .filter((id, index, all) => typeof id === 'string' && id.length > 0 && all.indexOf(id) === index)
-  const hint = sessions.length === 0 ? '' : `\n(For more context, open session ${sessions.join(' or ')}.)`
-  return `${head}\n${body}${hint}`
+  if (sessions.length > 0) details.push(`for more context, open session ${sessions.join(' or ')}`)
+  const time = Date.parse(sent.sentAt ?? '')
+  const text = typeof sent.text === 'string' && sent.text.trim().length > 0
+    ? sent.text + (sent.textCut > 0 ? `\n[…${sent.textCut} more characters not kept]` : '')
+    : undefined
+  return compact({
+    from: sentParty(sent) ?? reply.from,
+    sentAt: Number.isFinite(time) ? time : reply.sentAt,
+    text: text ?? reply.text,
+    quoted: text === undefined ? reply.quoted : undefined,
+    details: [...details, ...(reply.details ?? [])],
+  })
+}
+
+/** The sender of a logged send, in the principal shape of the bot's sends. */
+function sentParty(sent) {
+  const job = nonBlank(sent.job)
+  const fromSession = nonBlank(sent.fromSession)
+  const label = nonBlank(sent.label)
+  if (job !== undefined) return { kind: 'cron-job', channel: 'cron', id: nonBlank(sent.jobId) ?? job, name: job }
+  if (fromSession !== undefined) return { kind: 'dsh-session', channel: 'dsh', id: fromSession }
+  if (label !== undefined) return { kind: 'external', channel: 'external', id: label, name: label }
+  return undefined
+}
+
+function nonBlank(value) {
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
+}
+
+function epochMs(seconds) {
+  return typeof seconds === 'number' && Number.isFinite(seconds) ? seconds * 1000 : undefined
+}
+
+/** A copy without undefined fields and without an empty `details`. */
+function compact(record) {
+  const out = {}
+  for (const [key, value] of Object.entries(record)) {
+    if (value === undefined) continue
+    if (key === 'details' && Array.isArray(value) && value.length === 0) continue
+    out[key] = value
+  }
+  return out
+}
+
+/** A Telegram user as a reply's or forward's author. */
+function telegramParty(user) {
+  const name = [user.first_name, user.last_name].filter((part) => typeof part === 'string' && part.length > 0).join(' ')
+  return compact({
+    kind: 'telegram-user',
+    channel: 'telegram',
+    id: user.id === undefined || user.id === null ? undefined : String(user.id),
+    name: name.length > 0 ? name : undefined,
+    username: nonBlank(user.username),
+  })
+}
+
+/** Who wrote a replied-to message, from the reader's point of view. */
+function senderOf(target, message, options) {
+  const from = target.from
+  if (from !== undefined && options.botId !== undefined && from.id === options.botId) {
+    const text = messageBody(target)
+    const mirrored = MIRROR_LABELS.find(([label]) => text.startsWith(label))
+    return mirrored === undefined ? { from: { role: 'assistant' }, details: [] } : { from: { name: mirrored[1] }, details: [] }
+  }
+  if (target.sender_chat !== undefined) return { from: { name: chatName(target.sender_chat) }, details: [] }
+  if (from !== undefined && message?.from !== undefined && from.id === message.from.id) return { from: { role: 'sender' }, details: [] }
+  if (from !== undefined) return { from: telegramParty(from), details: from.is_bot === true ? ['written by a bot'] : [] }
+  return { from: undefined, details: [] }
+}
+
+/** The author of a forward origin, from the reader's point of view. */
+function originParty(origin, message, options) {
+  const signature = typeof origin.author_signature === 'string' && origin.author_signature.length > 0 ? `, signed ${origin.author_signature}` : ''
+  if (origin.type === 'user') {
+    const user = origin.sender_user
+    if (user !== undefined && options.botId !== undefined && user.id === options.botId) return { from: { role: 'assistant' }, details: [] }
+    if (user !== undefined && message?.from !== undefined && user.id === message.from.id) return { from: { role: 'sender' }, details: [] }
+    if (user === undefined) return { from: { name: 'a user' }, details: [] }
+    return { from: telegramParty(user), details: user.is_bot === true ? ['written by a bot'] : [] }
+  }
+  if (origin.type === 'hidden_user') return { from: { name: `${origin.sender_user_name ?? 'a user'} (account hidden)` }, details: [] }
+  if (origin.type === 'channel') return { from: { name: `channel ${chatName(origin.chat)}${signature}` }, details: [] }
+  if (origin.type === 'chat') return { from: { name: `${chatName(origin.sender_chat)}${signature}` }, details: [] }
+  return { from: { name: 'an unknown source' }, details: [] }
 }
 
 /** Forward origin of a message, including the fields older Bot API versions used. */
@@ -211,20 +287,6 @@ function originOf(message) {
   if (message?.forward_from !== undefined) return { type: 'user', sender_user: message.forward_from, date }
   if (typeof message?.forward_sender_name === 'string') return { type: 'hidden_user', sender_user_name: message.forward_sender_name, date }
   return undefined
-}
-
-/** Who wrote a replied-to message, from the reader's point of view. */
-function describeSender(target, message, options) {
-  const from = target.from
-  if (from !== undefined && options.botId !== undefined && from.id === options.botId) {
-    const text = messageBody(target)
-    const mirrored = MIRROR_LABELS.find(([label]) => text.startsWith(label))
-    return mirrored === undefined ? 'the assistant (this bot)' : mirrored[1]
-  }
-  if (target.sender_chat !== undefined) return chatName(target.sender_chat)
-  if (from !== undefined && message?.from !== undefined && from.id === message.from.id) return 'the user (their own earlier message)'
-  if (from !== undefined) return personName(from)
-  return 'an unknown sender'
 }
 
 /** Name the origin of a forwarded message. */
@@ -320,19 +382,4 @@ function mediaKind(message) {
 function formatDate(seconds, options = {}) {
   if (typeof seconds !== 'number' || !Number.isFinite(seconds)) return 'at an unknown time'
   return (typeof options.formatDate === 'function' ? options.formatDate(seconds) : undefined) ?? formatTelegramDate(seconds, 'UTC')
-}
-
-/** Quote text line by line, cut at a word boundary near the limit. */
-function quoteLines(text, limit) {
-  let shown = text.trim()
-  let note = ''
-  if (shown.length > limit) {
-    let cut = shown.lastIndexOf(' ', limit)
-    const newline = shown.lastIndexOf('\n', limit)
-    if (newline > cut) cut = newline
-    if (cut < limit * 0.8) cut = limit
-    note = `\n> […truncated, ${shown.length - cut} more characters]`
-    shown = shown.slice(0, cut).trimEnd()
-  }
-  return shown.split('\n').map((line) => `> ${line}`).join('\n') + note
 }

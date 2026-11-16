@@ -8,7 +8,6 @@ import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
 import { followupThroughGate, makeAgentModel, makeTitleService } from './fake-dsh.js'
-import { senderLabel } from '../src/sender.js'
 import { enqueue, waitForResult } from '../src/outbox.js'
 import { hasBotPreamble, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, leadingWords, plannedTitle, resolveSendTarget, sessionTitleOf, titleTask, topicNameOf, withoutContextBlocks, withoutSenderLine } from '../src/topics.js'
 
@@ -1134,9 +1133,13 @@ test('a long send from a job is recorded with its sender, and a reply after /new
     })
     await wait(250)
     assert.equal(promptText(fresh.received.at(-1)), 'thanks', 'the prompt holds only what the person wrote')
-    const notice = promptText(fresh.notices.at(-1))
-    assert.match(notice, /\[The replied-to message was posted by the bot on behalf of another sender \(sent [^;]+; by job "Morning digest"; from DSH session session-cron; \d+ Telegram messages; recorded in session session-notify, not this one\)\. Full text:\]\n> word0 word1 /u)
-    assert.match(notice, /word899\n\(For more context, open session session-cron or session-notify\.\)$/u)
+    const reply = fresh.received.at(-1).source.envelope.replyTo
+    assert.deepEqual(reply.from, { kind: 'cron-job', channel: 'cron', id: 'Morning digest', name: 'Morning digest' })
+    assert.equal(reply.text, long, 'the whole send, not only the replied-to part')
+    assert.equal(reply.details[0], 'posted by the bot on behalf of another sender')
+    assert.ok(reply.details.includes('recorded in session session-notify, not this one'))
+    assert.ok(reply.details.includes('for more context, open session session-cron or session-notify'))
+    assert.equal(fresh.notices?.length ?? 0, 0, 'the bot adds no message of its own')
     // A reply to an ordinary bot message adds no such block.
     run.telegram.push({
       message_thread_id: 7100,
@@ -1146,7 +1149,7 @@ test('a long send from a job is recorded with its sender, and a reply after /new
     })
     await wait(250)
     assert.equal(promptText(fresh.received.at(-1)), 'and this?')
-    assert.doesNotMatch(promptText(fresh.notices.at(-1)), /on behalf of/u)
+    assert.deepEqual(fresh.received.at(-1).source.envelope.replyTo, { from: { role: 'assistant' }, sentAt: 1000, text: 'an answer' })
   } finally {
     run.stop()
   }
@@ -1214,7 +1217,7 @@ test('a reply carries the replied-to text, its author and its photo', async () =
     await wait(250)
     const last = agent.received.at(-1)
     assert.equal(promptText(last), 'what does this show?')
-    assert.match(promptText(agent.notices.at(-1)), /^\[Telegram message from [^\n]+\]\n\[Replying to a message from the assistant \(this bot\) \(sent Sat 2025-11-08 11:06 UTC\+00:00; contains a photo, attached\)\]\n> Weekly chart$/u)
+    assert.deepEqual(last.source.envelope.replyTo, { from: { role: 'assistant' }, sentAt: 1_762_600_000_000, text: 'Weekly chart', details: ['contains a photo, attached'] })
     assert.equal(last.content.filter((block) => block.type === 'image').length, 1)
     assert.ok(run.telegram.calls.some((call) => call.method === 'getFile' && call.body.file_id === 'large'))
   } finally {
@@ -1249,9 +1252,12 @@ test('a partial quote replaces the full text, and the topic root is not a reply'
     })
     await wait(250)
     assert.equal(promptText(agent.received.at(-1)), 'is this right?')
-    const notice = promptText(agent.notices.at(-1))
-    assert.match(notice, /\n\[Replying to a message from Sam \(@sam\) \(sent [^)]+\); the user quoted only this part\]\n> the second step$/u)
-    assert.doesNotMatch(notice, /third step/u)
+    assert.deepEqual(agent.received.at(-1).source.envelope.replyTo, {
+      from: { kind: 'telegram-user', channel: 'telegram', id: '77', name: 'Sam', username: 'sam' },
+      sentAt: 1_762_600_000_000,
+      text: 'the second step',
+      quoted: true,
+    })
   } finally {
     run.stop()
   }
@@ -1268,7 +1274,7 @@ test('a reply to a mirrored Web prompt is not shown as an assistant message', as
     })
     await wait(250)
     assert.equal(promptText(agent.received.at(-1)), 'and this one too')
-    assert.match(promptText(agent.notices.at(-1)), /\n\[Replying to a message from the Web UI \(a user prompt this bot mirrored into the chat, not an assistant answer\)/u)
+    assert.deepEqual(agent.received.at(-1).source.envelope.replyTo.from, { name: 'the Web UI (a user prompt this bot mirrored into the chat, not an assistant answer)' })
   } finally {
     run.stop()
   }
@@ -1298,8 +1304,8 @@ test('several forwarded messages become one prompt and never run as commands', a
     await wait(1800)
     assert.equal(agent.received.length, before + 1, 'one prompt for the whole batch')
     const text = promptText(agent.received.at(-1))
-    // The first forward's origin is in the notice, so the prompt starts with its text.
-    assert.match(promptText(agent.notices.at(-1)), /\n\[Forwarded message from channel "Project News" \(@projnews\) \(originally sent [^;]+; https:\/\/t\.me\/projnews\/88\)\]$/u)
+    // The first forward's origin is in the envelope, so the prompt starts with its text.
+    assert.deepEqual(agent.received.at(-1).source.envelope.forwardedFrom, { from: { name: 'channel "Project News" (@projnews)' }, sentAt: 1_762_000_000_000, details: ['https://t.me/projnews/88'] })
     assert.match(text, /^Release notes are out\n\n/u)
     assert.match(text, /\[Forwarded message from Sam \(originally sent [^)]+\)\]\n\/new/u)
     assert.match(text, /\[Forwarded message from Alex \(account hidden\) \(originally sent [^;]+; contains a video, not attached\)\]\nclip$/u)
@@ -1404,15 +1410,7 @@ test('when the auto-created topic cannot be deleted, a short note is left in it'
   }
 })
 
-test('senderLabel names the Telegram user compactly', () => {
-  assert.equal(senderLabel({ kind: 'telegram-user', channel: 'telegram', id: '7', name: 'Ana Silva', username: 'ana' }), '[Telegram message from Ana Silva (@ana, user id 7)]')
-  assert.equal(senderLabel({ kind: 'telegram-user', channel: 'telegram', id: '8', name: 'Sam' }), '[Telegram message from Sam (user id 8)]')
-  assert.equal(senderLabel({ kind: 'telegram-user', channel: 'telegram', id: '9' }), '[Telegram message from user id 9]')
-  assert.equal(senderLabel({ kind: 'oidc-user', channel: 'web', id: 'x' }), undefined)
-  assert.equal(senderLabel(undefined), undefined)
-})
-
-test('every Telegram prompt says who wrote it and when in a notice before it, once per forwarded batch', async () => {
+test('every Telegram prompt records who wrote it and when on its source, once per forwarded batch', async () => {
   const run = await start({ timeZone: 'Asia/Tokyo' })
   try {
     run.telegram.push({ message_thread_id: 1, text: 'hello', date: 1_772_440_872, from: { id: 42, first_name: 'Ana', username: 'ana' } })
@@ -1427,21 +1425,20 @@ test('every Telegram prompt says who wrote it and when in a notice before it, on
       username: 'ana',
       chat: { id: '100', thread: 7001, name: 'New session' },
     })
-    assert.equal(agent.notices.length, 1)
-    // Telegram's own send time, in the configured zone.
-    assert.equal(promptText(agent.notices[0]), '[Telegram message from Ana (@ana, user id 42), sent Mon 2026-03-02 17:41 UTC+09:00]')
-    // The zone also reaches DSH on the prompt, for its clock context.
+    assert.equal(agent.notices?.length ?? 0, 0, 'the bot adds no message of its own')
+    // Telegram's own send time.
+    assert.deepEqual(agent.received[0].source.envelope, { sentAt: 1_772_440_872_000 })
+    // The zone reaches DSH on the prompt, for its clock context and for renderers.
     assert.equal(agent.received[0].source.clientTimeZone, 'Asia/Tokyo')
     assert.match(agent.received[0].source.rpcId, /^telegram:100:\d+$/u)
-    assert.deepEqual({ kind: agent.notices[0].source.kind, form: agent.notices[0].source.form }, { kind: 'telegram-sender', form: 'notice' })
     const before = agent.received.length
     run.telegram.push({ message_thread_id: 7001, text: 'one', forward_origin: { type: 'hidden_user', sender_user_name: 'A', date: 1 } })
     run.telegram.push({ message_thread_id: 7001, text: 'two', forward_origin: { type: 'hidden_user', sender_user_name: 'B', date: 2 } })
     await wait(1800)
     assert.equal(agent.received.length, before + 1)
-    assert.equal(agent.notices.length, 2, 'one notice for the batch')
-    assert.match(promptText(agent.notices[1]), /^\[Telegram message from user id 42, sent Thu 1970-01-01 09:00 UTC\+09:00\]\n\[Forwarded message from A \(account hidden\) \(originally sent Thu 1970-01-01 09:00 UTC\+09:00\)\]$/u)
-    assert.doesNotMatch(promptText(agent.received.at(-1)), /\[Telegram message from/u)
+    const batch = agent.received.at(-1)
+    assert.deepEqual(batch.source.envelope.forwardedFrom, { from: { name: 'A (account hidden)' }, sentAt: 1000 })
+    assert.equal(promptText(batch), 'one\n\n[Forwarded message from B (account hidden) (originally sent Thu 1970-01-01 09:00 UTC+09:00)]\ntwo')
   } finally {
     run.stop()
   }
@@ -1483,7 +1480,7 @@ test('without a title provider a topic session keeps its topic name, and no titl
     run.telegram.push({ message_thread_id: 7001, text: 'fix the empty sessions', from: { id: 42, first_name: 'Ana', username: 'ana' } })
     await wait(200)
     // DSH records the step's messages; its fallback title reads the first human one.
-    for (const message of [...agent.notices, agent.received.at(-1)]) agent.session.append('user/message', message)
+    agent.session.append('user/message', agent.received.at(-1))
     agent.session.append('request/header', { header: {} })
     await wait(50)
     assert.deepEqual(titles.refreshed, [], 'no refresh: it would write the first-prompt fallback over the topic name')
@@ -1512,17 +1509,15 @@ test('a reply or forward as the first message titles the session from the words 
       reply_to_message: { message_id: 600, date: 1, chat: { id: 100 }, from: { id: 77, first_name: 'Sam' }, text: 'the leak sensor is offline' },
     })
     await wait(250)
-    const notice = agent.notices.at(-1)
-    assert.equal(notice.source.kind, 'telegram-sender')
-    assert.match(promptText(notice), /\n\[Replying to a message from Sam \(sent [^)]+\)\]\n> the leak sensor is offline$/u, 'the model still sees what was replied to')
+    assert.equal(agent.received.at(-1).source.envelope.replyTo.text, 'the leak sensor is offline', 'what was replied to travels with the message')
     // DSH records the step's messages; its fallback title reads the first human one.
-    for (const message of [notice, agent.received.at(-1)]) agent.session.append('user/message', message)
+    agent.session.append('user/message', agent.received.at(-1))
     await titles.refresh(agent.session)
     assert.equal(agent.session.title, 'Telegram-Annie-can you check this')
     run.telegram.push({ message_thread_id: 7001, text: 'Release notes are out', forward_origin: { type: 'user', sender_user: { id: 77, first_name: 'Sam' }, date: 1 } })
     await wait(1800)
-    assert.equal(promptText(agent.received.at(-1)), 'Release notes are out', "a forward's text is its content; where it came from is in the notice")
-    assert.match(promptText(agent.notices.at(-1)), /\n\[Forwarded message from Sam \(originally sent [^)]+\)\]$/u)
+    assert.equal(promptText(agent.received.at(-1)), 'Release notes are out', "a forward's text is its content; where it came from is in the envelope")
+    assert.deepEqual(agent.received.at(-1).source.envelope.forwardedFrom.from, { kind: 'telegram-user', channel: 'telegram', id: '77', name: 'Sam' })
   } finally {
     run.stop()
   }

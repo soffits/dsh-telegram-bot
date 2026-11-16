@@ -277,7 +277,7 @@ function makeTelegram() {
           { file_id: 'sticker-set-2', file_unique_id: 'U-SET-2', emoji: '😻', set_name: body.name, is_animated: true, is_video: false, thumbnail: { file_id: 'sticker-set-2-thumb' } },
         ] } })
       }
-      if (method === 'sendDocument' || method === 'sendPhoto' || method === 'sendSticker') {
+      if (['sendDocument', 'sendPhoto', 'sendSticker', 'sendVoice', 'sendAudio', 'sendVideo', 'sendAnimation'].includes(method)) {
         messageId += 1
         return deliver({ ok: true, result: { message_id: messageId } })
       }
@@ -837,6 +837,34 @@ const notifyState = {
   sessions: { 'session-notify': { sessionId: 'session-notify', chatId: 100, threadId: 7100, title: 'Notify', cwd: '/tmp/default-workspace', updatedAt: 1 } },
   threads: { '100:7100': 'session-notify' },
 }
+
+test('topic sends can be silent, HTML or plain, and send audio, voice, video and GIFs by type', async () => {
+  const run = await start({}, notifyState)
+  try {
+    run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    const names = ['note.ogg', 'song.mp3', 'clip.mp4', 'loop.gif']
+    const files = []
+    for (const name of names) {
+      const file = join(STATUS_DIR, name)
+      await writeFile(file, 'data')
+      files.push(file)
+    }
+    await run.host.provided.telegramTopics.send({ to: 7100, text: '<b>Done</b>', files, format: 'html', silent: true, asVoice: true })
+    const text = sent(run.telegram.calls, 7100).find((call) => call.body.text === '<b>Done</b>')
+    assert.equal(text.body.parse_mode, 'HTML')
+    assert.equal(text.body.disable_notification, true)
+    const uploads = run.telegram.calls.filter((call) => ['sendVoice', 'sendAudio', 'sendVideo', 'sendAnimation'].includes(call.method))
+    assert.deepEqual(uploads.map((call) => call.method), ['sendVoice', 'sendAudio', 'sendVideo', 'sendAnimation'])
+    assert.ok(uploads.every((call) => call.body.raw.includes('name="disable_notification"\r\n\r\ntrue')), 'every upload is silent')
+    await run.host.provided.telegramTopics.send({ to: 7100, text: 'a_b *c*', format: 'plain' })
+    const plain = sent(run.telegram.calls, 7100).find((call) => call.body.text === 'a_b *c*')
+    assert.equal(plain.body.parse_mode, undefined)
+    assert.equal(plain.body.disable_notification, undefined, 'only a silent send is silent')
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 7100, text: 'x', format: 'bbcode' }), (error) => /Unknown text format/.test(error.message) && error.retryable === false)
+  } finally {
+    run.stop()
+  }
+})
 
 test('the Host service posts into a topic by thread id and records it in the bound session', async () => {
   const run = await start({}, notifyState)

@@ -171,7 +171,7 @@ dsh-telegram-send --thread 12345 --file /tmp/report.pdf "Monthly report"
 
 Who sent it: `--job <name>` names the job or script, and `--from-session <id>` the DSH session. Inside a DSH session `--from-session` defaults to `$DSH_SESSION_ID`; pass `--from-session ''` to leave it out. `--from <label>` is a free-form label for senders that are neither. When the sending session is the one bound to the topic, it gets no second copy.
 
-Long text is split into several Telegram messages. Every `--file` is sent after the text, one message per file.
+Long text is split into several Telegram messages. Every `--file` is sent after the text, one message per file, shown by its type: pictures inline, GIFs as animations, audio and video in Telegram's players, anything else as a document; `--voice` sends Opus/Ogg files as voice messages. The text is Markdown, converted for Telegram; `--format html` sends Telegram HTML as written and `--format plain` sends it untouched. `--silent` delivers without a notification sound.
 
 The command writes the request into `$DSH_HOME/telegram/outbox/` and waits up to `--timeout` seconds (default 30) for the plugin's answer. Exit codes: `0` sent, `1` failed (the error is printed, for example an unknown thread id), `2` bad arguments, `3` still queued (the bot sends it once it runs). `--no-wait` returns right after queueing. The spool keeps requests while DSH is stopped, which is why it is a directory and not a socket; a request interrupted by a restart is sent again. The command is installed as the package's `bin`; link it onto your `PATH` if needed (`node_modules/.bin/dsh-telegram-send` in the profile).
 
@@ -183,6 +183,9 @@ const result = await ctx.get('telegramTopics').send({
   text: 'Backup **finished**',
   files: ['/tmp/report.pdf'],   // absolute paths, optional
   from: { job: 'backup', sessionId: 'session-…' }, // optional; `label` for other senders
+  format: 'markdown',           // optional: 'markdown' (default), 'html' or 'plain'
+  silent: false,                // optional: no notification sound
+  asVoice: false,               // optional: Opus/Ogg files as voice messages
 })
 // { chatId, threadId, topic, sessionId, recorded, messageIds }, plus note or recordError when it was not recorded
 ctx.get('telegramTopics').topics() // [{ chatId, threadId, name, sessionId }]: known topics in every chat, name may be null

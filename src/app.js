@@ -45,7 +45,7 @@ import { publishStatus } from './status.js'
 import { answerSegments, isInterjection, messageAnswer, turnAnswer } from './final-text.js'
 import { createOutbox } from './outbox.js'
 import { agentsListText, childState, collectSubagents, createAgentBoards, reportOf } from './agents.js'
-import { deliveredToTopic, hasBotPreamble, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, leadingWords, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor, withoutContextBlocks, withoutSenderLine } from './topics.js'
+import { deliveredToTopic, hasBotPreamble, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, leadingWords, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor, uploadMethod, withoutContextBlocks, withoutSenderLine } from './topics.js'
 import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.js'
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, describeForward, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference } from './message-context.js'
@@ -936,13 +936,15 @@ export function apply(ctx, config) {
    * @param text - body.
    * @param signal - request lifetime.
    * @param threadId - topic thread.
+   * @param extra - more sendMessage fields, such as `disable_notification`.
    * @returns the Bot API result, or undefined.
    */
-  async function sendPlain(chatId, text, signal, threadId) {
+  async function sendPlain(chatId, text, signal, threadId, extra = {}) {
     try {
       return await call('sendMessage', {
         chat_id: chatId,
         ...topicTarget(chatId, threadId),
+        ...extra,
         text,
       }, signal)
     } catch (error) {
@@ -1220,23 +1222,28 @@ export function apply(ctx, config) {
    * @param text - raw Markdown answer.
    * @param signal - request lifetime.
    * @param threadId - topic thread.
+   * @param options - `format`: `markdown` (default; converted to MarkdownV2),
+   *   `html` (Telegram HTML, sent as is) or `plain`; `extra`: more
+   *   sendMessage fields, such as `disable_notification`.
    * @returns the Bot API result, or undefined.
    */
-  async function sendAnswer(chatId, text, signal, threadId) {
-    const body = toTelegramMarkdown(text)
+  async function sendAnswer(chatId, text, signal, threadId, { format = 'markdown', extra = {} } = {}) {
+    if (format === 'plain') return sendPlain(chatId, text, signal, threadId, extra)
+    const html = format === 'html'
     try {
       return await call('sendMessage', {
         chat_id: chatId,
         ...topicTarget(chatId, threadId),
-        text: body,
-        parse_mode: 'MarkdownV2',
+        ...extra,
+        text: html ? text : toTelegramMarkdown(text),
+        parse_mode: html ? 'HTML' : 'MarkdownV2',
       }, signal)
     } catch (error) {
       const detail = messageOf(error)
       if (!isTelegramParseError(detail)) throw error
-      if (!signal.aborted) warn(`MarkdownV2 send failed, falling back to plain text: ${detail}`)
+      if (!signal.aborted) warn(`${html ? 'HTML' : 'MarkdownV2'} send failed, falling back to plain text: ${detail}`)
       await publishStatus({ lastFormatFallback: detail })
-      return sendPlain(chatId, text, signal, threadId)
+      return sendPlain(chatId, text, signal, threadId, extra)
     }
   }
 
@@ -3954,27 +3961,27 @@ export function apply(ctx, config) {
     }
   }
 
-  /** File types Telegram shows inline as photos. */
-  const PHOTO_TYPES = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' }
-
   /**
-   * Upload one local file into a topic.
+   * Upload one local file into a topic, shown the way its type suits
+   * (`uploadMethod`).
    * @param chatId - target chat.
    * @param threadId - topic thread.
    * @param file - `{ name, data }`.
    * @param signal - request lifetime.
+   * @param options - `asVoice`: Opus/Ogg audio as a voice message;
+   *   `silent`: no notification sound.
    * @returns the Bot API message.
    */
-  async function uploadFile(chatId, threadId, file, signal) {
-    const photo = PHOTO_TYPES[extname(file.name).toLowerCase()] !== undefined && file.data.length <= 10 * 1024 * 1024
-    const method = photo ? 'sendPhoto' : 'sendDocument'
-    const field = photo ? 'photo' : 'document'
+  async function uploadFile(chatId, threadId, file, signal, { asVoice = false, silent = false } = {}) {
+    const { method, field } = uploadMethod(file.name, file.data.length, asVoice)
     const boundary = `----dsh-telegram-${randomUUID()}`
     const safeName = file.name.replace(/["\r\n]/gu, '_')
+    const formField = (name, value) => `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`
     const bodyFor = (topicField, topicId) => {
       const parts = [
-        `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`,
-        ...(topicField === undefined ? [] : [`--${boundary}\r\nContent-Disposition: form-data; name="${topicField}"\r\n\r\n${topicId}\r\n`]),
+        formField('chat_id', chatId),
+        ...(topicField === undefined ? [] : [formField(topicField, topicId)]),
+        ...(silent ? [formField('disable_notification', 'true')] : []),
         `--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${safeName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
       ]
       return Buffer.concat([
@@ -4158,6 +4165,9 @@ export function apply(ctx, config) {
     }
   }
 
+  /** How sendToTopic's text may be written. */
+  const SEND_FORMATS = ['markdown', 'html', 'plain']
+
   /** Messages sent through sendToTopic, for the context of later replies. */
   const sentLog = createSentLog({ onError: (error) => reportError('sent-log', error) })
 
@@ -4238,12 +4248,15 @@ export function apply(ctx, config) {
    * The Host service, the agent tool and the file spool all use this.
    * Errors a retry cannot fix (an unknown thread id, a bad file, a send that
    * already reached Telegram in part) carry `retryable: false`.
-   * @param request - `{ to, chat, text, files, from }`; `to` is the topic's
-   *   thread id; the message goes to the chat the bot saw that thread in,
-   *   or to `chat` when given (needed only when two chats share the id);
-   *   `from` may hold `label` (who sent it), `job` (a job name)
+   * @param request - `{ to, chat, text, files, from, format, silent, asVoice }`;
+   *   `to` is the topic's thread id; the message goes to the chat the bot saw
+   *   that thread in, or to `chat` when given (needed only when two chats
+   *   share the id); `from` may hold `label` (who sent it), `job` (a job name)
    *   and `sessionId` (the sender session; the bound session sending into
-   *   its own topic gets its copy too, labelled "by this session").
+   *   its own topic gets its copy too, labelled "by this session");
+   *   `format` is how the text is written: `markdown` (default), `html`
+   *   (Telegram HTML) or `plain`; `silent` sends without a notification
+   *   sound; `asVoice` sends Opus/Ogg files as voice messages.
    * @param signal - request lifetime.
    * @returns where it went and whether the session recorded it.
    */
@@ -4255,6 +4268,10 @@ export function apply(ctx, config) {
     // A sticker library entry (`{ id, fileId, emoji, setName }`).
     const sticker = typeof request?.sticker?.fileId === 'string' ? request.sticker : undefined
     if (text.trim().length === 0 && paths.length === 0 && sticker === undefined) throw finalError('Nothing to send: give text, files or a sticker.')
+    const format = request?.format ?? 'markdown'
+    if (!SEND_FORMATS.includes(format)) throw finalError(`Unknown text format ${JSON.stringify(format)}: use ${SEND_FORMATS.join(', ')}.`)
+    const silent = request?.silent === true
+    const extra = silent ? { disable_notification: true } : {}
     let chatId
     let threadId
     try {
@@ -4270,13 +4287,13 @@ export function apply(ctx, config) {
     try {
       if (text.trim().length > 0) {
         for (const chunk of splitAnswerText(text.trim())) {
-          const result = await sendAnswer(chatId, chunk, signal, threadId)
+          const result = await sendAnswer(chatId, chunk, signal, threadId, { format, extra })
           if (result?.message_id === undefined) throw new Error('Telegram did not accept the message.')
           messageIds.push(result.message_id)
         }
       }
       if (sticker !== undefined) {
-        const result = await call('sendSticker', { chat_id: chatId, ...topicTarget(chatId, threadId), sticker: sticker.fileId }, signal)
+        const result = await call('sendSticker', { chat_id: chatId, ...topicTarget(chatId, threadId), ...extra, sticker: sticker.fileId }, signal)
         if (result?.message_id !== undefined) messageIds.push(result.message_id)
       }
       // The bound session sending into its own topic: present later in the
@@ -4286,7 +4303,7 @@ export function apply(ctx, config) {
         : undefined
       for (const file of files) {
         if (own !== undefined) claimTurnFile(own, own.activeTurn, file.path)
-        const result = await uploadFile(chatId, threadId, file, signal)
+        const result = await uploadFile(chatId, threadId, file, signal, { asVoice: request?.asVoice === true, silent })
         if (result?.message_id !== undefined) messageIds.push(result.message_id)
       }
       // The turn already said something in its topic (a sticker, a file, a
@@ -6868,12 +6885,14 @@ export function apply(ctx, config) {
   /** Topic sending for other plugins: `ctx.get('telegramTopics').send(...)`. */
   const topicService = {
     /**
-     * @param request - `{ to, chat, text, files, from }`: `to` is the topic's
-     *   thread id, sent to the chat that owns it (`chat` picks one when
-     *   several chats share the id), `text` Markdown, `files` absolute paths, `from`
-     *   `{ job, sessionId, label }` naming the sender.
+     * @param request - `{ to, chat, text, files, from, format, silent, asVoice }`:
+     *   `to` is the topic's thread id, sent to the chat that owns it (`chat`
+     *   picks one when several chats share the id), `text` Markdown unless
+     *   `format` says `html` or `plain`, `files` absolute paths, `from`
+     *   `{ job, sessionId, label }` naming the sender, `silent` no
+     *   notification sound, `asVoice` Opus/Ogg files as voice messages.
      */
-    send: ({ to, chat, text, files = [], from } = {}) => sendToTopic({ to, chat, text, files, from }),
+    send: ({ to, chat, text, files = [], from, format, silent, asVoice } = {}) => sendToTopic({ to, chat, text, files, from, format, silent, asVoice }),
     /** @returns the topics the bot knows in every chat: chat id, thread id, last known name, bound session. */
     topics: () => knownTopicKeys()
       .map((key) => {

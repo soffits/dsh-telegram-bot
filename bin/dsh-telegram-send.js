@@ -12,13 +12,15 @@ import { enqueue, waitForResult } from '../src/outbox.js'
 
 const usage = `Usage: dsh-telegram-send --thread <thread-id> [--chat <chat-id>] [--file <path>]...
                          [--job <name>] [--from-session <id>] [--from <label>]
+                         [--format markdown|html|plain] [--silent] [--voice]
                          [--no-wait] [--timeout <seconds>] [text...]
 
 Sends text (from the arguments, or from stdin when none are given) and files
 into a topic of the running DSH Telegram bot, addressed by its numeric thread
 id (/id in the topic shows it). The message is also recorded in the session
 bound to that topic, without starting a turn. Long text is split into several
-Telegram messages.
+Telegram messages. Files are shown by type: pictures inline, GIFs as
+animations, audio and video in Telegram's players, anything else as a document.
 
   --chat <id>            chat to send to; only needed when several chats have a
                          topic with that thread id (the bot otherwise uses the
@@ -27,6 +29,10 @@ Telegram messages.
   --from-session <id>    DSH session sending it; defaults to $DSH_SESSION_ID
                          (set inside DSH sessions), --from-session '' for none
   --from <label>         free-form sender label, used when neither is given
+  --format <format>      how the text is written: markdown (default, converted
+                         for Telegram), html (Telegram HTML) or plain
+  --silent               deliver without a notification sound
+  --voice                send Opus/Ogg audio files as voice messages
 
 Exit codes: 0 sent, 1 failed (for example an unknown thread id), 2 bad arguments,
 3 still queued after the timeout (the bot sends it once it runs).`
@@ -42,6 +48,9 @@ try {
       from: { type: 'string' },
       job: { type: 'string', short: 'j' },
       'from-session': { type: 'string' },
+      format: { type: 'string' },
+      silent: { type: 'boolean' },
+      voice: { type: 'boolean' },
       'no-wait': { type: 'boolean' },
       timeout: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
@@ -62,6 +71,12 @@ if (values.thread === undefined || !/^\d+$/u.test(values.thread.trim())) {
 }
 if (values.chat !== undefined && !/^-?\d+$/u.test(values.chat.trim())) {
   process.stderr.write(`--chat takes a numeric chat id.\n\n${usage}\n`)
+  process.exit(2)
+}
+
+const FORMATS = ['markdown', 'html', 'plain']
+if (values.format !== undefined && !FORMATS.includes(values.format)) {
+  process.stderr.write(`--format takes one of ${FORMATS.join(', ')}.\n\n${usage}\n`)
   process.exit(2)
 }
 
@@ -92,6 +107,9 @@ const id = await enqueue({
   text,
   files,
   ...(Object.keys(from).length === 0 ? {} : { from }),
+  ...(values.format === undefined ? {} : { format: values.format }),
+  ...(values.silent ? { silent: true } : {}),
+  ...(values.voice ? { asVoice: true } : {}),
 })
 if (values['no-wait']) {
   process.stdout.write(`${JSON.stringify({ queued: id })}\n`)

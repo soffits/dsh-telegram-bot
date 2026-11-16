@@ -17,6 +17,8 @@ export const DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 const MIRROR_LABELS = [
   ['🖥 From Web:', 'the Web UI (a user prompt this bot mirrored into the chat, not an assistant answer)'],
   ['🖥 Из Web:', 'the Web UI (a user prompt this bot mirrored into the chat, not an assistant answer)'],
+  ['🤖 From agent session ', 'another agent session (a prompt one agent sent another, mirrored into the chat; not the user and not an assistant answer)'],
+  ['🤖 От агента, сессия ', 'another agent session (a prompt one agent sent another, mirrored into the chat; not the user and not an assistant answer)'],
   ['⏰ Scheduled task:', 'a scheduled task (a prompt this bot mirrored into the chat, not an assistant answer)'],
   ['⏰ Задача по расписанию:', 'a scheduled task (a prompt this bot mirrored into the chat, not an assistant answer)'],
 ]

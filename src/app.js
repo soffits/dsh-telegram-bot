@@ -37,7 +37,7 @@ import {
 } from './formatting.js'
 import { admitText, promptRequestId } from './admission.js'
 import { STEER_REACTION, busyMode, clearTelegramInbox, hasPendingInput, steerPrompt } from './steer.js'
-import { createPrincipalTagger, sendPrincipal, telegramUserPrincipal } from './sender.js'
+import { createPrincipalTagger, senderSession, sendPrincipal, telegramUserPrincipal } from './sender.js'
 import { clientTimeZone, formatTelegramDate, resolveTimeZone } from './clock.js'
 import { loadState, STATE_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
@@ -2608,6 +2608,18 @@ export function apply(ctx, config) {
   }
 
   /**
+   * The line a mirrored prompt goes under, from its recorded sender.
+   * @param principal - the prompt's `source.principal`, if any.
+   * @returns the label.
+   */
+  function mirrorLabel(principal) {
+    const session = senderSession(principal)
+    if (session === undefined) return tr('🖥 From Web', '🖥 Из Web')
+    const short = session.replace(/^session-/, '').slice(0, 8)
+    return tr(`🤖 From agent session ${short}`, `🤖 От агента, сессия ${short}`)
+  }
+
+  /**
    * Show a user message that reached the session from another client.
    * Messages the bridge itself submitted are skipped, so nothing echoes back.
    * @param chat - topic state.
@@ -2625,7 +2637,7 @@ export function apply(ctx, config) {
     if (source?.kind === 'user') {
       if (queued ? telegramMessageIds.has(message.id) : telegramMessageIds.delete(message.id)) return
       if (typeof source.rpcId === 'string' && source.rpcId.startsWith('telegram')) return
-      label = tr('🖥 From Web', '🖥 Из Web')
+      label = mirrorLabel(source.principal)
     } else if (source?.kind === 'schedule') {
       label = tr('⏰ Scheduled task', '⏰ Задача по расписанию')
     } else {

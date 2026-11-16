@@ -524,6 +524,23 @@ test('a turn started in the Web UI appears in the bound topic', async () => {
   }
 })
 
+test('a prompt another agent session sent is mirrored as the agent\'s, not as from the Web', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const agent = run.host.live.get('session-1')
+    const before = run.telegram.calls.length
+    const principal = { kind: 'dsh-session', channel: 'dsh', id: 'session-1a2b3c4d-5e6f' }
+    await playExternalTurn(agent, 2, { id: 'agent-1', role: 'user', content: [{ type: 'text', text: 'brief from a parent' }], source: { kind: 'user', rpcId: 'rpc-agent-1', principal } }, 'answer for agent')
+    const shown = texts(run.telegram.calls.slice(before), 7001)
+    assert.ok(shown.some((text) => text.startsWith('🤖 From agent session 1a2b3c4d:') && text.includes('brief from a parent')), shown.join('\n---\n'))
+    assert.ok(!shown.some((text) => text.includes('From Web')), shown.join('\n---\n'))
+  } finally {
+    run.stop()
+  }
+})
+
 test('messages sent from Telegram are not echoed back', async () => {
   const run = await start()
   try {

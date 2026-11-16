@@ -82,6 +82,17 @@ export function sendPrincipal(from) {
 }
 
 /**
+ * The DSH session that sent a prompt, when its recorded sender is one: an
+ * agent's brief or follow-up (`open_session`, `prompt_session`), which DSH
+ * otherwise shows like something the owner typed in the Web UI.
+ * @param principal - the message's `source.principal`, if any.
+ * @returns the session id, or undefined for any other sender.
+ */
+export function senderSession(principal) {
+  return principal?.kind === 'dsh-session' ? nonEmpty(principal.id) : undefined
+}
+
+/**
  * A frozen copy of a message whose source records its sender.
  * @param message - the user message.
  * @param principal - its sender.

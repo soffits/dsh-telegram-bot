@@ -97,16 +97,18 @@ function makeBoards({ delayMs = 20, tickMs = 60_000, edit } = {}) {
   const labels = new Map()
   const posts = []
   const edits = []
+  const removed = []
   let clock = 1_000_000
   let nextId = 500
   const boards = createAgentBoards({
     parentOf: (id) => parents.get(id),
     topicOf: (id) => topics.get(id),
-    turnOf: (topic) => (topic.busy ? topic.turn : undefined),
+    showsTurn: (topic) => topic.busy,
     labelOf: async (_parent, child) => labels.get(child),
     modelOf: async () => 'claude-opus-5-5',
     post: async (topic, text) => {
-      nextId += 1
+      // Room for the messages a test notes in between, as in a real chat.
+      nextId += 10
       posts.push({ topic: topic.key, id: nextId, text })
       return nextId
     },
@@ -115,6 +117,7 @@ function makeBoards({ delayMs = 20, tickMs = 60_000, edit } = {}) {
       edits.push({ topic: topic.key, id: messageId, text, outcome })
       return outcome
     },
+    remove: async (topic, messageId) => { removed.push({ topic: topic.key, id: messageId }) },
     reportError: (scope, error) => { throw new Error(`${scope}: ${error}`) },
     now: () => clock,
     delayMs,
@@ -123,13 +126,13 @@ function makeBoards({ delayMs = 20, tickMs = 60_000, edit } = {}) {
   const topic = { key: '100:7001', busy: true, turn: 1 }
   topics.set('root', topic)
   return {
-    boards, parents, topics, labels, posts, edits, topic,
+    boards, parents, topics, labels, posts, edits, removed, topic,
     advance: (ms) => { clock += ms },
     child: (id, parent, label) => { parents.set(id, parent); if (label) labels.set(id, label) },
   }
 }
 
-test('subagents of a shown turn share one status message, edited as they start and finish', async () => {
+test('subagents share one status card, edited as they start and finish', async () => {
   const t = makeBoards()
   try {
     t.child('a', 'root', 'Research prices')
@@ -148,8 +151,8 @@ test('subagents of a shown turn share one status message, edited as they start a
     t.boards.onEnd({ runId: 'r2', id: 'b', stopReason: 'cancelled' })
     await wait(60)
     assert.equal(t.edits.at(-1).text, '🤖 2 subagents · done, 1 failed\n✓ Research prices · claude-opus-5-5 · 30s\n✗ Check stock · claude-opus-5-5 · 30s · cancelled')
-    assert.equal(t.boards.boards.size, 0, 'a finished board is frozen')
-    // The next subagent, in the same turn or a later one, opens a new message.
+    assert.equal(t.boards.boards.size, 0, 'a finished card is frozen')
+    // The next subagent opens a new card.
     t.child('c', 'root', 'Summarize')
     await t.boards.onStart({ runId: 'r3', id: 'c' })
     await wait(60)
@@ -193,7 +196,7 @@ test('subagents of unbound sessions or of turns the topic is not showing stay qu
   }
 })
 
-test('a new turn gets its own board while the earlier one keeps running', async () => {
+test('subagents started in later turns join the running card instead of opening another', async () => {
   const t = makeBoards()
   try {
     t.child('a', 'root', 'Long research')
@@ -203,8 +206,92 @@ test('a new turn gets its own board while the earlier one keeps running', async 
     t.child('b', 'root', 'Quick check')
     await t.boards.onStart({ runId: 'r2', id: 'b' })
     await wait(60)
+    assert.equal(t.posts.length, 1, 'one card per topic')
+    assert.equal(t.edits.at(-1).text, '🤖 2 subagents · 2 running\n⏳ Long research · claude-opus-5-5 · <1m\n⏳ Quick check · claude-opus-5-5 · <1m')
+    // Started while no turn shows, a subagent still joins the card that is open.
+    t.topic.busy = false
+    t.child('c', 'root', 'Background sweep')
+    await t.boards.onStart({ runId: 'r3', id: 'c' })
+    await wait(60)
+    assert.equal(t.posts.length, 1)
+    assert.match(t.edits.at(-1).text, /^🤖 3 subagents · 3 running\n/u)
+  } finally {
+    t.boards.dispose()
+  }
+})
+
+test('a running card follows new messages to the bottom of the topic, once per burst', async () => {
+  const t = makeBoards()
+  try {
+    t.child('a', 'root', 'Research prices')
+    await t.boards.onStart({ runId: 'r1', id: 'a' })
+    await wait(60)
+    const first = t.posts[0].id
+    // Older messages, other topics and the card itself do not move it.
+    t.boards.noteMessage(t.topic.key, first - 3)
+    t.boards.noteMessage('100:9999', first + 50)
+    t.boards.noteMessage(t.topic.key, first)
+    await wait(60)
+    assert.equal(t.posts.length, 1)
+    // Two messages land below it: the card is sent again once, the old copy deleted.
+    t.boards.noteMessage(t.topic.key, first + 1)
+    t.boards.noteMessage(t.topic.key, first + 2)
+    await wait(60)
     assert.equal(t.posts.length, 2)
-    assert.equal(t.posts[1].text, '🤖 1 subagent · 1 running\n⏳ Quick check · claude-opus-5-5 · <1m')
+    assert.equal(t.posts[1].text, t.posts[0].text)
+    assert.deepEqual(t.removed, [{ topic: t.topic.key, id: first }])
+    assert.equal(t.edits.length, 0, 'moving is a new message, not an edit')
+    // Later changes edit the moved card.
+    t.boards.onEnd({ runId: 'r1', id: 'a', stopReason: 'completed' })
+    await wait(60)
+    assert.equal(t.edits.at(-1).id, t.posts[1].id)
+  } finally {
+    t.boards.dispose()
+  }
+})
+
+test('a finished card stays where it is as the final state', async () => {
+  const t = makeBoards()
+  try {
+    t.child('a', 'root', 'Research prices')
+    await t.boards.onStart({ runId: 'r1', id: 'a' })
+    await wait(60)
+    t.boards.onEnd({ runId: 'r1', id: 'a', stopReason: 'completed' })
+    // A message lands just as the last subagent finishes: the card is
+    // finished in place rather than moved.
+    t.boards.noteMessage(t.topic.key, t.posts[0].id + 1)
+    await wait(60)
+    assert.equal(t.posts.length, 1)
+    assert.equal(t.removed.length, 0)
+    assert.match(t.edits.at(-1).text, /^🤖 1 subagent · all done\n✓ Research prices/u)
+    t.boards.noteMessage(t.topic.key, t.posts[0].id + 2)
+    await wait(60)
+    assert.equal(t.posts.length, 1)
+    assert.equal(t.boards.boards.size, 0)
+  } finally {
+    t.boards.dispose()
+  }
+})
+
+test('a nested subagent is listed right under its parent, indented', async () => {
+  const t = makeBoards()
+  try {
+    t.child('a', 'root', 'Plan the trip')
+    t.child('b', 'root', 'Check the budget')
+    await t.boards.onStart({ runId: 'r1', id: 'a' })
+    await t.boards.onStart({ runId: 'r2', id: 'b' })
+    t.child('g', 'a', 'Find flights')
+    t.child('h', 'g', 'Compare fares')
+    await t.boards.onStart({ runId: 'r3', id: 'g' })
+    await t.boards.onStart({ runId: 'r4', id: 'h' })
+    await wait(60)
+    assert.equal(t.posts.at(-1).text, [
+      '🤖 4 subagents · 4 running',
+      '⏳ Plan the trip · claude-opus-5-5 · <1m',
+      '↳ ⏳ Find flights · claude-opus-5-5 · <1m',
+      '  ↳ ⏳ Compare fares · claude-opus-5-5 · <1m',
+      '⏳ Check the budget · claude-opus-5-5 · <1m',
+    ].join('\n'))
   } finally {
     t.boards.dispose()
   }

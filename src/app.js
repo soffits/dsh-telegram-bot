@@ -699,7 +699,9 @@ export function apply(ctx, config) {
     for (let attempt = 0; attempt < targets.length + 4; attempt += 1) {
       const target = targets[attempt % targets.length]
       try {
-        return await requestOnce(target, token, method, body, signal, timeoutMs, contentType)
+        const result = await requestOnce(target, token, method, body, signal, timeoutMs, contentType)
+        noteSent(method, payload, result)
+        return result
       } catch (error) {
         lastError = error
         if (signal.aborted) throw error
@@ -751,6 +753,34 @@ export function apply(ctx, config) {
       }
     }
     throw lastError ?? new Error(`Telegram ${method} failed`)
+  }
+
+  /**
+   * Tell the subagent cards about a message the bot sent, so a card that is
+   * no longer the newest message of its topic moves below it.
+   * @param method - Bot API method.
+   * @param payload - request fields (chat and topic).
+   * @param result - Bot API result.
+   */
+  function noteSent(method, payload, result) {
+    if (!/^(send|copy|forward)/u.test(method) || method === 'sendChatAction' || payload === null || typeof payload !== 'object') return
+    const chatId = payload.chat_id
+    if (typeof chatId !== 'number' && typeof chatId !== 'string') return
+    const messages = (Array.isArray(result) ? result : [result]).filter((message) => Number.isSafeInteger(message?.message_id))
+    if (messages.length === 0) return
+    let threadId = Number.isSafeInteger(payload.message_thread_id) ? payload.message_thread_id : undefined
+    if (threadId === undefined && Number.isSafeInteger(payload.direct_messages_topic_id)) {
+      const prefix = `${chatId}:`
+      const key = Object.keys(state.directTopics ?? {}).find((candidate) => candidate.startsWith(prefix) && state.directTopics[candidate] === payload.direct_messages_topic_id)
+      if (key !== undefined) threadId = Number(key.slice(prefix.length))
+    }
+    const topicKey = `${chatId}:${threadId ?? 0}`
+    // Never let the card bookkeeping fail the send that just succeeded.
+    try {
+      for (const message of messages) agentBoards.noteMessage(topicKey, message.message_id)
+    } catch (error) {
+      reportError('subagent status', error)
+    }
   }
 
   /**
@@ -5336,6 +5366,10 @@ export function apply(ctx, config) {
     })
     const directTopicId = message.direct_messages_topic?.topic_id
     const threadId = message.message_thread_id ?? inferredTopicId(message)
+    // A new message in the topic pushes its subagent card down.
+    if (type !== 'edited_message' && chat !== undefined && Number.isSafeInteger(message.message_id)) {
+      agentBoards.noteMessage(`${chat.id}:${threadId ?? 0}`, message.message_id)
+    }
     const announced = topicNameOf(message)
     try {
       if (chat !== undefined && chatAllowed(chat, allowedChatsOf(config))) {
@@ -6833,16 +6867,17 @@ export function apply(ctx, config) {
     return () => outbox.stop()
   }, 'dsh-telegram-bot: outbox')
 
-  // Subagents started by a turn the topic shows get one status message per
-  // batch (src/agents.js).
+  // Subagents a topic's session starts share one status card at the bottom of
+  // the topic (src/agents.js).
   const agentBoards = createAgentBoards({
     parentOf: (id) => ctx.get('agents')?.get(id)?.session?.header?.parentSession,
     topicOf: (sessionId) => (lifetime === undefined ? undefined : chatForSession(sessionId)),
-    turnOf: (chat) => (chat.busy && !chat.done ? chat.turnEpoch : undefined),
+    showsTurn: (chat) => chat.busy && !chat.done,
     labelOf: subagentLabel,
     modelOf: async (id) => (await sessionModelOf(ctx, id).catch(() => undefined))?.model,
     post: postAgentStatus,
     edit: editAgentStatus,
+    remove: (chat, messageId) => deleteMessage(chat.chatId, chat.threadId, messageId),
     reportError,
     tr,
   })

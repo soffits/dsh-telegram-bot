@@ -48,7 +48,7 @@ import { agentsListText, childState, collectSubagents, createAgentBoards, report
 import { deliveredToTopic, hasBotPreamble, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, leadingWords, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor, withoutContextBlocks, withoutSenderLine } from './topics.js'
 import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.js'
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
-import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference } from './message-context.js'
+import { composePrompt, describeForward, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference } from './message-context.js'
 import { createSentLog } from './sent-log.js'
 import { catalogKey, createModelCatalog, defaultModelOf, effortChoices, effortName, findModel, isGoneModel, modelByKey, modelName, pageOf, pickedSelection, providerByKey, sameSelection, sessionModelOf } from './models.js'
 import {
@@ -2980,11 +2980,11 @@ export function apply(ctx, config) {
         const id = randomUUID()
         telegramMessageIds.add(id)
         principals.remember(id, details)
-        const { principal } = details
+        const { principal, envelope } = details
         // With a request id and a zone on the source, DSH's clock context reads
         // times in the sender's zone, as it does for a Web prompt.
         const rpcId = Number.isSafeInteger(messageId) ? promptRequestId(chat.chatId, messageId) : undefined
-        agent.followup({ id, role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user', ...(rpcId === undefined ? {} : { rpcId }), ...(rpcId === undefined || zone === undefined ? {} : { clientTimeZone: zone }), ...(principal === undefined ? {} : { principal }) } })
+        agent.followup({ id, role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user', ...(rpcId === undefined ? {} : { rpcId }), ...(rpcId === undefined || zone === undefined ? {} : { clientTimeZone: zone }), ...(principal === undefined ? {} : { principal }), ...(envelope === undefined ? {} : { envelope }) } })
       }
       // The turn/end listener finalizes the Telegram turn. whenIdle is only a
       // fallback for the turn that started this epoch, never a queued turn.
@@ -6240,34 +6240,36 @@ export function apply(ctx, config) {
       }
     }
     const timeZone = messageTimeZone()
-    let { context, text } = composePrompt(message, { botId: me?.id, ownFile, replyFile, sent, currentSession, formatDate: (seconds) => formatTelegramDate(seconds, timeZone) })
+    let { text, replyTo, forwardedFrom } = composePrompt(message, { botId: me?.id, ownFile, replyFile, sent, currentSession, formatDate: (seconds) => formatTelegramDate(seconds, timeZone) })
     // A recording speaks for itself through its transcript, a sticker through its note.
     if (ownFile && !forwarded && spokenMediaOf(message) === undefined && message.sticker === undefined && messageBody(message).trim().length === 0) {
       text = tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
     }
-    // A prompt is never empty: with nothing else to send, the context is the prompt.
-    if (text.length === 0 && attachments.length === 0 && context !== undefined) {
-      text = context
-      context = undefined
+    // A prompt is never empty: a bare reply or forward with nothing the bot
+    // can attach still reaches the agent, its context in the envelope.
+    if (text.length === 0 && attachments.length === 0 && (replyTo !== undefined || forwardedFrom !== undefined)) {
+      text = '(no text)'
     }
+    // The line a later forward keeps next to its text when forwards are sent together.
+    const forwardLine = forwardedFrom === undefined ? undefined : describeForward(message, { botId: me?.id, ownFile, formatDate: (seconds) => formatTelegramDate(seconds, timeZone) })
     // An edited message is the text as of its edit.
-    return { text, context, attachments, messageId: message.message_id, from: message.from, date: message.edit_date ?? message.date }
+    return { text, replyTo, forwardedFrom, forwardLine, attachments, messageId: message.message_id, from: message.from, date: message.edit_date ?? message.date }
   }
 
   /**
-   * Keep who wrote a Telegram message, when, and the context of its prompt,
-   * until the prompt reaches DSH.
+   * Keep who wrote a Telegram message, when, and what it replies to or
+   * forwards, until the prompt reaches DSH.
    * @param chatId - Telegram chat.
-   * @param prompt - `{ messageId, from, context, date }` from `promptFrom`.
+   * @param prompt - `{ messageId, from, replyTo, forwardedFrom, date }` from `promptFrom`.
    */
-  function rememberPrompt(chatId, { messageId, from, context, date }) {
+  function rememberPrompt(chatId, { messageId, from, replyTo, forwardedFrom, date }) {
     if (!Number.isSafeInteger(messageId)) return
     const sender = from === null ? undefined : from
     const sent = typeof date === 'number' && Number.isFinite(date) ? date : undefined
-    if (sender === undefined && context === undefined && sent === undefined) return
+    if (sender === undefined && replyTo === undefined && forwardedFrom === undefined && sent === undefined) return
     const key = `${chatId}:${messageId}`
     promptSenders.delete(key)
-    promptSenders.set(key, { from: sender, context, date: sent })
+    promptSenders.set(key, { from: sender, replyTo, forwardedFrom, date: sent })
     if (promptSenders.size > 1024) promptSenders.delete(promptSenders.keys().next().value)
   }
 
@@ -6288,18 +6290,23 @@ export function apply(ctx, config) {
   }
 
   /**
-   * What the notice before a Telegram message's prompt says, and the sender
-   * recorded on it.
+   * The metadata recorded on a Telegram message's prompt: its sender, and its
+   * envelope (when it was sent, what it replies to, where a forward comes
+   * from), which dsh-message-context shows the model.
    * @param chat - the topic the prompt runs in.
    * @param messageId - Telegram message id.
-   * @returns `{ principal, context, sentAt }`, each undefined when not known.
+   * @returns `{ principal, envelope }`, each undefined when not known.
    */
   function promptDetails(chat, messageId) {
     const entry = promptSenders.get(`${chat.chatId}:${messageId}`)
+    const envelope = {
+      ...(typeof entry?.date === 'number' ? { sentAt: entry.date * 1000 } : {}),
+      ...(entry?.replyTo === undefined ? {} : { replyTo: entry.replyTo }),
+      ...(entry?.forwardedFrom === undefined ? {} : { forwardedFrom: entry.forwardedFrom }),
+    }
     return {
       principal: promptPrincipal(chat, messageId),
-      context: entry?.context,
-      sentAt: formatTelegramDate(entry?.date, messageTimeZone()),
+      envelope: Object.keys(envelope).length === 0 ? undefined : envelope,
     }
   }
 
@@ -6326,8 +6333,8 @@ export function apply(ctx, config) {
    * @param signal - runtime lifetime.
    */
   async function dispatchPrompt(chatState, chatId, threadId, prompt, signal) {
-    // Who is writing, and what the message replies to or forwards, reach the
-    // model as a notice before the prompt (see `senderNotice`).
+    // Who is writing, when, and what the message replies to or forwards are
+    // recorded on the prompt's source (see `promptDetails`).
     rememberPrompt(chatId, prompt)
     const route = routeMessage({ threadId, inSession: typeof chatState.sessionId === 'string' })
     if (route === 'new-topic') {
@@ -6368,12 +6375,12 @@ export function apply(ctx, config) {
       forwardBatches.delete(key)
       if (signal.aborted) return
       const prompts = batch.prompts
-      // The first forward's origin goes in the notice; later ones stay next
+      // The first forward's origin goes in the envelope; later ones stay next
       // to their own text, so each text keeps its origin.
       const [first, ...rest] = prompts
       const merged = {
-        text: [first.text, ...rest.map((item) => [item.context, item.text].filter((part) => typeof part === 'string' && part.length > 0).join('\n'))].filter((text) => text.length > 0).join('\n\n'),
-        context: first.context,
+        text: [first.text, ...rest.map((item) => [item.forwardLine, item.text].filter((part) => typeof part === 'string' && part.length > 0).join('\n'))].filter((text) => text.length > 0).join('\n\n'),
+        forwardedFrom: first.forwardedFrom,
         attachments: prompts.flatMap((item) => item.attachments),
         messageId: first.messageId,
         from: first.from,

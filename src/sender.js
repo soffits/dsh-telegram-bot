@@ -11,14 +11,12 @@
  * known; the other fields depend on the kind. None carries a credential, so
  * all are safe in a session log.
  *
- * The model learns the sender, when the message was sent, and the context of
- * the message (what it replies to, where a forward comes from), from a notice
- * message placed right before the prompt, not from lines inside the prompt: DSH titles a session
- * from the first words of its first human message, and those must be the
- * person's own.
+ * When the message was sent, what it replies to and where a forward comes
+ * from go on `source.envelope`, the metadata dsh-message-context renders for
+ * the model. The bot never adds them to the text: DSH titles a session from
+ * the first words of its first human message, and those must be the person's
+ * own.
  */
-
-import { randomUUID } from 'node:crypto'
 
 /** Remembered prompts waiting for their step; the oldest go first past this. */
 export const MAX_PENDING_PRINCIPALS = 1024
@@ -93,61 +91,23 @@ export function senderSession(principal) {
 }
 
 /**
- * A frozen copy of a message whose source records its sender.
+ * A frozen copy of a message whose source records its sender and envelope.
+ * Fields the message already has are kept.
  * @param message - the user message.
- * @param principal - its sender.
- * @returns the copy; the message itself when there is no principal.
+ * @param metadata - `{ principal, envelope }`, each optional.
+ * @returns the copy; the message itself when there is nothing to add.
  */
-export function withPrincipal(message, principal) {
-  if (principal === undefined) return message
-  return Object.freeze({ ...message, source: Object.freeze({ ...message.source, principal: deepFreeze(principal) }) })
-}
-
-/** Source kind of the sender notice before each Telegram prompt. */
-export const SENDER_NOTICE_KIND = 'telegram-sender'
-
-/**
- * The line that tells the model who wrote a Telegram message and when. Several
- * allowed users can talk to the same bot, each in their own chat, and a
- * message can reach the agent long after it was sent (a queued message, a
- * backlog after a restart), so the time is Telegram's own.
- * @param principal - a `telegram-user` principal.
- * @param sentAt - when the message was sent, as text (see `formatMoment`).
- * @returns a one-line label, or undefined with neither a Telegram sender nor a time.
- */
-export function senderLabel(principal, sentAt) {
-  const time = nonEmpty(sentAt) === undefined ? '' : `, sent ${sentAt.trim()}`
-  if (principal?.kind !== 'telegram-user' || principal.id === undefined) {
-    return time === '' ? undefined : `[Telegram message${time}]`
-  }
-  const details = []
-  if (nonEmpty(principal.username) !== undefined) details.push(`@${principal.username}`)
-  details.push(`user id ${principal.id}`)
-  const name = nonEmpty(principal.name)
-  return name !== undefined ? `[Telegram message from ${name} (${details.join(', ')})${time}]` : `[Telegram message from ${details.join(', ')}${time}]`
-}
-
-/**
- * The notice that comes before a prompt: who sent it, when, and the context
- * the bot adds around it. It is its own message with a producer source, so
- * DSH's title input and readers of human messages see only what the person
- * wrote.
- * @param message - a user message entering a step.
- * @param details - `{ context, sentAt }`: context blocks for this prompt (see
- *   `composePrompt`) and when it was sent, as text; both optional.
- * @returns the notice, or undefined with no sender, time or context.
- */
-export function senderNotice(message, { context, sentAt } = {}) {
-  if (message?.source?.kind !== 'user') return undefined
-  const label = senderLabel(message.source.principal, sentAt)
-  const extra = typeof context === 'string' && context.trim().length > 0 ? context : undefined
-  if (label === undefined && extra === undefined) return undefined
-  const text = [label, extra].filter((part) => part !== undefined).join('\n')
-  return deepFreeze({
-    id: randomUUID(),
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: SENDER_NOTICE_KIND, form: 'notice', summary: label ?? text.split('\n')[0] },
+export function withMetadata(message, { principal, envelope } = {}) {
+  const addPrincipal = principal !== undefined && message.source.principal === undefined
+  const addEnvelope = envelope !== undefined && message.source.envelope === undefined
+  if (!addPrincipal && !addEnvelope) return message
+  return Object.freeze({
+    ...message,
+    source: Object.freeze({
+      ...message.source,
+      ...(addPrincipal ? { principal: deepFreeze(principal) } : {}),
+      ...(addEnvelope ? { envelope: deepFreeze(envelope) } : {}),
+    }),
   })
 }
 
@@ -160,26 +120,28 @@ function deepFreeze(value) {
 }
 
 /**
- * Principals for prompts the bot hands to DSH's session controller, which
- * builds the message itself. The bot remembers the sender by request id
- * before the hand-over; `preStep`, an `agent/pre-step` listener, records it
- * on the message as it enters a step, so it is in the session log with the
- * message (DSH lets that hook replace the messages of a step).
+ * Metadata for prompts the bot hands to DSH's session controller, which
+ * builds the message itself. The bot remembers the sender and envelope by
+ * request id before the hand-over; `preStep`, an `agent/pre-step` listener,
+ * records them on the message as it enters a step, so they are in the
+ * session log with the message (DSH lets that hook replace the messages of a
+ * step). It is registered without `prepend`, so a renderer that is prepended
+ * sees what it recorded.
  * @param limit - most principals remembered at once.
  */
 export function createPrincipalTagger(limit = MAX_PENDING_PRINCIPALS) {
   const pending = new Map()
   return {
     /**
-     * Remember the sender, send time and context of the prompt with this
-     * request id (or, for a message the bot builds itself, this message id).
+     * Remember the sender and envelope of the prompt with this request id
+     * (or, for a message the bot builds itself, this message id).
      * @param requestId - the request or message id.
-     * @param details - `{ principal, context, sentAt }`, each optional.
+     * @param metadata - `{ principal, envelope }`, each optional.
      */
-    remember(requestId, { principal, context, sentAt } = {}) {
-      if (typeof requestId !== 'string' || (principal === undefined && context === undefined && sentAt === undefined)) return
+    remember(requestId, { principal, envelope } = {}) {
+      if (typeof requestId !== 'string' || (principal === undefined && envelope === undefined)) return
       pending.delete(requestId)
-      pending.set(requestId, { principal, context, sentAt })
+      pending.set(requestId, { principal, envelope })
       if (pending.size > limit) pending.delete(pending.keys().next().value)
     },
     /** Pending prompts, for tests. */
@@ -187,8 +149,8 @@ export function createPrincipalTagger(limit = MAX_PENDING_PRINCIPALS) {
       return pending.size
     },
     /**
-     * `agent/pre-step` listener: record remembered senders on the step's
-     * messages and put each prompt's notice (sender, time and context) before it.
+     * `agent/pre-step` listener: record remembered senders and envelopes on
+     * the step's messages.
      */
     async preStep(_payload, next) {
       const decision = await next()
@@ -201,14 +163,10 @@ export function createPrincipalTagger(limit = MAX_PENDING_PRINCIPALS) {
         const key = !user ? undefined : (typeof message.source.rpcId === 'string' && pending.has(message.source.rpcId) ? message.source.rpcId : message.id)
         const entry = typeof key === 'string' ? pending.get(key) : undefined
         if (entry !== undefined) pending.delete(key)
-        if (entry?.principal !== undefined && message.source.principal === undefined) {
-          message = withPrincipal(message, entry.principal)
-          changed = true
-        }
-        const notice = senderNotice(message, entry)
-        if (notice !== undefined) {
-          messages.push(notice)
-          changed = true
+        if (entry !== undefined) {
+          const tagged = withMetadata(message, entry)
+          if (tagged !== message) changed = true
+          message = tagged
         }
         messages.push(message)
       }

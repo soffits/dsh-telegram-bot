@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { enqueue, waitForResult } from '../src/outbox.js'
-import { deliveredToTopic, isAutoCommandTopic, isTopicGone, resolveSendTarget, resolveTopicTarget, topicNameOf, topicTargetFor } from '../src/topics.js'
+import { deliveredToTopic, isAutoCommandTopic, isTopicGone, resolveSendTarget, resolveTopicTarget, topicNameOf, topicTargetFor, uploadMethod } from '../src/topics.js'
 
 test('topic names are learned from creation and rename messages', () => {
   assert.deepEqual(topicNameOf({ forum_topic_created: { name: 'Build' } }), { name: 'Build', authoritative: true })
@@ -94,4 +94,16 @@ test('delivery checks require evidence of the target topic', () => {
   assert.equal(deliveredToTopic({}, {}, 200, 7001, { message_id: 1 }), false)
   // A channel direct-messages chat may use a distinct direct topic id.
   assert.equal(deliveredToTopic({}, { '200:7001': 2597 }, 200, 7001, { direct_messages_topic: { topic_id: 2597 } }), true)
+})
+
+test('files upload with the method that shows their type', () => {
+  assert.deepEqual(uploadMethod('a.PNG', 100), { method: 'sendPhoto', field: 'photo' })
+  assert.deepEqual(uploadMethod('a.png', 11 * 1024 * 1024), { method: 'sendDocument', field: 'document' }, 'too big for a photo')
+  assert.deepEqual(uploadMethod('a.gif', 100), { method: 'sendAnimation', field: 'animation' })
+  assert.deepEqual(uploadMethod('a.ogg', 100), { method: 'sendAudio', field: 'audio' })
+  assert.deepEqual(uploadMethod('a.ogg', 100, true), { method: 'sendVoice', field: 'voice' })
+  assert.deepEqual(uploadMethod('a.mp3', 100, true), { method: 'sendAudio', field: 'audio' }, 'only Opus/Ogg can be a voice message')
+  assert.deepEqual(uploadMethod('a.mp4', 100), { method: 'sendVideo', field: 'video' })
+  assert.deepEqual(uploadMethod('report', 100), { method: 'sendDocument', field: 'document' })
+  assert.deepEqual(uploadMethod('notes.txt', 100), { method: 'sendDocument', field: 'document' })
 })

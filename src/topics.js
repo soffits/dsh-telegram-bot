@@ -338,3 +338,30 @@ export function resolveTopicTarget(names, chatId, target) {
   const list = known.map((entry) => `"${entry.name}" (${entry.threadId})`).join(', ')
   throw new Error(`Unknown Telegram topic "${raw}". ${list.length > 0 ? `Known topics: ${list}.` : 'The bot knows no topic names yet.'} Rename the topic in Telegram or with /rename so the bot learns its name, or send to its thread id (/id in the topic).`)
 }
+
+/** Extensions per Telegram upload kind, for files sent into a topic. */
+const UPLOAD_KINDS = [
+  { method: 'sendPhoto', field: 'photo', extensions: ['.jpg', '.jpeg', '.png', '.webp'], maxBytes: 10 * 1024 * 1024 },
+  { method: 'sendAnimation', field: 'animation', extensions: ['.gif'] },
+  { method: 'sendVoice', field: 'voice', extensions: ['.ogg', '.oga', '.opus'], voiceOnly: true },
+  { method: 'sendAudio', field: 'audio', extensions: ['.mp3', '.m4a', '.aac', '.flac', '.wav', '.ogg', '.oga', '.opus'] },
+  { method: 'sendVideo', field: 'video', extensions: ['.mp4', '.mov', '.webm', '.mkv'] },
+]
+
+/**
+ * The Bot API method that shows a file best: pictures inline, GIFs as
+ * animations, audio in the player (Opus/Ogg as a voice message when asked),
+ * video in the player, anything else as a document.
+ * @param name - file name.
+ * @param size - file size in bytes.
+ * @param asVoice - send Opus/Ogg audio as a voice message.
+ * @returns `{ method, field }`.
+ */
+export function uploadMethod(name, size, asVoice = false) {
+  const dot = name.lastIndexOf('.')
+  const extension = dot < 0 ? '' : name.slice(dot).toLowerCase()
+  const kind = UPLOAD_KINDS.find((entry) => entry.extensions.includes(extension)
+    && (entry.voiceOnly !== true || asVoice)
+    && (entry.maxBytes === undefined || size <= entry.maxBytes))
+  return kind === undefined ? { method: 'sendDocument', field: 'document' } : { method: kind.method, field: kind.field }
+}

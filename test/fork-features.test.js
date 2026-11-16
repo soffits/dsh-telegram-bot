@@ -2389,7 +2389,7 @@ test('the model picker lists providers, then their models, and a pick switches t
   }
 })
 
-test('subagents of a Telegram turn show in one status message, and /agents lists them with their report', async () => {
+test('subagents of a Telegram topic show in one status card that stays at the bottom, and /agents lists them with their report', async () => {
   const run = await start()
   try {
     run.telegram.push({ message_thread_id: 1, text: 'hello' })
@@ -2412,10 +2412,21 @@ test('subagents of a Telegram turn show in one status message, and /agents lists
     assert.equal(posted[0].body.message_thread_id, 7001)
     assert.equal(posted[0].body.disable_notification, true)
     assert.equal(posted[0].body.text, '🤖 1 subagent · 1 running\n⏳ Research prices · claude-opus-5-5 · <1m')
+    // A message lands in the topic below the card: the card is sent again
+    // under it, silently, and the copy above is deleted.
+    const moving = run.telegram.calls.length
+    run.telegram.push({ message_thread_id: 7001, text: 'and check the reviews too' })
+    await wait(1900)
+    const moved = run.telegram.calls.slice(moving).filter((call) => call.method === 'sendMessage' && String(call.body.text).startsWith('🤖'))
+    assert.equal(moved.length, 1, 'the card moves once')
+    assert.equal(moved[0].body.message_thread_id, 7001)
+    assert.equal(moved[0].body.disable_notification, true, 'no notification sound')
+    assert.equal(moved[0].body.text, posted[0].body.text)
+    assert.ok(run.telegram.calls.slice(moving).some((call) => call.method === 'deleteMessage' && call.body.message_id === posted[0].result.message_id), 'the old card is deleted')
     child.status = 'idle'
     child.emit('subagent/end', { runId: 'run-a', provider: 'spawn', id: 'child-a', local: true, stopReason: 'completed' })
     await wait(1700)
-    const edited = run.telegram.calls.slice(before).filter((call) => call.method === 'editMessageText' && call.body.message_id === posted[0].result.message_id)
+    const edited = run.telegram.calls.slice(before).filter((call) => call.method === 'editMessageText' && call.body.message_id === moved[0].result.message_id)
     assert.equal(edited.length, 1)
     assert.match(edited[0].body.text, /^🤖 1 subagent · all done\n✓ Research prices · claude-opus-5-5 · \d+s$/u)
     // The topic's turn ends; /agents reads the catalog and the child's log.

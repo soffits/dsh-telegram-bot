@@ -1,7 +1,7 @@
 import './setup-home.js'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createPrincipalTagger, senderLabel, senderNotice, sendPrincipal, telegramUserPrincipal, withPrincipal } from '../src/sender.js'
+import { createPrincipalTagger, senderLabel, senderNotice, senderSession, sendPrincipal, telegramUserPrincipal, withPrincipal } from '../src/sender.js'
 
 test('a Telegram user principal names the user and the topic, without empty fields', () => {
   assert.deepEqual(
@@ -82,4 +82,11 @@ test('the tagger keeps a send time remembered without a sender', async () => {
   assert.equal(decision.messages[1], prompt)
   tagger.remember('nothing', {})
   assert.equal(tagger.size, 0)
+})
+
+test('only a dsh-session principal names a sending session', () => {
+  assert.equal(senderSession({ kind: 'dsh-session', channel: 'dsh', id: 'session-1' }), 'session-1')
+  assert.equal(senderSession({ kind: 'dsh-session', channel: 'dsh', id: ' ' }), undefined)
+  assert.equal(senderSession({ kind: 'oidc-user', channel: 'web', id: 'sub' }), undefined)
+  assert.equal(senderSession(undefined), undefined)
 })

@@ -2447,3 +2447,75 @@ test('subagents of a Telegram topic show in one status card that stays at the bo
     run.stop()
   }
 })
+
+/** Stream one text block of the running turn, as DSH does before recording it. */
+async function streamText(agent, text) {
+  agent.emit('agent/assistant-stream', { agent, frame: { type: 'chunk', chunk: { type: 'block-start', blockType: 'text' } } })
+  agent.emit('agent/assistant-stream', { agent, frame: { type: 'chunk', chunk: { type: 'text-delta', text } } })
+  await wait(300)
+}
+
+/** Ids of the messages that ever showed `text` (as sent, Markdown-escaped). */
+const carrying = (calls, text) => new Set(calls
+  .filter((call) => (call.method === 'sendMessage' || call.method === 'editMessageText') && String(call.body.text).includes(text))
+  .map((call) => (call.method === 'sendMessage' ? call.result?.message_id : call.body.message_id)))
+
+test('the reply to a Telegram message sent into a running turn goes below that message', async () => {
+  const run = await start()
+  try {
+    const agent = await runningTelegramTurn(run)
+    agent.session.log = agent.session.events
+    const placeholder = run.telegram.calls.filter((call) => call.method === 'sendMessage' && String(call.body.text).includes('Generating')).at(-1).result.message_id
+    await streamText(agent, 'First answer.')
+    agent.session.append('assistant/message', { turn: 2, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'First answer.' }] } })
+    run.telegram.push({ message_thread_id: 7001, text: 'also check the reviews' })
+    await wait(150)
+    const interjection = reactions(run.telegram.calls).at(-1).body.message_id
+    assert.ok(interjection > placeholder)
+    // DSH takes the message at the next step; the answer so far stays above it.
+    agent.session.append('user/message', { ...agent.steered[0] })
+    await wait(100)
+    await streamText(agent, 'Reviews are good.')
+    agent.session.append('assistant/message', { turn: 2, step: 2, message: { role: 'assistant', content: [{ type: 'text', text: 'Reviews are good.' }] } })
+    agent.session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    await wait(300)
+    const calls = run.telegram.calls
+    const above = calls.filter((call) => call.method === 'editMessageText' && call.body.message_id === placeholder).map((call) => call.body.text)
+    assert.match(above.at(-1), /First answer/u)
+    assert.ok(!above.some((text) => text.includes('Reviews are good')), 'the reply to it is not written above it')
+    const below = [...carrying(calls, 'Reviews are good')]
+    assert.ok(below.length > 0 && below.every((id) => id > interjection), `reply in ${below} after ${interjection}`)
+  } finally {
+    run.stop()
+  }
+})
+
+test('a Web message sent into a running turn shows at once, and the reply goes below it', async () => {
+  const run = await start()
+  try {
+    const agent = await runningTelegramTurn(run)
+    agent.session.log = agent.session.events
+    const placeholder = run.telegram.calls.filter((call) => call.method === 'sendMessage' && String(call.body.text).includes('Generating')).at(-1).result.message_id
+    await streamText(agent, 'Working on it.')
+    agent.session.append('assistant/message', { turn: 2, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'Working on it.' }, { type: 'tool-call', id: 'c1', name: 'bash', input: {} }] } })
+    const web = { id: 'web-2', role: 'user', content: [{ type: 'text', text: 'use the blue one' }], source: { kind: 'user', rpcId: 'rpc-web-2' } }
+    agent.session.append('agent/inbox/spliced', { target: 'next-step', start: 0, inserted: [web] })
+    await wait(100)
+    const mirrored = run.telegram.calls.filter((call) => call.method === 'sendMessage' && String(call.body.text).includes('use the blue one'))
+    assert.equal(mirrored.length, 1, 'shown when it was sent')
+    assert.match(mirrored[0].body.text, /From Web/u)
+    agent.session.append('user/message', web)
+    await wait(100)
+    assert.equal(run.telegram.calls.filter((call) => call.method === 'sendMessage' && String(call.body.text).includes('use the blue one')).length, 1, 'and only once')
+    await streamText(agent, 'Switched to blue.')
+    agent.session.append('assistant/message', { turn: 2, step: 2, message: { role: 'assistant', content: [{ type: 'text', text: 'Switched to blue.' }] } })
+    agent.session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    await wait(300)
+    const calls = run.telegram.calls
+    assert.ok(calls.some((call) => call.method === 'deleteMessage' && call.body.message_id === placeholder), 'the reply above held only narration, so it goes')
+    const below = [...carrying(calls, 'Switched to blue')]
+    assert.ok(below.length > 0 && below.every((id) => id > mirrored[0].result.message_id), `reply in ${below} after ${mirrored[0].result.message_id}`)
+  } finally {
+    run.stop()
+  }
+})

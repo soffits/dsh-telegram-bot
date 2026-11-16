@@ -42,7 +42,7 @@ import { clientTimeZone, formatTelegramDate, resolveTimeZone } from './clock.js'
 import { loadState, STATE_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
-import { messageAnswer, turnAnswer } from './final-text.js'
+import { answerSegments, isInterjection, messageAnswer, turnAnswer } from './final-text.js'
 import { createOutbox } from './outbox.js'
 import { agentsListText, childState, collectSubagents, createAgentBoards, reportOf } from './agents.js'
 import { deliveredToTopic, hasBotPreamble, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, leadingWords, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor, withoutContextBlocks, withoutSenderLine } from './topics.js'
@@ -2170,9 +2170,10 @@ export function apply(ctx, config) {
   async function flushChat(chat) {
     // A goal round being adopted is still sending its placeholders.
     if (chat.done || chat.adopting) return
-    // A mirrored turn has no "Generating" placeholder; its first flush sends
-    // the answer message.
-    if (chat.messageId === null && chat.turnSource !== 'mirror') return
+    // A mirrored turn has no "Generating" placeholder, and a turn whose reply
+    // was split by a message sent into it has none below that message; their
+    // first flush sends the answer message.
+    if (chat.messageId === null && chat.turnSource !== 'mirror' && !answerSplit(chat)) return
     const raw = renderChat(chat)
     if (raw.length === 0) return
     const next = toTelegramMarkdown(raw)
@@ -2560,17 +2561,69 @@ export function apply(ctx, config) {
     startTyping(chat)
   }
 
+  /** Whether the shown turn's reply was split by a message sent into it. */
+  function answerSplit(chat) {
+    return chat.activeTurn !== undefined && chat.splitTurn === chat.activeTurn
+  }
+
+  /**
+   * Close the reply shown so far, because a message was sent into the turn
+   * below it: the reply message keeps the answers given before that message
+   * (or goes, when there were none), and the live reply, thinking and tool
+   * messages start again under it.
+   * @param chat - topic state.
+   */
+  function splitAnswer(chat) {
+    const turn = chat.activeTurn
+    let text
+    if (chat.turnSource === 'mirror') {
+      text = (chat.mirrorTexts?.get(turn) ?? []).join('\n\n').trim()
+      chat.mirrorTexts?.set(turn, [])
+    } else {
+      text = answerSegments(chat.boundAgent?.session?.log, turn).at(-2) ?? ''
+    }
+    text = withoutSilentMarker(text)
+    const messageId = chat.messageId
+    const thinkingId = chat.thinkingMessageId
+    const toolId = chat.toolMessageId
+    chat.splitTurn = turn
+    chat.messageId = null
+    chat.text = ''
+    chat.lastText = ''
+    clearEditTimer(chat)
+    resetAux(chat)
+    chat.toolEpoch = (chat.toolEpoch ?? 0) + 1
+    chat.answerEdit = (chat.answerEdit ?? Promise.resolve()).catch(() => {}).then(async () => {
+      if (thinkingId !== null) await deleteMessage(chat.chatId, chat.threadId, thinkingId)
+      if (toolId !== null) await deleteMessage(chat.chatId, chat.threadId, toolId)
+      if (text.length === 0) {
+        if (messageId !== null) await deleteMessage(chat.chatId, chat.threadId, messageId)
+        return
+      }
+      const chunks = splitAnswerText(text)
+      const edited = messageId !== null && await editAnswer(chat.chatId, messageId, chunks[0], bridgeAbort.signal, chat.threadId)
+      if (!edited) await sendAnswer(chat.chatId, chunks[0], bridgeAbort.signal, chat.threadId)
+      for (const chunk of chunks.slice(1)) await sendAnswer(chat.chatId, chunk, bridgeAbort.signal, chat.threadId)
+    }).catch((error) => reportError('split-answer', error))
+  }
+
   /**
    * Show a user message that reached the session from another client.
    * Messages the bridge itself submitted are skipped, so nothing echoes back.
    * @param chat - topic state.
    * @param message - durable user message.
    */
-  function mirrorUserMessage(chat, message) {
+  function mirrorUserMessage(chat, message, queued = false) {
     const source = message?.source
+    // Shown when it entered the session's inbox; DSH records it later.
+    if (queued) {
+      if (chat.mirroredQueued?.has(message?.id)) return
+    } else if (chat.mirroredQueued?.delete(message?.id)) {
+      return
+    }
     let label
     if (source?.kind === 'user') {
-      if (telegramMessageIds.delete(message.id)) return
+      if (queued ? telegramMessageIds.has(message.id) : telegramMessageIds.delete(message.id)) return
       if (typeof source.rpcId === 'string' && source.rpcId.startsWith('telegram')) return
       label = tr('🖥 From Web', '🖥 Из Web')
     } else if (source?.kind === 'schedule') {
@@ -2585,6 +2638,12 @@ export function apply(ctx, config) {
     const files = content.filter((block) => block?.type === 'image' || block?.type === 'file').length
     if (text.length === 0 && files === 0) return
     const body = `${label}:\n${clipPreview(text, 3000)}${files === 0 ? '' : `\n📎 ${files}`}`
+    if (queued && typeof message.id === 'string') {
+      chat.mirroredQueued ??= new Set()
+      chat.mirroredQueued.add(message.id)
+      // Ids of queued messages that were withdrawn are never recorded.
+      if (chat.mirroredQueued.size > 200) chat.mirroredQueued.delete(chat.mirroredQueued.values().next().value)
+    }
     // Queue behind the answer stream so the prompt stays above its answer.
     chat.answerEdit = (chat.answerEdit ?? Promise.resolve())
       .then(() => sendPlain(chat.chatId, body, bridgeAbort.signal, chat.threadId))
@@ -2608,6 +2667,14 @@ export function apply(ctx, config) {
     if (event.type === 'turn/end' && chat.steerFollow === true && !hasPendingInput(ctx.get('agents')?.get(session.id))) {
       chat.steerFollow = false
     }
+    // A message sent into the turn after it started replying splits the reply:
+    // what was answered so far stays above that message, the rest goes below.
+    if (event.type === 'assistant/message' && !chat.done && chat.activeTurn !== undefined && event.data?.turn === chat.activeTurn) {
+      chat.repliedTurn = chat.activeTurn
+    } else if (event.type === 'user/message' && !chat.done && chat.activeTurn !== undefined
+      && chat.repliedTurn === chat.activeTurn && isInterjection(event.data)) {
+      splitAnswer(chat)
+    }
     if (event.type === 'deliverables/presented') {
       // Presented files show in the Web UI; send them to the topic too, for
       // Telegram turns and for mirrored ones.
@@ -2626,6 +2693,12 @@ export function apply(ctx, config) {
     }
     if (!follow) return
     const turn = event.data?.turn
+    // A message from another client shows when it is sent, not when the agent
+    // takes it at its next step.
+    if (event.type === 'agent/inbox/spliced') {
+      for (const message of Array.isArray(event.data?.inserted) ? event.data.inserted : []) mirrorUserMessage(chat, message, true)
+      return
+    }
     if (event.type === 'user/message') {
       mirrorUserMessage(chat, event.data)
       return

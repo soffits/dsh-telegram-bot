@@ -366,7 +366,45 @@ function localImagePaths(markdown) {
   return found
 }
 
+/**
+ * Cut one line of Telegram HTML to a number of visible characters: tags
+ * count for nothing, an entity (`&amp;`) for one, and every tag still open
+ * at the cut is closed, so the result always parses.
+ * @param html - one line of Telegram HTML.
+ * @param max - visible characters to keep.
+ * @returns the clipped line.
+ */
+function clipHtml(html, max) {
+  const open = []
+  let out = ''
+  let shown = 0
+  const tokens = String(html ?? '').match(/<[^>]*>|&[#\w]+;|[\s\S]/gu) ?? []
+  for (const token of tokens) {
+    if (token.startsWith('<') && token.length > 1) {
+      const closing = /^<\/(\w+)/u.exec(token)
+      if (closing !== null) {
+        if (open.at(-1) === closing[1]) open.pop()
+      } else {
+        const opening = /^<(\w+)/u.exec(token)
+        if (opening !== null && !token.endsWith('/>')) open.push(opening[1])
+      }
+      out += token
+      continue
+    }
+    if (shown >= max) break
+    out += token
+    shown += 1
+  }
+  // Tags opened right at the cut with nothing shown inside are dropped.
+  out = out.replace(/(?:<[a-z]+[^>]*>)+$/iu, (tail) => {
+    for (let i = (tail.match(/<[a-z]/giu) ?? []).length; i > 0; i -= 1) open.pop()
+    return ''
+  })
+  return out.trimEnd() + open.reverse().map((tag) => `</${tag}>`).join('')
+}
+
 export {
+  clipHtml,
   localImagePaths,
   splitTableRow,
   isTableSeparator,

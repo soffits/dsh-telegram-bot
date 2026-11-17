@@ -20,6 +20,7 @@ import {
 } from './constants.js'
 import { classifyError } from './errors.js'
 import {
+  clipHtml,
   clipPreview,
   compactToolValue,
   fitAnswerText,
@@ -660,12 +661,52 @@ export function apply(ctx, config) {
    */
   function noteRateLimit(chatId, retryAfter) {
     const key = String(chatId)
+    if (Number.isFinite(retryAfter)) {
+      floodUntil.set(key, Math.max(floodUntil.get(key) ?? 0, Date.now() + Math.max(1, retryAfter) * FLOOD_SECOND_MS))
+    }
     const state = outboundStates.get(key)
     if (state === undefined) return
     state.tokens = 0
     state.updatedAt = Date.now()
     state.intervalMs = Math.min(5000, Math.max(20, Math.ceil((retryAfter ?? 1) * 1000)))
     state.capacity = Math.min(state.capacity, 2)
+  }
+
+  /** One second of a Telegram retry_after; tests shrink it. */
+  const FLOOD_SECOND_MS = process.env.NODE_ENV === 'test' ? 10 : 1000
+  /** Per chat: when Telegram's flood control for it ends (epoch ms). */
+  const floodUntil = new Map()
+
+  /**
+   * How long one call may keep waiting out Telegram's flood control. A new
+   * message or file is something the reader would otherwise never get, so it
+   * waits for as long as Telegram asks within a generous bound; edits and the
+   * rest only update what is already there; "typing…" is not worth a wait.
+   * @param method - Bot API method.
+   * @returns the total wait allowed, in ms.
+   */
+  function floodPatienceMs(method) {
+    if (method === 'sendChatAction') return 0
+    if (/^(send|copy|forward)/u.test(method)) return 15 * 60 * FLOOD_SECOND_MS
+    return 3 * 60 * FLOOD_SECOND_MS
+  }
+
+  /**
+   * Wait until the chat's flood control is over before calling Telegram
+   * again, since calls made during it fail and extend it.
+   * @param chatId - target chat.
+   * @param method - Bot API method.
+   * @param signal - request lifetime.
+   */
+  async function waitOutFlood(chatId, method, signal) {
+    const remaining = (floodUntil.get(String(chatId)) ?? 0) - Date.now()
+    if (remaining <= 0) return
+    if (remaining > floodPatienceMs(method)) {
+      const error = new Error(`Too Many Requests: the chat is under flood control for ${Math.ceil(remaining / FLOOD_SECOND_MS)} s more`)
+      error.telegram = true
+      throw error
+    }
+    await sleep(remaining, signal)
   }
 
   /**
@@ -692,12 +733,14 @@ export function apply(ctx, config) {
     // while short requests still succeed.
     const targets = [undefined, '149.154.166.110', '149.154.167.220']
     let lastError
-    let rateLimitRetries = 0
+    let floodWaitedMs = 0
+    const chatId = payload !== null && typeof payload === 'object' && method !== 'getUpdates' ? payload.chat_id : undefined
     // Creating a topic is not idempotent: a timeout after Telegram committed
     // the topic must not be retried on another IP (that creates duplicates).
     const singleShot = method === 'createForumTopic'
     for (let attempt = 0; attempt < targets.length + 4; attempt += 1) {
       const target = targets[attempt % targets.length]
+      if (chatId !== undefined) await waitOutFlood(chatId, method, signal)
       try {
         const result = await requestOnce(target, token, method, body, signal, timeoutMs, contentType)
         noteSent(method, payload, result)
@@ -740,12 +783,16 @@ export function apply(ctx, config) {
             // private-chat topic, and the action is cosmetic.
             if (isTopicGone(error.message) && method !== 'sendChatAction') forgetGoneTopic(payload.chat_id, payload.message_thread_id ?? payload.direct_messages_topic_id, method)
           }
-          // Telegram asks the caller to back off explicitly. Retrying a few
-          // times keeps a final answer from being lost during bursts of edits.
-          if (Number.isFinite(error.retryAfter) && error.retryAfter <= 60 && rateLimitRetries < 3) {
-            rateLimitRetries += 1
-            await sleep((Math.max(1, error.retryAfter) + 1) * 1000, signal)
-            continue
+          // Flood control says when to send again: wait it out (waitOutFlood
+          // at the top of the loop) instead of dropping the message. The wait
+          // is not a failed route, so it does not use up an attempt.
+          if (Number.isFinite(error.retryAfter)) {
+            const waitMs = (Math.max(1, error.retryAfter) + 1) * FLOOD_SECOND_MS
+            if (floodWaitedMs + waitMs <= floodPatienceMs(method)) {
+              floodWaitedMs += waitMs
+              attempt -= 1
+              continue
+            }
           }
           throw error
         }
@@ -2362,7 +2409,7 @@ export function apply(ctx, config) {
       if (chat.done || chat.adopting || chat.tools.length === 0) return
       const epoch = chat.toolEpoch ?? 0
       const lines = chat.tools.slice(-5).map(formatToolCall).join('\n').split('\n')
-      if (lines.length > 0) lines[lines.length - 1] = lines.at(-1).slice(0, 26).trimEnd()
+      if (lines.length > 0) lines[lines.length - 1] = clipHtml(lines.at(-1), 26)
       const body = lines.join('\n')
       if (body === chat.toolLastText) return
       chat.toolLastText = body

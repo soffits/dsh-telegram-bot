@@ -4527,7 +4527,7 @@ export function apply(ctx, config) {
   async function deliverSessionTopic(record, chatId, signal) {
     try {
       const preview = await lastAssistantText(record.sessionId)
-      const title = record.title || await sessionTitle(record.sessionId)
+      const title = await sessionTitle(record.sessionId)
       const delivered = await sendKeyboardMarkdown(
         chatId,
         record.threadId,
@@ -4670,7 +4670,7 @@ export function apply(ctx, config) {
    * @returns topic title.
    */
   async function nextForkTitle(sourceId) {
-    const sourceTitle = state.sessions[sourceId]?.title || await sessionTitle(sourceId)
+    const sourceTitle = await sessionTitle(sourceId)
     const records = await ctx.get('sessionQuery')?.listSessions(bridgeAbort.signal)
     const branch = (records ?? []).filter((entry) => entry.header?.parentSession === sourceId).length + 1
     return shortLabel(`${sourceTitle} (${branch})`, 120)
@@ -5267,7 +5267,7 @@ export function apply(ctx, config) {
     const rows = [[{ text: tr('🆕 New session', '🆕 Новая сессия'), callback_data: `tn:${workspace.id}` }]]
     for (const record of records) {
       const id = record.header.id
-      const title = state.sessions[id]?.title || await sessionTitle(id, record.header)
+      const title = await sessionTitle(id, record.header)
       const boundHere = chatState.sessionId === id
       const boundElsewhere = !boundHere && Object.entries(state.threads).some(([key, bound]) => bound === id && key !== chatState.key)
       const mark = boundHere ? '✅' : boundElsewhere ? '🔗' : record.live ? '🟢' : '⚪'

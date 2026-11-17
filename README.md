@@ -103,6 +103,7 @@ Restart `dsh web` after installing or updating the plugin. Then open **Settings 
 | Show model thinking | Show reasoning in a temporary message |
 | Show tool calls | Show tool calls in a temporary message |
 | Show turns from other clients (`mirrorTurns`) | Mirror turns started outside Telegram into the bound topic; default on |
+| `mirrorAgentPrompts` | With `mirrorTurns`: also show the prompts other agent sessions send this session (their briefs are written for a model); default off. Messages typed in the Web UI and scheduled-task prompts are always shown |
 | `busyMessages` | `steer` (default): messages sent during a turn go into it; `queue`: they wait until the turn ends |
 | `transcriber` | `dsh` (default), `command` or `off`; see [Voice messages](#voice-messages) |
 | `transcribeLanguage` | Language hint for DSH speech-to-text, such as `zh` or `en`; empty uses its own setting |

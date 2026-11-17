@@ -69,6 +69,12 @@ export const Config = z.object({
    */
   mirrorTurns: z.boolean().default(true).volatile(),
   /**
+   * Also show the prompts other agent sessions send this session (`open_session`,
+   * `prompt_session`): briefs written for a model, off by default. Needs
+   * `mirrorTurns`.
+   */
+  mirrorAgentPrompts: z.boolean().default(false).volatile(),
+  /**
    * Telegram messages sent while the session's turn runs: `steer` sends them
    * into that turn (the agent sees them at its next step, like a message typed
    * in the Web UI during a turn); `queue` holds them until the turn ends.

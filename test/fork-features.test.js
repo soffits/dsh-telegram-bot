@@ -202,6 +202,8 @@ function makeTelegram() {
   /** Thread id -> Bot API error for every call into that topic. */
   const goneThreads = new Map()
   const undeletable = new Set()
+  /** Method -> retry_after values Telegram's flood control answers with, one per call, before it lets the method through. */
+  const floods = new Map()
   /** Chats `getChat` knows, by id. */
   const chats = new Map()
   let messageId = 0
@@ -256,6 +258,11 @@ function makeTelegram() {
         return chats.has(body.chat_id) ? deliver({ ok: true, result: chats.get(body.chat_id) }) : deliver({ ok: false, description: 'Bad Request: chat not found' })
       }
       calls.push({ method, body })
+      const flood = floods.get(method)?.shift()
+      if (flood !== undefined) {
+        calls.at(-1).flooded = true
+        return deliver({ ok: false, error_code: 429, description: `Too Many Requests: retry after ${flood}`, parameters: { retry_after: flood } })
+      }
       // A deleted topic is gone whichever field addresses it (private-chat
       // topics may be retried with direct_messages_topic_id).
       const topicField = body?.message_thread_id ?? body?.direct_messages_topic_id
@@ -307,7 +314,7 @@ function makeTelegram() {
     messageId += 1
     pending.push({ update_id: updateId, message: { message_id: messageId, date: 1, chat: { id: 100, type: 'private', first_name: 'Annie' }, from: { id: 42 }, ...message } })
   }
-  return { fake, calls, push, pushCallback, missingThreads, goneThreads, undeletable, chats }
+  return { fake, calls, push, pushCallback, missingThreads, goneThreads, undeletable, chats, floods }
 }
 
 /** Start the plugin against fresh fakes and an optional initial state. */
@@ -1813,6 +1820,72 @@ test('files presented in a Web turn are uploaded to the bound topic and logged',
   } finally {
     run.stop()
     await rm(files.dir, { recursive: true, force: true })
+  }
+})
+
+test('a file presented under flood control waits out a long retry_after and still reaches the topic', async () => {
+  const run = await start()
+  const files = await presentable()
+  try {
+    const agent = await runningTelegramTurn(run)
+    const session = { id: agent.id }
+    // Telegram asks for 70 s (0.7 s here): longer than the bot used to wait, so the file was dropped.
+    run.telegram.floods.set('sendPhoto', [70])
+    agent.emit('session/event', session, { type: 'deliverables/presented', data: { turn: 2, callId: 'c1', files: [{ path: files.png }] } })
+    await wait(100)
+    // A message sent meanwhile waits for the flood control to end instead of hitting it again.
+    const during = run.telegram.calls.length
+    const note = run.host.tools.get('telegram_send').execute({ thread: '7001', text: 'meanwhile' }, { agent: { id: 'someone-else' } })
+    await wait(300)
+    assert.equal(run.telegram.calls.slice(during).filter((call) => call.method === 'sendMessage' && call.body.text === 'meanwhile').length, 0, 'nothing is sent during flood control')
+    await note
+    await wait(700)
+    const photos = run.telegram.calls.filter((call) => call.method === 'sendPhoto' && call.body.message_thread_id === 7001)
+    assert.deepEqual(photos.map((call) => call.flooded === true), [true, false], 'one refused try, then the upload')
+    assert.ok(!texts(run.telegram.calls, 7001).some((text) => text.includes('Could not send')))
+    const log = JSON.parse(await readFile(join(STATUS_DIR, 'sent-messages.json'), 'utf8'))
+    assert.deepEqual(log.entries.filter((entry) => entry.label === 'present').map((entry) => entry.files), [['camel.png']])
+  } finally {
+    run.stop()
+    await rm(files.dir, { recursive: true, force: true })
+  }
+})
+
+test('"typing…" is not sent during flood control', async () => {
+  const run = await start()
+  try {
+    await runningTelegramTurn(run)
+    run.telegram.floods.set('sendMessage', [5000])
+    await run.host.tools.get('telegram_send').execute({ thread: '7001', text: 'hit the limit' }, { agent: { id: 'someone-else' } }).catch(() => {})
+    const before = run.telegram.calls.length
+    await wait(300)
+    assert.equal(run.telegram.calls.slice(before).filter((call) => call.method === 'sendChatAction').length, 0)
+  } finally {
+    run.stop()
+  }
+})
+
+test('the tool-call line is cut by what it shows, so its HTML stays whole', async () => {
+  const run = await start({ showToolCalls: true })
+  try {
+    const agent = await runningTelegramTurn(run)
+    const before = run.telegram.calls.length
+    const block = { type: 'tool-call', id: 't1', name: 'bash', arguments: JSON.stringify({ command: 'grep -rn "present" src/app.js && echo "<done>" | head -40 && ls -la ~/.dsh/telegram/outbox' }) }
+    agent.emit('agent/assistant-stream', { frame: { type: 'chunk', chunk: { type: 'block-end', block } } })
+    await wait(600)
+    const shown = run.telegram.calls.slice(before).filter((call) => call.method === 'sendMessage' && call.body.parse_mode === 'HTML' && String(call.body.text).includes('bash'))
+    assert.equal(shown.length, 1, 'the tool list is posted')
+    const html = String(shown[0].body.text)
+    const tags = [...html.matchAll(/<(\/?)(\w+)[^>]*>/gu)]
+    const stack = []
+    for (const [, closing, tag] of tags) {
+      if (closing === '') stack.push(tag)
+      else assert.equal(stack.pop(), tag, html)
+    }
+    assert.deepEqual(stack, [], html)
+    assert.ok(!/&[#\w]*$/u.test(html.replace(/<[^>]*>/gu, '')), 'no entity cut in half')
+  } finally {
+    run.stop()
   }
 })
 

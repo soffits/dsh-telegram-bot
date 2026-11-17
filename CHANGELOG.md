@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.2
+
+- Telegram's flood control no longer drops files and messages. When Telegram answers 429, the bot waits as long as it asks (up to 15 minutes for a new message or file, 3 for edits) instead of giving up when `retry_after` is over 60 s or after three tries, and every other call to that chat waits for the flood control to end instead of hitting it again; "typing…" is skipped meanwhile. Before, a presented file could vanish without a trace, since the "Could not send" note went through the same limited path.
+- The live tool-call line is cut by the characters it shows, not its HTML, so its `<code>` tags stay whole and Telegram no longer rejects it with "can't find end tag".
+
 ## 0.12.1
 
 - The one-time title migrations are gone: the bot no longer rewrites every bound session's title when it connects, no longer retitles sessions named after the sender line or context blocks of versions before 0.6.2, and no longer reads the `TG · <topic>` and `<topic> · <task>` title forms of earlier versions. Every bound session had already been moved to `Telegram-<person>-<task>`; a changed person label now reaches a title the next time its session is used.

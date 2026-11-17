@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.3
+
+- Prompts that another agent session sends a bound session (`open_session`, `prompt_session`) are no longer mirrored into its topic: they are briefs written for a model, and they landed in people's chats as "From agent session …". Prompts a person typed in the Web UI and scheduled-task prompts are still shown. Set `mirrorAgentPrompts` to bring the agent prompts back.
+
 ## 0.12.2
 
 - Telegram's flood control no longer drops files and messages. When Telegram answers 429, the bot waits as long as it asks (up to 15 minutes for a new message or file, 3 for edits) instead of giving up when `retry_after` is over 60 s or after three tries, and every other call to that chat waits for the flood control to end instead of hitting it again; "typing…" is skipped meanwhile. Before, a presented file could vanish without a trace, since the "Could not send" note went through the same limited path.

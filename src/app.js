@@ -2691,6 +2691,8 @@ export function apply(ctx, config) {
     if (source?.kind === 'user') {
       if (queued ? telegramMessageIds.has(message.id) : telegramMessageIds.delete(message.id)) return
       if (typeof source.rpcId === 'string' && source.rpcId.startsWith('telegram')) return
+      // An agent's brief is written for a model, not for the people in the chat.
+      if (senderSession(source.principal) !== undefined && readLive(config.mirrorAgentPrompts, false) !== true) return
       label = mirrorLabel(source.principal)
     } else if (source?.kind === 'schedule') {
       label = tr('⏰ Scheduled task', '⏰ Задача по расписанию')

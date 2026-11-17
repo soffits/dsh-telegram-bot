@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.4
+
+- A session's title in a topic message, a forked session or a session list is read from the session each time, not from the copy the bot stored when it bound the topic, so a renamed session shows its new name.
+
 ## 0.12.3
 
 - Prompts that another agent session sends a bound session (`open_session`, `prompt_session`) are no longer mirrored into its topic: they are briefs written for a model, and they landed in people's chats as "From agent session …". Prompts a person typed in the Web UI and scheduled-task prompts are still shown. Set `mirrorAgentPrompts` to bring the agent prompts back.

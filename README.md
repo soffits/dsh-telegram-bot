@@ -46,7 +46,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Leave **Disallow users
   ⏳ Find a hotel near the venue · deepseek-v4-flash · 3m
   ```
 - `/agents` lists the session's running and most recent subagents (up to eight, nested ones included), with their state, model, time, when they started and the beginning of their last report (the last message they sent their parent, or their final answer). It reads DSH's saved sessions, so it also covers subagents from before a restart; one cut off by a restart shows as interrupted.
-- Inline controls for model, reasoning effort, permission mode and context usage. The model picker offers every provider and model of the Web UI's model picker (provider first, then its models, with paging) and switches the session the way the Web UI does, which also makes the pick the default for new sessions. The panel always shows the model the session runs now; `/new` starts the next session on that model.
+- Inline controls for model, reasoning effort, permission mode and context usage. The model picker offers every provider and model of the Web UI's model picker (provider first, then its models, with paging) and switches only that session: the default for new sessions stays as it is (the Web UI's picker would save the pick as the default). The panel always shows the model the session runs now; `/new` starts the next session on the model picked in the topic, or on the default when none was picked.
 - Tool approvals with **Deny** / **Allow** buttons.
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
 - Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.

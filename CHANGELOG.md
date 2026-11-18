@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.5
+
+- Picking a model or effort in a topic switches only that topic's session. It used to go through the Web UI's model picker, which also saves every pick as the default for new sessions, so a switch in one chat changed the model every other new session started on. The model is still checked with the host before the switch, and `/new` in the topic still starts on the topic's pick.
+
 ## 0.12.4
 
 - A session's title in a topic message, a forked session or a session list is read from the session each time, not from the copy the bot stored when it bound the topic, so a renamed session shows its new name.

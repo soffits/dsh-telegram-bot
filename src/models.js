@@ -65,6 +65,24 @@ export async function sessionModelOf(ctx, sessionId) {
 }
 
 /**
+ * Switch one session to a model without touching the default for new
+ * sessions. The Web picker's `sessionController.selectModel` saves every pick
+ * as that default, so a switch in one chat would move every chat's next
+ * session; this takes its other steps instead: the host checks it can route
+ * the model (`llm.resolveCallConfig`, which throws with the reason when it
+ * cannot), then the live agent records it.
+ * @param ctx - Host context.
+ * @param agent - the session's live agent.
+ * @param selection - provider, model and optional effort.
+ */
+export async function selectSessionModel(ctx, agent, selection) {
+  const picked = toSelection(selection)
+  const llm = ctx.get('llm')
+  if (typeof llm?.resolveCallConfig === 'function') await llm.resolveCallConfig({ ...picked })
+  agent.model.select(picked)
+}
+
+/**
  * Read the deployment default model (the one the Web UI saves).
  * @param ctx - Host context.
  * @returns the selection, or undefined without a default-model service.

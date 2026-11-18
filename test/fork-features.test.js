@@ -153,9 +153,7 @@ function makeHost() {
       /** The Web UI's model switch: check, record on the agent, save the default. */
       selectModel: async (request) => {
         const { sessionId, ...selection } = request
-        const offered = CATALOG_GROUPS.find((group) => group.id === selection.provider)?.models.some((model) => model.id === selection.model)
-        if (!offered) throw new Error(`model ${selection.provider}/${selection.model} is unavailable`)
-        modelSelections.push(request)
+        await services.llm.resolveCallConfig(selection)
         live.get(sessionId).model.select(selection)
         await defaults.saveSelection(selection)
         return { selected: selection }
@@ -172,7 +170,17 @@ function makeHost() {
       get: (id) => workspaces.find((workspace) => workspace.id === id),
       create: async () => ({ id: 'workspace-new', attachSession() {} }),
     },
-    llm: { listModels: async () => [], resolveModel: async () => ({ context: { contextWindow: 1_000_000 } }) },
+    llm: {
+      listModels: async () => [],
+      resolveModel: async () => ({ context: { contextWindow: 1_000_000 } }),
+      /** The host's routing check, which every model switch runs first. */
+      resolveCallConfig: async (selection) => {
+        const offered = CATALOG_GROUPS.find((group) => group.id === selection.provider)?.models.some((model) => model.id === selection.model)
+        if (!offered) throw new Error(`model ${selection.provider}/${selection.model} is unavailable`)
+        modelSelections.push({ ...selection })
+        return {}
+      },
+    },
     attachments: {
       async saveFile({ data, name }) { return { attachmentId: `file-${name}`, name, bytes: data.length } },
       async saveImage({ data, name, mediaType }) { return { attachmentId: `image-${name}`, name, bytes: data.length, mediaType, width: 1, height: 1 } },
@@ -2276,7 +2284,8 @@ test('a topic whose model was removed from the catalog moves to the default, dro
     run.telegram.push({ message_thread_id: 7001, text: 'hello' })
     await wait(250)
     assert.deepEqual(old.model.current(), GEMINI)
-    assert.deepEqual(run.host.modelSelections.at(-1), { sessionId: 'session-old', ...GEMINI }, 'through the Web UI\'s selectModel')
+    assert.deepEqual(run.host.modelSelections.at(-1), GEMINI, 'checked with the host first')
+    assert.deepEqual(run.host.defaults.saved, [], 'the default is left alone')
     assert.equal((await run.readState()).pickedModels?.['100:7001'], undefined, 'the stale pick is dropped')
     const notices = texts(run.telegram.calls, 7001).filter((text) => /is gone/.test(text))
     assert.equal(notices.length, 1)
@@ -2330,8 +2339,8 @@ test('the model picker lists providers, then their models, and a pick switches t
     run.telegram.pushCallback(7001, gemini.buttons[0].callback_data, gemini.messageId)
     await wait(150)
     assert.deepEqual(agent.model.current(), GEMINI, 'the pick reaches the agent')
-    assert.deepEqual(run.host.modelSelections.at(-1), { sessionId: 'session-1', ...GEMINI }, 'through the Web UI\'s selectModel')
-    assert.deepEqual(run.host.defaults.selection, GEMINI, 'saved as the default, like a Web pick')
+    assert.deepEqual(run.host.modelSelections.at(-1), GEMINI, 'checked with the host first')
+    assert.deepEqual(run.host.defaults.saved, [], 'only this session changes, not the default for new sessions')
     assert.equal(panelOf(run.telegram.calls).model, '🤖 Gemini Pro (High)')
 
     // Back to Anthropic Sonnet: the effort starts at the model's default, then changes.

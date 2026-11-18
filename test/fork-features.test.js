@@ -519,6 +519,36 @@ const texts = (calls, threadId) => [
   ...calls.filter((call) => (call.method === 'sendMessage' || call.method === 'editMessageText') && (call.body.message_thread_id === threadId)),
 ].map((call) => call.body.text)
 
+/** Start a Web turn that stays open, so /stop has something to interrupt. */
+function beginOpenWebTurn(agent, turn) {
+  const session = { id: agent.id }
+  agent.emit('session/event', session, { type: 'turn/start', data: { turn } })
+  agent.emit('session/event', session, { type: 'user/message', data: { id: `m-${turn}`, role: 'user', content: [{ type: 'text', text: 'from web' }], source: { kind: 'user', rpcId: `web-${turn}` } } })
+  agent.emit('agent/assistant-stream', { agent, frame: { type: 'chunk', chunk: { type: 'block-start', blockType: 'text' } } })
+  agent.emit('agent/assistant-stream', { agent, frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'partial answer' } } })
+}
+
+for (const mirrorTurns of [false, true]) {
+  test(`/stop ${mirrorTurns ? 'stops' : 'leaves alone'} a Web turn with mirrorTurns ${mirrorTurns}`, async () => {
+    const run = await start({ mirrorTurns })
+    try {
+      run.telegram.push({ message_thread_id: 1, text: 'hello' })
+      await wait(200)
+      const agent = run.host.live.get('session-1')
+      let cancelled = 0
+      agent.cancel = () => { cancelled += 1 }
+      beginOpenWebTurn(agent, 2)
+      await wait(150)
+      run.telegram.push({ message_thread_id: 7001, text: '/stop' })
+      await wait(200)
+      assert.equal(cancelled, mirrorTurns ? 1 : 0)
+      assert.equal(run.telegram.calls.some((call) => call.body?.text === '⏹ Stopped.'), mirrorTurns)
+    } finally {
+      run.stop()
+    }
+  })
+}
+
 test('a turn started in the Web UI appears in the bound topic', async () => {
   const run = await start()
   try {

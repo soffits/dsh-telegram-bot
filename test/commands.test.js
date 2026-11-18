@@ -87,10 +87,8 @@ function makeContext(agent) {
           ],
         }],
       }),
-      selectModel: async (request) => {
-        modelSelects.push(request)
-        agent.model.select(request)
-        return { selected: { provider: request.provider, model: request.model, reasoningEffort: request.reasoningEffort } }
+      selectModel: async () => {
+        throw new Error('the Web picker\'s selectModel would save the default model')
       },
     },
     goals: {
@@ -143,7 +141,14 @@ function makeContext(agent) {
       create: async () => ({ id: 'workspace-default' }),
     },
     attachments,
-    llm: { listModels: async () => [], resolveModel: async () => ({ context: { contextWindow: 1_000_000 } }) },
+    llm: {
+      listModels: async () => [],
+      resolveModel: async () => ({ context: { contextWindow: 1_000_000 } }),
+      resolveCallConfig: async (selection) => {
+        modelSelects.push(selection)
+        return {}
+      },
+    },
   }
   return {
     ctx: {

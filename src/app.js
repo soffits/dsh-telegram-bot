@@ -51,7 +51,7 @@ import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.j
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, describeForward, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference } from './message-context.js'
 import { createSentLog } from './sent-log.js'
-import { catalogKey, createModelCatalog, defaultModelOf, effortChoices, effortName, findModel, isGoneModel, modelByKey, modelName, pageOf, pickedSelection, providerByKey, sameSelection, sessionModelOf } from './models.js'
+import { catalogKey, createModelCatalog, defaultModelOf, effortChoices, effortName, findModel, isGoneModel, modelByKey, modelName, pageOf, pickedSelection, providerByKey, sameSelection, selectSessionModel, sessionModelOf } from './models.js'
 import {
   allowedChatsOf,
   allowedUsersOf,
@@ -2070,9 +2070,9 @@ export function apply(ctx, config) {
    * Move a topic's session off a model the catalog no longer offers (a
    * removed provider or a dropped model: every turn would fail before any
    * request, so no fallback can help). The session goes to the current
-   * default through the Web picker's `selectModel`, a stale per-topic pick is
-   * dropped, and the topic gets one line about it. A model that is merely
-   * failing now, or no catalog, changes nothing.
+   * default, a stale per-topic pick is dropped, and the topic gets one line
+   * about it. A model that is merely failing now, or no catalog, changes
+   * nothing.
    * @param chat - chat bridge state.
    * @param agent - the session's live agent.
    */
@@ -2088,12 +2088,7 @@ export function apply(ctx, config) {
       if (!isGoneModel(catalog, current)) return
       const fallback = defaultModelOf(ctx)
       if (fallback === undefined || isGoneModel(catalog, fallback)) return
-      const controller = ctx.get('sessionController')
-      if (typeof controller?.selectModel === 'function') {
-        await controller.selectModel({ sessionId: agent.session?.id ?? chat.sessionId, ...fallback })
-      } else {
-        agent.model.select(fallback)
-      }
+      await selectSessionModel(ctx, agent, fallback)
       warn(`${agent.session?.id ?? agent.id} was on ${current.provider}/${current.model}, which is not offered any more; it continues on ${fallback.provider}/${fallback.model}`)
       const name = (selection) => findModel(catalog, selection)?.model.name ?? `${selection.provider}/${selection.model}`
       await send(
@@ -3496,10 +3491,9 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Switch a topic's session to one model selection the way the Web model
-   * picker does: `sessionController.selectModel` checks the model is
-   * available, records it on the session's agent and saves it as the default
-   * for new sessions. A failure reaches the caller, so the user sees it.
+   * Switch a topic's session to one model selection. Only that session and
+   * the topic's later `/new` sessions change; the default for other new
+   * sessions stays as it is. A failure reaches the caller, so the user sees it.
    * @param chat - chat bridge state.
    * @param selection - provider, model and optional effort.
    */
@@ -3511,13 +3505,7 @@ export function apply(ctx, config) {
     state.pickedModels ??= {}
     state.pickedModels[`${chat.chatId}:${chat.threadId}`] = picked
     void persistState()
-    const agent = await ensureAgent(chat)
-    const controller = ctx.get('sessionController')
-    if (typeof controller?.selectModel === 'function') {
-      await controller.selectModel({ sessionId: agent.session?.id ?? chat.sessionId, ...selection })
-      return
-    }
-    agent.model.select(selection)
+    await selectSessionModel(ctx, await ensureAgent(chat), selection)
   }
 
   /**

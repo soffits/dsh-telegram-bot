@@ -210,6 +210,8 @@ export function apply(ctx, config) {
         text: '',
         textSeparator: false,
         lastText: '',
+        answerFlushing: false,
+        lastTextDeltaAt: 0,
         messageId: null,
         editTimer: null,
         thinkingText: '',
@@ -629,7 +631,7 @@ export function apply(ctx, config) {
     const key = String(chatId)
     let state = outboundStates.get(key)
     if (state === undefined) {
-      state = { tokens: 10, capacity: 10, intervalMs: 50, minDelayMs: 20, updatedAt: Date.now(), tail: Promise.resolve() }
+      state = { tokens: 10, capacity: 10, intervalMs: 50, minDelayMs: 20, updatedAt: Date.now(), tail: Promise.resolve(), successes: 0 }
       outboundStates.set(key, state)
     }
     const previous = state.tail
@@ -670,6 +672,24 @@ export function apply(ctx, config) {
     state.updatedAt = Date.now()
     state.intervalMs = Math.min(5000, Math.max(20, Math.ceil((retryAfter ?? 1) * 1000)))
     state.capacity = Math.min(state.capacity, 2)
+    state.successes = 0
+    void publishStatus({ lastRateLimit: { chatId, retryAfter: retryAfter ?? 1, at: Date.now() } })
+  }
+
+  /**
+   * Recover a chat's bucket after successful calls. A single 429 must slow the
+   * topic down temporarily, not leave every later edit at retry_after spacing.
+   * @param chatId - chat that answered successfully.
+   */
+  function noteOutboundSuccess(chatId) {
+    const state = outboundStates.get(String(chatId))
+    if (state === undefined) return
+    if (state.intervalMs <= 50 && state.capacity >= 10) return
+    state.successes = (state.successes ?? 0) + 1
+    if (state.successes < 2) return
+    state.successes = 0
+    state.intervalMs = Math.max(50, Math.floor(state.intervalMs / 2))
+    state.capacity = Math.min(10, state.capacity + 2)
   }
 
   /** One second of a Telegram retry_after; tests shrink it. */
@@ -744,6 +764,9 @@ export function apply(ctx, config) {
       try {
         const result = await requestOnce(target, token, method, body, signal, timeoutMs, contentType)
         noteSent(method, payload, result)
+        if (method !== 'getUpdates' && payload !== null && typeof payload === 'object' && payload.chat_id !== undefined) {
+          noteOutboundSuccess(payload.chat_id)
+        }
         return result
       } catch (error) {
         lastError = error
@@ -2229,6 +2252,7 @@ export function apply(ctx, config) {
     if (next === chat.lastText) return
     chat.lastText = next
     chat.lastEdit = Date.now()
+    chat.answerFlushing = true
     chat.answerEdit = (chat.answerEdit ?? Promise.resolve()).then(async () => {
       if (chat.done) return
       if (chat.messageId === null) {
@@ -2239,6 +2263,8 @@ export function apply(ctx, config) {
       await editAnswer(chat.chatId, chat.messageId, raw, bridgeAbort.signal, chat.threadId)
     }).catch((error) => {
       if (!bridgeAbort.signal.aborted) reportError('stream-edit', error)
+    }).finally(() => {
+      chat.answerFlushing = false
     })
     await chat.answerEdit
   }
@@ -2345,6 +2371,9 @@ export function apply(ctx, config) {
   async function flushThinking(chat) {
     return queueAuxEdit(chat, 'thinkingEdit', 'thinking-edit', async () => {
       if (chat.adopting) return
+      // The answer message is the important stream. Do not put reasoning edits
+      // in front of an answer edit that is waiting on Telegram.
+      if (chat.answerFlushing || (chat.editTimer !== null && chat.text.length > 0)) return
       const full = chat.thinkingText.replace(/\r/gu, '')
       if (full.trim().length === 0) return
       if (chat.done) chat.thinkingShown = full.length
@@ -2402,6 +2431,9 @@ export function apply(ctx, config) {
   async function flushTool(chat) {
     return queueAuxEdit(chat, 'toolEdit', 'tool-edit', async () => {
       if (chat.done || chat.adopting || chat.tools.length === 0) return
+      // Same priority rule as reasoning: a live answer must not queue behind
+      // tool display edits.
+      if (chat.answerFlushing || (chat.editTimer !== null && chat.text.length > 0)) return
       const epoch = chat.toolEpoch ?? 0
       const lines = chat.tools.slice(-5).map(formatToolCall).join('\n').split('\n')
       if (lines.length > 0) lines[lines.length - 1] = clipHtml(lines.at(-1), 26)
@@ -2433,6 +2465,15 @@ export function apply(ctx, config) {
     }, 650)
   }
 
+  /** Coalesce bursts of completed tool calls into one display edit. */
+  function scheduleTool(chat) {
+    if (chat.toolTimer !== null || chat.done) return
+    chat.toolTimer = setTimeout(() => {
+      chat.toolTimer = null
+      fireAndForget('tool-flush', () => flushTool(chat))
+    }, 250)
+  }
+
   /**
    * Consume one assistant stream frame.
    * @param chat - chat bridge state.
@@ -2450,6 +2491,7 @@ export function apply(ctx, config) {
     }
     if (frame.type === 'chunk' && frame.chunk?.type === 'text-delta') {
       const nextText = frame.chunk.text
+      chat.lastTextDeltaAt = Date.now()
       // The first text delta starts the edit throttle, so the first visible
       // edit contains a readable chunk instead of a single character.
       if (chat.text.length === 0) chat.lastEdit = Date.now()
@@ -2479,7 +2521,7 @@ export function apply(ctx, config) {
       if (readLive(config.showToolCalls, true) !== true) return
       chat.textSeparator = chat.text.length > 0
       upsertTool(chat, frame.chunk.block)
-      fireAndForget('tool-flush-now', () => flushTool(chat))
+      scheduleTool(chat)
     }
   }
 
@@ -2531,6 +2573,8 @@ export function apply(ctx, config) {
     const toolId = chat.toolMessageId
     chat.text = ''
     chat.lastText = ''
+    chat.answerFlushing = false
+    chat.lastTextDeltaAt = 0
     chat.messageId = null
     resetAux(chat)
     chat.busy = false
@@ -2831,6 +2875,8 @@ export function apply(ctx, config) {
     if (chat.toolMessageId !== null) await deleteMessage(chat.chatId, chat.threadId, chat.toolMessageId)
     chat.text = ''
     chat.lastText = ''
+    chat.answerFlushing = false
+    chat.lastTextDeltaAt = 0
     chat.messageId = null
     resetAux(chat)
     await publishStatus({
@@ -2873,6 +2919,8 @@ export function apply(ctx, config) {
     const epoch = chat.turnEpoch
     chat.text = ''
     chat.lastText = ''
+    chat.answerFlushing = false
+    chat.lastTextDeltaAt = 0
     chat.messageId = null
     clearEditTimer(chat)
     resetAux(chat)
@@ -3081,6 +3129,8 @@ export function apply(ctx, config) {
     chat.toolEpoch = (chat.toolEpoch ?? 0) + 1
     chat.text = ''
     chat.lastText = ''
+    chat.answerFlushing = false
+    chat.lastTextDeltaAt = 0
     chat.messageId = null
     chat.adopting = true
     clearEditTimer(chat)
@@ -3120,7 +3170,7 @@ export function apply(ctx, config) {
       chat.adopting = false
       scheduleFlush(chat)
       if (chat.thinkingText.length > 0) scheduleThinking(chat)
-      if (chat.tools.length > 0) fireAndForget('tool-flush-now', () => flushTool(chat))
+      if (chat.tools.length > 0) scheduleTool(chat)
     })
     return true
   }

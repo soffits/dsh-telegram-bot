@@ -305,13 +305,13 @@ function makeTelegram() {
     }
     return request
   }
-  const pushCallback = (threadId, data, callbackMessageId) => {
+  const pushCallback = (threadId, data, callbackMessageId, from = { id: 42 }) => {
     updateId += 1
     pending.push({
       update_id: updateId,
       callback_query: {
         id: `cb-${updateId}`,
-        from: { id: 42 },
+        from,
         data,
         message: { message_id: callbackMessageId, chat: { id: 100, type: 'private' }, message_thread_id: threadId },
       },
@@ -331,6 +331,7 @@ async function start(config = {}, initialState = {}, prepare = () => {}) {
   // Message ids restart with every fake bot; old sends must not match them.
   await rm(join(STATUS_DIR, 'sent-messages.json'), { force: true })
   await rm(join(STATUS_DIR, 'stickers.json'), { force: true })
+  await rm(join(STATUS_DIR, 'actions.json'), { force: true })
   await rm(join(STATUS_DIR, 'sticker-previews'), { recursive: true, force: true })
   await writeFile(join(STATUS_DIR, 'state.json'), JSON.stringify({ version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, ...initialState }))
   const host = makeHost()
@@ -2526,3 +2527,97 @@ test('a Web message sent into a running turn shows at once, and the reply goes b
     run.stop()
   }
 })
+
+/** A scheduler stand-in remembering what it was handed. */
+function withScheduler(emitted) {
+  return ({ host }) => {
+    host.services.cronJobs = { controller: () => ({ emit(event) { emitted.push(event); return { matched: ['job-1'] } } }) }
+  }
+}
+
+const keyboardOf = (call) => call?.body?.reply_markup?.inline_keyboard ?? []
+const answers = (calls) => calls.filter((call) => call.method === 'answerCallbackQuery')
+
+test('action buttons go under the last part of a send and a press by the named user is emitted once', async () => {
+  const emitted = []
+  const run = await start({ allowedUsers: ['42', '43'] }, notifyState, withScheduler(emitted))
+  try {
+    const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    const result = await run.host.provided.telegramTopics.send({
+      to: 7100,
+      text: 'New device: code 4821',
+      actions: { buttons: [{ id: 'yes', label: '一样' }, { id: 'no', label: '不一样' }], event: 'notify.answer', data: { confirm: 'abcd1234' }, users: ['42'], expires: new Date(Date.now() + 60_000).toISOString() },
+    })
+    const message = sent(run.telegram.calls, 7100).find((call) => call.body.text.includes('4821'))
+    const keys = keyboardOf(message).flat()
+    assert.deepEqual(keys.map((key) => key.text), ['一样', '不一样'])
+    assert.deepEqual(keys.map((key) => key.callback_data), [`x:${result.actions}:0`, `x:${result.actions}:1`])
+    const messageId = result.messageIds.at(-1)
+    const stored = JSON.parse(await readFile(join(STATUS_DIR, 'actions.json'), 'utf8')).entries[result.actions]
+    assert.equal(stored.messageId, messageId)
+
+    run.telegram.pushCallback(7100, keys[0].callback_data, messageId, { id: 43, first_name: 'Ben' })
+    await wait(150)
+    assert.equal(emitted.length, 0, 'someone else cannot answer')
+    assert.match(answers(run.telegram.calls).at(-1).body.text, /Only the person/)
+
+    run.telegram.pushCallback(7100, keys[1].callback_data, messageId, { id: 42, first_name: 'Ana' })
+    await wait(150)
+    assert.equal(emitted.length, 1)
+    assert.equal(emitted[0].channel, 'notify.answer')
+    assert.equal(emitted[0].data.confirm, 'abcd1234')
+    assert.equal(emitted[0].data.action, 'no')
+    assert.equal(emitted[0].data.label, '不一样')
+    assert.deepEqual([emitted[0].data.by.channel, emitted[0].data.by.id, emitted[0].data.by.name], ['telegram', '42', 'Ana'])
+    assert.equal(emitted[0].data.message.messageId, messageId)
+    const edit = run.telegram.calls.filter((call) => call.method === 'editMessageReplyMarkup').at(-1)
+    assert.equal(edit.body.message_id, messageId)
+    assert.deepEqual(keyboardOf(edit).flat().map((key) => key.text), ['✓ 不一样 · Ana'])
+
+    run.telegram.pushCallback(7100, keys[0].callback_data, messageId, { id: 42, first_name: 'Ana' })
+    await wait(150)
+    assert.equal(emitted.length, 1, 'a settled set takes no second press')
+    assert.equal(answers(run.telegram.calls).at(-1).body.text, '✓ 不一样 · Ana')
+    assert.equal(agent.injected[0].content[0].text, 'New device: code 4821\n[Buttons: 一样 · 不一样]', 'the bound session sees which buttons went out')
+  } finally {
+    run.stop()
+  }
+})
+
+test('an expired set only shows that it expired, and a set needs a valid event and text', async () => {
+  const emitted = []
+  const run = await start({}, notifyState, withScheduler(emitted))
+  try {
+    run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    const result = await run.host.provided.telegramTopics.send({
+      to: 7100, text: 'Approve?', actions: { buttons: [{ id: 'yes', label: 'Yes' }], event: 'files.pairing', expires: '2020-01-01T00:00:00Z' },
+    })
+    run.telegram.pushCallback(7100, `x:${result.actions}:0`, result.messageIds.at(-1))
+    await wait(150)
+    assert.equal(emitted.length, 0)
+    const edit = run.telegram.calls.filter((call) => call.method === 'editMessageReplyMarkup').at(-1)
+    assert.deepEqual(keyboardOf(edit).flat().map((key) => key.text), ['⌛ Expired'])
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 7100, text: 'x', actions: { buttons: [{ id: 'yes', label: 'Yes' }], event: 'not a channel' } }),
+      (error) => /not a channel name/.test(error.message) && error.retryable === false)
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 7100, text: 'x', actions: { buttons: [], event: 'a.b' } }), /1 to 8 buttons/)
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 7100, files: [], text: ' ', actions: { buttons: [{ id: 'y', label: 'Y' }], event: 'a.b' } }), /Nothing to send/)
+  } finally {
+    run.stop()
+  }
+})
+
+test('a press with no scheduler running decides nothing and can be repeated', async () => {
+  const run = await start({}, notifyState)
+  try {
+    run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    const result = await run.host.provided.telegramTopics.send({ to: 7100, text: 'Approve?', actions: { buttons: [{ id: 'yes', label: 'Yes' }], event: 'a.b' } })
+    run.telegram.pushCallback(7100, `x:${result.actions}:0`, result.messageIds.at(-1))
+    await wait(150)
+    assert.match(answers(run.telegram.calls).at(-1).body.text, /scheduler is not running/)
+    const stored = JSON.parse(await readFile(join(STATUS_DIR, 'actions.json'), 'utf8')).entries[result.actions]
+    assert.equal(stored.settled, undefined)
+  } finally {
+    run.stop()
+  }
+})
+

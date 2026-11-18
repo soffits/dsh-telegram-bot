@@ -51,6 +51,7 @@ import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.j
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, describeForward, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference } from './message-context.js'
 import { createSentLog } from './sent-log.js'
+import { ACTION_PREFIX, actionKeyboard, checkActions, createActionStore, outcomeKeyboard, parseActionData, pressEvent } from './actions.js'
 import { catalogKey, createModelCatalog, defaultModelOf, effortChoices, effortName, findModel, isGoneModel, modelByKey, modelName, pageOf, pickedSelection, providerByKey, sameSelection, selectSessionModel, sessionModelOf } from './models.js'
 import {
   allowedChatsOf,
@@ -4110,6 +4111,9 @@ export function apply(ctx, config) {
 
   /** Messages sent through sendToTopic, for the context of later replies. */
   const sentLog = createSentLog({ onError: (error) => reportError('sent-log', error) })
+  const actionStore = createActionStore()
+  /** Action tokens whose press is being handed on, so a double tap emits once. */
+  const pressing = new Set()
 
   /**
    * Who sent a topic message, as a short label for the session record.
@@ -4198,7 +4202,10 @@ export function apply(ctx, config) {
    *   its own topic gets its copy too, labelled "by this session");
    *   `format` is how the text is written: `markdown` (default), `html`
    *   (Telegram HTML) or `plain`; `silent` sends without a notification
-   *   sound; `asVoice` sends Opus/Ogg files as voice messages.
+   *   sound; `asVoice` sends Opus/Ogg files as voice messages; `actions`
+   *   (`{ buttons: [{ id, label }], event, data, users, expires }`, see
+   *   src/actions.js) puts buttons under the text whose press is emitted as
+   *   `event` for the scheduler, with `data` and who pressed.
    * @param signal - request lifetime.
    * @returns where it went and whether the session recorded it.
    */
@@ -4214,6 +4221,16 @@ export function apply(ctx, config) {
     if (!SEND_FORMATS.includes(format)) throw finalError(`Unknown text format ${JSON.stringify(format)}: use ${SEND_FORMATS.join(', ')}.`)
     const silent = request?.silent === true
     const extra = silent ? { disable_notification: true } : {}
+    let actions
+    if (request?.actions !== undefined && request.actions !== null) {
+      try {
+        actions = checkActions(request.actions)
+      } catch (error) {
+        throw finalError(error)
+      }
+      if (text.trim().length === 0) throw finalError('Action buttons go under a text: give one.')
+    }
+    const actionToken = actions === undefined ? undefined : actionStore.token()
     let chatId
     let threadId
     try {
@@ -4228,10 +4245,14 @@ export function apply(ctx, config) {
     const messageIds = []
     try {
       if (text.trim().length > 0) {
-        for (const chunk of splitAnswerText(text.trim())) {
-          const result = await sendAnswer(chatId, chunk, signal, threadId, { format, extra })
+        const chunks = splitAnswerText(text.trim())
+        for (const [index, chunk] of chunks.entries()) {
+          const last = index === chunks.length - 1
+          const markup = last && actions !== undefined ? { reply_markup: { inline_keyboard: actionKeyboard(actionToken, actions.buttons) } } : {}
+          const result = await sendAnswer(chatId, chunk, signal, threadId, { format, extra: { ...extra, ...markup } })
           if (result?.message_id === undefined) throw new Error('Telegram did not accept the message.')
           messageIds.push(result.message_id)
+          if (last && actions !== undefined) await actionStore.add(actionToken, { ...actions, chatId, threadId, messageId: result.message_id })
         }
       }
       if (sticker !== undefined) {
@@ -4294,7 +4315,8 @@ export function apply(ctx, config) {
         const label = self ? ' by this session' : sender.length > 0 ? ` by ${sender}` : ''
         const where = target.name === undefined ? `topic ${threadId}` : `topic "${target.name}"`
         const summary = `Sent to the Telegram ${where}${label}`
-        const body = [text.trim(), sticker === undefined ? '' : `[Sticker ${describeSticker(sticker)}]`].filter((part) => part.length > 0).join('\n')
+        const buttons = actions === undefined ? '' : `[Buttons: ${actions.buttons.map((button) => button.label).join(' · ')}]`
+        const body = [text.trim(), buttons, sticker === undefined ? '' : `[Sticker ${describeSticker(sticker)}]`].filter((part) => part.length > 0).join('\n')
         const content = body.length > 0 ? [{ type: 'text', text: body }] : []
         content.push(...await recordedFiles(files))
         if (sticker !== undefined) content.push(...await recordedSticker(sticker, signal))
@@ -4342,6 +4364,63 @@ export function apply(ctx, config) {
       ...(recordError === undefined ? {} : { recordError }),
       ...(note === undefined ? {} : { note }),
       messageIds,
+      ...(actionToken === undefined ? {} : { actions: actionToken }),
+    }
+  }
+
+  /**
+   * A press on an action button (src/actions.js): only for the message it
+   * was sent with and, when the sender named users, only by one of them;
+   * once open and unexpired it is handed to the scheduler as the set's event
+   * and the buttons become the outcome. A later press only hears what
+   * happened.
+   * @param query - callback query.
+   * @param ref - callback data after the prefix.
+   * @param chatId - chat of the pressed message.
+   * @param threadId - its topic.
+   * @param signal - runtime lifetime.
+   */
+  async function handleActionPress(query, ref, chatId, threadId, signal) {
+    const reply = (text, alert = true) => call('answerCallbackQuery', { callback_query_id: query.id, ...(text === undefined ? {} : { text, show_alert: alert }) }, signal, 5000).catch(() => {})
+    const parsed = parseActionData(ref)
+    const entry = parsed === undefined ? undefined : await actionStore.get(parsed.token)
+    if (entry === undefined) return reply(tr('These buttons are no longer known.', 'Эти кнопки больше не действуют.'))
+    if (entry.chatId !== chatId || entry.threadId !== threadId || entry.messageId !== query.message?.message_id) {
+      return reply(tr('These buttons belong to another message.', 'Эти кнопки относятся к другому сообщению.'))
+    }
+    if (entry.settled !== undefined) return reply(entry.settled.text)
+    const button = parsed.index === undefined ? undefined : entry.buttons[parsed.index]
+    if (button === undefined) return reply(tr('Unknown button.', 'Неизвестная кнопка.'))
+    if (entry.users.length > 0 && !entry.users.includes(String(query.from.id))) {
+      return reply(tr('Only the person this was sent to can answer it.', 'Ответить может только тот, кому это отправлено.'))
+    }
+    if (pressing.has(parsed.token)) return reply()
+    pressing.add(parsed.token)
+    try {
+      if (entry.expires !== undefined && Date.now() >= entry.expires) {
+        const text = tr('⌛ Expired', '⌛ Истекло')
+        await actionStore.settle(parsed.token, { outcome: 'expired', text })
+        await call('editMessageReplyMarkup', { chat_id: chatId, message_id: entry.messageId, reply_markup: { inline_keyboard: outcomeKeyboard(parsed.token, text) } }, signal).catch((error) => reportError('action-edit', error))
+        return reply(tr('This has expired; nothing was decided.', 'Срок истёк; ничего не решено.'))
+      }
+      const publisher = ctx.get('cronJobs')?.controller?.()
+      if (publisher === undefined || typeof publisher.emit !== 'function') {
+        return reply(tr('The scheduler is not running, so nothing was decided. Try again in a minute.', 'Планировщик не запущен, ничего не решено. Попробуй через минуту.'))
+      }
+      const principal = telegramUserPrincipal(query.from, { chatId, threadId, topic: state.topicNames?.[`${chatId}:${threadId}`] })
+      try {
+        publisher.emit({ channel: entry.event, source: 'telegram', key: `telegram-action-${parsed.token}`, data: pressEvent(entry, button, principal, Date.now()) })
+      } catch (error) {
+        reportError('action-emit', error)
+        return reply(tr(`Could not hand this on: ${messageOf(error)}`, `Не удалось передать: ${messageOf(error)}`))
+      }
+      const who = principal.name ?? (principal.username === undefined ? principal.id : `@${principal.username}`)
+      const text = `✓ ${button.label} · ${who}`
+      await actionStore.settle(parsed.token, { outcome: 'pressed', action: button.id, by: principal.id, text })
+      await call('editMessageReplyMarkup', { chat_id: chatId, message_id: entry.messageId, reply_markup: { inline_keyboard: outcomeKeyboard(parsed.token, text) } }, signal).catch((error) => reportError('action-edit', error))
+      return reply(button.label, false)
+    } finally {
+      pressing.delete(parsed.token)
     }
   }
 
@@ -4872,6 +4951,10 @@ export function apply(ctx, config) {
     const colon = data.indexOf(':')
     const prefix = colon === -1 ? data : data.slice(0, colon)
     const ref = colon === -1 ? '' : data.slice(colon + 1)
+    if (prefix === ACTION_PREFIX) {
+      await handleActionPress(query, ref, chat.id, threadId, signal)
+      return
+    }
     await call('answerCallbackQuery', { callback_query_id: query.id }, signal, 5000).catch(() => {})
     try {
       if (prefix === 'a') {
@@ -6831,9 +6914,10 @@ export function apply(ctx, config) {
      *   picks one when several chats share the id), `text` Markdown unless
      *   `format` says `html` or `plain`, `files` absolute paths, `from`
      *   `{ job, sessionId, label }` naming the sender, `silent` no
-     *   notification sound, `asVoice` Opus/Ogg files as voice messages.
+     *   notification sound, `asVoice` Opus/Ogg files as voice messages,
+     *   `actions` buttons whose press is emitted for the scheduler (src/actions.js).
      */
-    send: ({ to, chat, text, files = [], from, format, silent, asVoice } = {}) => sendToTopic({ to, chat, text, files, from, format, silent, asVoice }),
+    send: ({ to, chat, text, files = [], from, format, silent, asVoice, actions } = {}) => sendToTopic({ to, chat, text, files, from, format, silent, asVoice, actions }),
     /** @returns the topics the bot knows in every chat: chat id, thread id, last known name, bound session. */
     topics: () => knownTopicKeys()
       .map((key) => {

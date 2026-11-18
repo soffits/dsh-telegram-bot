@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.0
+
+- Action buttons: a topic send (`dsh-telegram-send --action <id>=<label> --action-event <channel>`, or `actions` on the `telegramTopics` service) puts inline buttons under its text, and the first press by an allowed person (only the `--action-user` ids when given, before `--action-expires`) is emitted for dsh-cron-jobs as that event with the sender's data, the button and who pressed as a `telegram-user` principal; the buttons then show the outcome. Buttons are kept in `$DSH_HOME/telegram/actions.json`, so a press works after a restart. Built beside the tool-approval buttons, which stay in memory because they belong to one running turn.
+
 ## 0.12.6
 
 - A live answer is no longer held up by reasoning and tool-call edits: while an answer edit is queued or in flight those edits are skipped, and a burst of tool calls becomes one edit. After a Telegram 429 the topic's send rate recovers on its own after a few good calls, instead of staying at the slow spacing. The status file records the last rate limit. From upstream.

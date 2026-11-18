@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.6
+
+- A live answer is no longer held up by reasoning and tool-call edits: while an answer edit is queued or in flight those edits are skipped, and a burst of tool calls becomes one edit. After a Telegram 429 the topic's send rate recovers on its own after a few good calls, instead of staying at the slow spacing. The status file records the last rate limit. From upstream.
+
 ## 0.12.5
 
 - Picking a model or effort in a topic switches only that topic's session. It used to go through the Web UI's model picker, which also saves every pick as the default for new sessions, so a switch in one chat changed the model every other new session started on. The model is still checked with the host before the switch, and `/new` in the topic still starts on the topic's pick.

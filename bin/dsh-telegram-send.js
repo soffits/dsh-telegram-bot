@@ -13,6 +13,9 @@ import { enqueue, waitForResult } from '../src/outbox.js'
 const usage = `Usage: dsh-telegram-send --thread <thread-id> [--chat <chat-id>] [--file <path>]...
                          [--job <name>] [--from-session <id>] [--from <label>]
                          [--format markdown|html|plain] [--silent] [--voice]
+                         [--action <id>=<label>... --action-event <channel>
+                          [--action-data <json>] [--action-user <id>]...
+                          [--action-expires <time>]]
                          [--no-wait] [--timeout <seconds>] [text...]
 
 Sends text (from the arguments, or from stdin when none are given) and files
@@ -33,6 +36,15 @@ animations, audio and video in Telegram's players, anything else as a document.
                          for Telegram), html (Telegram HTML) or plain
   --silent               deliver without a notification sound
   --voice                send Opus/Ogg audio files as voice messages
+  --action <id>=<label>  a button under the text (repeatable, up to 8); a press
+                         is emitted as --action-event for dsh-cron-jobs with the
+                         --action-data object, the button's id as "action", its
+                         label, who pressed ("by", a telegram-user principal) and
+                         the message; the buttons then show the outcome
+  --action-event <name>  the event channel a press is emitted on
+  --action-data <json>   a JSON object the event carries
+  --action-user <id>     only this Telegram user may press (repeatable)
+  --action-expires <t>   ISO time after which a press only marks it expired
 
 Exit codes: 0 sent, 1 failed (for example an unknown thread id), 2 bad arguments,
 3 still queued after the timeout (the bot sends it once it runs).`
@@ -51,6 +63,11 @@ try {
       format: { type: 'string' },
       silent: { type: 'boolean' },
       voice: { type: 'boolean' },
+      action: { type: 'string', multiple: true },
+      'action-event': { type: 'string' },
+      'action-data': { type: 'string' },
+      'action-user': { type: 'string', multiple: true },
+      'action-expires': { type: 'string' },
       'no-wait': { type: 'boolean' },
       timeout: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
@@ -78,6 +95,32 @@ const FORMATS = ['markdown', 'html', 'plain']
 if (values.format !== undefined && !FORMATS.includes(values.format)) {
   process.stderr.write(`--format takes one of ${FORMATS.join(', ')}.\n\n${usage}\n`)
   process.exit(2)
+}
+
+let actions
+if (values.action !== undefined || values['action-event'] !== undefined) {
+  const buttons = (values.action ?? []).map((spec) => {
+    const at = spec.indexOf('=')
+    return at < 1 ? undefined : { id: spec.slice(0, at), label: spec.slice(at + 1) }
+  })
+  if (buttons.length === 0 || buttons.includes(undefined) || values['action-event'] === undefined) {
+    process.stderr.write(`Buttons need --action <id>=<label> (one or more) and --action-event.\n\n${usage}\n`)
+    process.exit(2)
+  }
+  let data = {}
+  try {
+    if (values['action-data'] !== undefined) data = JSON.parse(values['action-data'])
+  } catch {
+    process.stderr.write(`--action-data is not valid JSON.\n\n${usage}\n`)
+    process.exit(2)
+  }
+  actions = {
+    buttons,
+    event: values['action-event'],
+    data,
+    users: values['action-user'] ?? [],
+    ...(values['action-expires'] === undefined ? {} : { expires: values['action-expires'] }),
+  }
 }
 
 let text = positionals.join(' ')
@@ -110,6 +153,7 @@ const id = await enqueue({
   ...(values.format === undefined ? {} : { format: values.format }),
   ...(values.silent ? { silent: true } : {}),
   ...(values.voice ? { asVoice: true } : {}),
+  ...(actions === undefined ? {} : { actions }),
 })
 if (values['no-wait']) {
   process.stdout.write(`${JSON.stringify({ queued: id })}\n`)

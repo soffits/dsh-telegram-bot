@@ -187,12 +187,25 @@ const result = await ctx.get('telegramTopics').send({
   format: 'markdown',           // optional: 'markdown' (default), 'html' or 'plain'
   silent: false,                // optional: no notification sound
   asVoice: false,               // optional: Opus/Ogg files as voice messages
+  actions: undefined,           // optional: buttons whose press becomes a scheduler event (below)
 })
-// { chatId, threadId, topic, sessionId, recorded, messageIds }, plus note or recordError when it was not recorded
+// { chatId, threadId, topic, sessionId, recorded, messageIds, actions? }, plus note or recordError when it was not recorded
 ctx.get('telegramTopics').topics() // [{ chatId, threadId, name, sessionId }]: known topics in every chat, name may be null
 ```
 
 `send` rejects when the message was not sent. Errors that a retry cannot fix (an unknown thread id, a topic that was deleted, a missing or oversized file, nothing to send, or a failure after part of a long message already went out) carry `retryable: false`; others, such as the bot not running yet, are worth trying again. This is the shape [dsh-cron-jobs](https://github.com/soffits/dsh-cron-jobs) expects from a delivery channel, so `deliver: { via: telegramTopics, to: 12345 }` sends scheduled job results into the topic, with the job and its session named as the sender.
+
+### Action buttons
+
+A send can carry buttons under its text whose press is handed to [dsh-cron-jobs](https://github.com/soffits/dsh-cron-jobs) as an event, so a command job can act on a yes or no with no model in between (approving a device from a phone, say):
+
+```bash
+dsh-telegram-send --thread 12345 --action yes=Approve --action no=Reject \
+  --action-event files.pairing --action-data '{"device": "d1"}' \
+  --action-user 1000001 --action-expires 2026-01-02T08:45:00Z "A new device wants in. Code 4821."
+```
+
+With the service, `actions: { buttons: [{ id, label }], event, data, users, expires }`. Up to 8 buttons; ids are short words, labels up to 40 characters. The bot keeps what each button stands for in `$DSH_HOME/telegram/actions.json` (the message carries only a token), so a press works hours later and across restarts. A press counts only on the message it came with, only by an allowed user and, when `users` is given, only by one of those Telegram user ids. The first accepted press emits `event` through the `cronJobs` service with `{ ...data, action: <button id>, label, by: <principal>, message: { chatId, threadId, messageId }, at }`, where `by` is the presser as a `telegram-user` principal (`{ kind, channel: 'telegram', id, name?, username?, chat }`, the shape dsh-message-context uses for senders), and the buttons become one that shows the outcome (`✓ Approve · Ana`). A press after `expires` only marks it expired; a press while the scheduler isn't running decides nothing and can be repeated. Whoever acts on the event should still check who pressed: the bot only stops presses by other people where `users` names someone.
 
 From an agent: the `telegram_send` tool takes `thread` (the thread id), `text`, `files` (absolute paths) and, only when two chats share the thread id, `chat`. The calling session is named as the sender and does not get a copy of its own message.
 
@@ -300,7 +313,7 @@ node --check client.js
 npm test
 ```
 
-`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. `src/message-context.js` turns replies, quotes and forwards into the labelled context the agent reads. `src/topics.js` resolves send targets to thread ids, picks the topic field for private-chat topics, checks delivery and recognises deleted topics, `src/voice.js` decodes and transcribes recordings, `src/outbox.js` is the file spool behind `bin/dsh-telegram-send.js`, `src/sent-log.js` remembers sent messages for later replies, and `src/steer.js` sends messages into a running turn, and `src/stickers.js` is the sticker library, and `src/models.js` reads a session's live model and the Web model catalog for the model picker. The plugin adds two model-facing tools, `telegram_send` and `telegram_sticker`, and no system-prompt text.
+`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. `src/message-context.js` turns replies, quotes and forwards into the labelled context the agent reads. `src/topics.js` resolves send targets to thread ids, picks the topic field for private-chat topics, checks delivery and recognises deleted topics, `src/voice.js` decodes and transcribes recordings, `src/outbox.js` is the file spool behind `bin/dsh-telegram-send.js`, `src/sent-log.js` remembers sent messages for later replies, `src/actions.js` keeps action buttons and turns a press into an event, and `src/steer.js` sends messages into a running turn, and `src/stickers.js` is the sticker library, and `src/models.js` reads a session's live model and the Web model catalog for the model picker. The plugin adds two model-facing tools, `telegram_send` and `telegram_sticker`, and no system-prompt text.
 
 ## License
 

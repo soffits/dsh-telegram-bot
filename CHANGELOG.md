@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Session handling (resolving, creating and claiming a topic's session, unarchiving, steering prompts, recording notes, reading answers, titles and workspaces) and the outbox spool now come from `@soffits/dsh-channel-core`, shared with the Matrix bot, instead of a copy.
+- Session handling (resolving, creating and claiming a topic's session, unarchiving, steering prompts, recording notes, reading answers, titles and workspaces), the outbox spool, the subagent status card and `/agents` now come from `@soffits/dsh-channel-core`, shared with the Matrix bot, instead of a copy.
 - A steered message the session already holds is never handed to DSH again, also when it is plain text.
 - The outbox no longer keeps polling when the bot stops while it is starting.
 

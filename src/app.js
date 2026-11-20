@@ -24,6 +24,7 @@ import {
   attachToWorkspace,
   claimSession,
   controllerOf,
+  createAgentBoards,
   createModelCatalog,
   createPrincipalTagger,
   createSession,
@@ -51,6 +52,8 @@ import {
   sessionModelOf,
   sessionsInWorkspace,
   storedTitle,
+  subagentLabel,
+  subagentsText,
   transcribe,
   transcriptNote,
   turnAnswer,
@@ -81,7 +84,6 @@ import { clientTimeZone, formatTelegramDate, resolveTimeZone } from './clock.js'
 import { loadState, STATE_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
-import { agentsListText, childState, collectSubagents, createAgentBoards, reportOf } from './agents.js'
 import { deliveredToTopic, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor, uploadMethod } from './topics.js'
 import { spokenMediaOf } from './voice.js'
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
@@ -4360,19 +4362,6 @@ export function apply(ctx, config) {
   }
 
   /**
-   * The description a parent gave one of its subagents, from its catalog.
-   * @param parentId - parent session.
-   * @param childId - subagent session.
-   * @returns the label, or undefined.
-   */
-  async function subagentLabel(parentId, childId) {
-    if (typeof parentId !== 'string') return undefined
-    const children = await ctx.get('subagents')?.listChildren(parentId).catch(() => undefined)
-    const label = Array.isArray(children) ? children.find((child) => child.id === childId)?.label : undefined
-    return typeof label === 'string' && label.trim().length > 0 ? label.trim() : undefined
-  }
-
-  /**
    * Post a subagent status message, after what the topic has queued.
    * @param chat - topic state.
    * @param text - status text.
@@ -4417,50 +4406,6 @@ export function apply(ctx, config) {
       if (!bridgeAbort.signal.aborted) warn(`subagent status edit failed: ${message}`)
       return 'failed'
     }
-  }
-
-  /**
-   * The `/agents` text for a session: its running and latest subagents with
-   * their state and the start of their last report. Read from DSH's durable
-   * catalogs and session logs, so it works for subagents of earlier runs.
-   * @param sessionId - the topic's session.
-   * @returns the reply text, or undefined when this DSH has no subagent service.
-   */
-  async function subagentsText(sessionId) {
-    const subagents = ctx.get('subagents')
-    if (typeof subagents?.listChildren !== 'function') return undefined
-    const agents = ctx.get('agents')
-    const isRunning = (id) => agents?.get(id)?.status === 'running'
-    const { rows, total } = await collectSubagents((id) => subagents.listChildren(id), sessionId, isRunning)
-    const now = Date.now()
-    const query = ctx.get('sessionQuery')
-    const detailed = await Promise.all(rows.map(async (row) => {
-      let timing
-      let model
-      let observation
-      try {
-        observation = await query?.observeSession(row.id)
-        const values = observation?.projections?.values
-        timing = values?.subagentTiming
-        const selection = values?.modelSelection
-        model = (selection?.next ?? selection?.pending ?? selection?.lastUsed)?.model
-      } catch {
-        // State falls back to what the live agent says.
-      } finally {
-        observation?.[Symbol.dispose]?.()
-      }
-      const live = agents?.get(row.id)
-      if (typeof live?.model?.current === 'function') model = live.model.current()?.model ?? model
-      let events = []
-      try {
-        events = (await query?.readSurface(row.id))?.events ?? []
-      } catch {
-        // No report preview.
-      }
-      const { state, elapsedMs } = childState({ status: live?.status, timing }, now)
-      return { ...row, label: row.label || `subagent ${String(row.id).slice(0, 8)}`, model, state, elapsedMs, report: reportOf(events) }
-    }))
-    return agentsListText(detailed, total, now, tr)
   }
 
   /**
@@ -5639,7 +5584,7 @@ export function apply(ctx, config) {
         await send(chat.id, tr('This topic is not bound to a session. /sessions.', 'Этот topic не привязан к сессии. /sessions.'), signal, threadId)
         return
       }
-      const listed = await subagentsText(chatState.sessionId)
+      const listed = await subagentsText(ctx, chatState.sessionId, tr)
       const body = listed ?? tr('This DSH has no subagent service.', 'В этом DSH нет сервиса субагентов.')
       await sendPlain(chat.id, body.length > MAX_TELEGRAM_TEXT ? `${body.slice(0, MAX_TELEGRAM_TEXT - 1)}…` : body, signal, threadId)
       return
@@ -6858,12 +6803,12 @@ export function apply(ctx, config) {
   }, 'dsh-telegram-bot: outbox')
 
   // Subagents a topic's session starts share one status card at the bottom of
-  // the topic (src/agents.js).
+  // the topic (createAgentBoards in @soffits/dsh-channel-core).
   const agentBoards = createAgentBoards({
     parentOf: (id) => ctx.get('agents')?.get(id)?.session?.header?.parentSession,
     topicOf: (sessionId) => (lifetime === undefined ? undefined : chatForSession(sessionId)),
     showsTurn: (chat) => chat.busy && !chat.done,
-    labelOf: subagentLabel,
+    labelOf: (parentId, childId) => subagentLabel(ctx, parentId, childId),
     modelOf: async (id) => (await sessionModelOf(ctx, id).catch(() => undefined))?.model,
     post: postAgentStatus,
     edit: editAgentStatus,

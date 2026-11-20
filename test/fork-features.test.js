@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
-import { followupThroughGate, makeAgentModel, makeTitleService } from './fake-dsh.js'
+import { followupThroughGate, makeAgentModel, makeTitleService } from '@soffits/dsh-channel-core/testing'
 import { enqueue, waitForResult } from '@soffits/dsh-channel-core'
 import { OUTBOX_DIR } from '../src/constants.js'
 import { isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, titleTask, topicNameOf } from '../src/topics.js'
@@ -84,7 +84,7 @@ function makeHost() {
       ctx: { on: (name, fn) => { events.on(name, fn); return () => events.off(name, fn) } },
       status: 'idle',
       received: [],
-      followup(message) { followupThroughGate(this, events, message, hostEvents) },
+      followup(message) { followupThroughGate(this, message, [...events.listeners('agent/pre-step'), ...hostEvents.listeners('agent/pre-step')]) },
       injected: [],
       inject(message) { this.injected.push(message) },
       /** Messages sent into a running turn; the test plays what DSH does next. */

@@ -8,7 +8,8 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { parseArgs } from 'node:util'
-import { enqueue, waitForResult } from '../src/outbox.js'
+import { enqueue, waitForResult } from '@soffits/dsh-channel-core'
+import { OUTBOX_DIR } from '../src/constants.js'
 
 const usage = `Usage: dsh-telegram-send --thread <thread-id> [--chat <chat-id>] [--file <path>]...
                          [--job <name>] [--from-session <id>] [--from <label>]
@@ -154,13 +155,13 @@ const id = await enqueue({
   ...(values.silent ? { silent: true } : {}),
   ...(values.voice ? { asVoice: true } : {}),
   ...(actions === undefined ? {} : { actions }),
-})
+}, OUTBOX_DIR)
 if (values['no-wait']) {
   process.stdout.write(`${JSON.stringify({ queued: id })}\n`)
   process.exit(0)
 }
 const seconds = Number(values.timeout ?? 30)
-const result = await waitForResult(id, (Number.isFinite(seconds) && seconds > 0 ? seconds : 30) * 1000)
+const result = await waitForResult(id, (Number.isFinite(seconds) && seconds > 0 ? seconds : 30) * 1000, OUTBOX_DIR)
 if (result === undefined) {
   process.stderr.write(`Still queued as ${id}: the Telegram bot did not pick it up in time. It is sent once the bot runs.\n`)
   process.exit(3)

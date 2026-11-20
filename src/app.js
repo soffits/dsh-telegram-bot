@@ -10,6 +10,7 @@ import {
   BOT_COMMANDS_RU,
   FORWARD_BATCH_MS,
   MAX_TELEGRAM_TEXT,
+  OUTBOX_DIR,
   POLL_TIMEOUT_SECONDS,
   POST_SOURCE_KIND,
   RESTART_DEBOUNCE_MS,
@@ -19,26 +20,44 @@ import {
 } from './constants.js'
 import {
   answerSegments,
+  appendAccessMode,
+  attachToWorkspace,
+  claimSession,
+  controllerOf,
+  createAgentBoards,
   createModelCatalog,
   createPrincipalTagger,
+  createSession,
+  createSpool,
   cutSilent,
   defaultModelOf,
   effortChoices,
   effortName,
   findModel,
+  hasPendingInput,
   isGoneModel,
   isInterjection,
+  listWorkspaces,
   messageAnswer,
   modelName,
   pickedSelection,
+  readLive,
+  recentAssistantTexts,
+  recordMessage,
+  resolveAgent,
   runProgram,
   sameSelection,
   selectSessionModel,
   senderSession,
   sessionModelOf,
+  sessionsInWorkspace,
+  storedTitle,
+  subagentLabel,
+  subagentsText,
   transcribe,
   transcriptNote,
   turnAnswer,
+  unarchive,
 } from '@soffits/dsh-channel-core'
 import { classifyError } from './errors.js'
 import {
@@ -59,14 +78,12 @@ import {
   toolArg,
 } from './formatting.js'
 import { admitText, promptRequestId } from './admission.js'
-import { STEER_REACTION, busyMode, clearTelegramInbox, hasPendingInput, steerPrompt } from './steer.js'
+import { STEER_REACTION, busyMode, clearTelegramInbox, steerPrompt } from './steer.js'
 import { postPrincipal, telegramUserPrincipal } from './sender.js'
 import { clientTimeZone, formatTelegramDate, resolveTimeZone } from './clock.js'
 import { loadState, STATE_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
-import { createOutbox } from './outbox.js'
-import { agentsListText, childState, collectSubagents, createAgentBoards, reportOf } from './agents.js'
 import { deliveredToTopic, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor, uploadMethod } from './topics.js'
 import { spokenMediaOf } from './voice.js'
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
@@ -81,7 +98,6 @@ import {
   chatAllowed,
   isEnabled,
   messageOf,
-  readLive,
   sleep,
   tokenRefOf,
   userAllowed,
@@ -494,17 +510,8 @@ export function apply(ctx, config) {
    * @returns whether the fallback applied.
    */
   function applyPermissionFallback(chat, agent, name) {
-    const specs = {
-      'workspace-write': ['workspace-write', 'ask'],
-      'danger-full-access': ['danger-full-access', 'never'],
-      'read-only': ['read-only', 'ask'],
-    }
-    const spec = specs[name]
-    if (spec === undefined) return false
     try {
-      agent.session.append('permission/preset', { preset: name })
-      agent.session.append('sandbox/mode', { mode: spec[0] })
-      agent.session.append('approval/policy', { policy: spec[1] })
+      if (!appendAccessMode(agent.session, name)) return false
       chat.permission = name
       return true
     } catch (error) {
@@ -1987,43 +1994,6 @@ export function apply(ctx, config) {
     }
   }
 
-  /** @returns the Web session controller, when this deployment mounts it. */
-  function sessionControllerOf() {
-    const controller = ctx.get('sessionController')
-    return typeof controller?.create === 'function' && typeof controller?.resolveAgent === 'function' ? controller : undefined
-  }
-
-  /**
-   * Resume or find one session through the Web session controller.
-   * @param controller - session controller.
-   * @param sessionId - session id.
-   * @returns the live agent.
-   */
-  async function resolveThroughController(controller, sessionId) {
-    const found = await controller.resolveAgent(sessionId)
-    if (found?.error !== undefined) throw found.error
-    const agent = found?.agent ?? ctx.get('agents')?.get(sessionId)
-    if (agent === undefined) throw new Error(`session ${sessionId} has no live agent`)
-    return agent
-  }
-
-  /**
-   * Attach a Telegram-created session to the matching DSH workspace.
-   * @param sessionId - session id.
-   * @param cwd - session directory.
-   */
-  async function attachToWorkspace(sessionId, cwd) {
-    const registry = ctx.get('workspaceRegistry')
-    if (registry === undefined) return
-    try {
-      let workspace = registry.list().find((entry) => entry.path === cwd)
-      if (workspace === undefined) workspace = await registry.create(cwd)
-      await workspace.attachSession(sessionId)
-    } catch (error) {
-      warn(`workspace attach failed for ${sessionId}: ${messageOf(error)}`)
-    }
-  }
-
   /**
    * Make a session the bot just created for a topic its own: give it the
    * topic's title and end its blank state.
@@ -2057,31 +2027,8 @@ export function apply(ctx, config) {
         rememberTitlePerson(session.id, person)
       }
     }
-    if (typeof agent?.followup !== 'function' || typeof agent?.ctx?.on !== 'function') {
-      warn(`session ${session?.id ?? agent?.id} cannot run an empty turn; DSH may treat it as blank`)
-      return
-    }
-    const id = randomUUID()
-    const dispose = agent.ctx.on('agent/pre-step', (payload, next) => {
-      const messages = Array.isArray(payload?.messages) ? payload.messages : []
-      if (messages.length > 0 && messages.every((message) => message?.id === id)) return Promise.resolve({ kind: 'reject' })
-      return next()
-    })
-    agent.followup({
-      id,
-      role: 'user',
-      content: [{ type: 'text', text: `[This session belongs to the Telegram topic ${chat.threadId}]` }],
-      source: { kind: 'user', rpcId: `telegram-claim:${id}` },
-    })
-    // The gate stays until the turn is over, so the marker can never reach a model.
-    const idle = typeof agent.whenIdle === 'function' ? agent.whenIdle() : Promise.resolve()
-    void idle.catch(() => undefined).finally(() => { if (typeof dispose === 'function') dispose() })
-    let timer
-    await Promise.race([
-      idle.catch(() => undefined),
-      new Promise((resolveWait) => { timer = setTimeout(resolveWait, 10_000) }),
-    ])
-    clearTimeout(timer)
+    const claimed = await claimSession(agent, { text: `[This session belongs to the Telegram topic ${chat.threadId}]`, rpcPrefix: 'telegram-claim' })
+    if (!claimed) warn(`session ${session?.id ?? agent?.id} cannot run an empty turn; DSH may treat it as blank`)
   }
 
   /**
@@ -2133,7 +2080,7 @@ export function apply(ctx, config) {
   async function ensureAgent(chat, options = {}) {
     const agents = ctx.get('agents')
     if (agents === undefined) throw new Error('dsh-agent is not mounted in this profile')
-    const controller = sessionControllerOf()
+    const controller = controllerOf(ctx)
     const setup = (agentCtx, agent) => setupAgent(agentCtx, agent, chat)
     const targetCwd = chat.cwd
       ?? (typeof chat.sessionId === 'string' ? state.sessions[chat.sessionId]?.cwd : undefined)
@@ -2149,9 +2096,7 @@ export function apply(ctx, config) {
         return live
       }
       try {
-        const agent = controller === undefined
-          ? (await agents.resume({ resumeSessionId: chat.sessionId, agentOptions: defaultAgentOptions(), setup }))?.agent
-          : await resolveThroughController(controller, chat.sessionId)
+        const agent = await resolveAgent(ctx, chat.sessionId, { agentOptions: defaultAgentOptions(), setup })
         if (typeof agent?.session?.header?.cwd === 'string') chat.cwd = agent.session.header.cwd
         attachAgent(agent, chat)
         await syncPermission(chat, agent)
@@ -2168,29 +2113,12 @@ export function apply(ctx, config) {
       }
     }
 
-    const preset = presetOf()
-    let agent
-    if (controller !== undefined) {
-      try {
-        const created = await controller.create({
-          cwd: targetCwd,
-          ...(preset === undefined ? {} : { agentPreset: preset }),
-        })
-        agent = await resolveThroughController(controller, created.sessionId)
-      } catch (error) {
-        warn(`sessionController create failed, using raw agent: ${messageOf(error)}`)
-      }
-    }
-    if (agent === undefined) {
-      const meta = { cwd: targetCwd }
-      if (preset !== undefined && ctx.get('agentPresets') !== undefined) meta.agentPreset = preset
-      agent = (await agents.create({ sessionId: `session-${randomUUID()}`, meta, agentOptions: defaultAgentOptions(), setup })).agent
-    }
+    const agent = await createSession(ctx, { cwd: targetCwd, preset: presetOf(), setup, agentOptions: defaultAgentOptions(), warn })
     const sessionId = agent.session?.id ?? agent.id
     await startModel(agent, options.model)
     await claimForTopic(agent, chat)
     await bindSession(chat, sessionId, '', targetCwd)
-    await attachToWorkspace(sessionId, targetCwd)
+    await attachToWorkspace(ctx, sessionId, targetCwd, warn)
     attachAgent(agent, chat)
     await syncPermission(chat, agent)
     info(`created Telegram session ${sessionId}${controller === undefined ? '' : ' via sessionController'}`)
@@ -2983,7 +2911,7 @@ export function apply(ctx, config) {
       }
       let requestId
       try {
-        requestId = await steerPrompt(ctx, agent, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text, attachments, ...promptDetails(chat, messageId), clientTimeZone: clientTimeZone(messageTimeZone()) }, signal, principals)
+        requestId = await steerPrompt(ctx, agent, { chatId: chat.chatId, messageId, text, attachments, ...promptDetails(chat, messageId), clientTimeZone: clientTimeZone(messageTimeZone()) }, signal, principals)
       } catch (error) {
         // Not admitted: the bot's queue still delivers it after the turn.
         reportError('steer', error)
@@ -3044,15 +2972,11 @@ export function apply(ctx, config) {
    * @param chat - chat bridge state.
    */
   async function unarchiveForTopic(chat) {
-    const registry = ctx.get('workspaceRegistry')
     const sessionId = chat.sessionId
-    if (typeof sessionId !== 'string' || registry?.archivedSessionIds?.includes(sessionId) !== true) return
-    if (typeof registry.unarchiveSession !== 'function') {
-      warn(`session ${sessionId} is archived and this DSH cannot unarchive it; the message will not be answered`)
-      return
-    }
-    await registry.unarchiveSession(sessionId)
-    info(`unarchived session ${sessionId} for a message in its topic`)
+    if (typeof sessionId !== 'string') return
+    const outcome = await unarchive(ctx, sessionId)
+    if (outcome === 'unsupported') warn(`session ${sessionId} is archived and this DSH cannot unarchive it; the message will not be answered`)
+    if (outcome === 'unarchived') info(`unarchived session ${sessionId} for a message in its topic`)
   }
 
   /**
@@ -3636,52 +3560,6 @@ export function apply(ctx, config) {
       content: [{ type: 'text', text }],
       source: { kind: 'telegram-topic', form: 'notice', summary: summary.slice(0, 120) },
     })
-  }
-
-  /**
-   * Put a message into a session without starting a turn: appended now to an
-   * idle session whose surface starts with its system prompt, otherwise queued
-   * for the next step (see recordNote for why). Either way the Web UI shows
-   * it and the model reads it at its next step.
-   * @param agent - the session's live agent.
-   * @param message - a user-role message (`{ id, role, content, source }`).
-   */
-  function recordMessage(agent, message) {
-    if (agent.status === 'idle' && typeof agent.session?.append === 'function' && hasSystemHead(agent.session)) {
-      agent.session.append('user/message', message, { surfaceOp: 'append' })
-    } else if (typeof agent.inject === 'function') {
-      agent.inject(message)
-    } else if (typeof agent.send === 'function') {
-      agent.send(message, 'next-step', false)
-    } else {
-      throw new Error('The session cannot record messages.')
-    }
-  }
-
-  /**
-   * Whether a session's first surface node is a system/message, the only
-   * state in which a message may be appended to it outside a step.
-   * @param session - DSH session.
-   * @returns false when the head cannot be read, so callers queue instead.
-   */
-  function hasSystemHead(session) {
-    try {
-      const nodes = session.surface?.nodes
-      if (nodes !== undefined) {
-        if (nodes.length === 0) return false
-        const event = typeof session.eventAt === 'function'
-          ? session.eventAt(nodes[0])
-          : session.snapshotEvents?.().find((item) => item.seq === nodes[0])
-        return event?.type === 'system/message'
-      }
-      const events = typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : session.events
-      if (!Array.isArray(events)) return false
-      const surfaceTypes = new Set(['system/message', 'user/message', 'developer/message', 'assistant/message', 'tool/result'])
-      const first = events.find((event) => surfaceTypes.has(event.type))
-      return first?.type === 'system/message'
-    } catch {
-      return false
-    }
   }
 
   /**
@@ -4474,79 +4352,13 @@ export function apply(ctx, config) {
    * @returns display title.
    */
   async function sessionTitle(sessionId, header) {
-    try {
-      const snapshot = await ctx.get('sessionQuery')?.readTitleSnapshot(sessionId)
-      const title = snapshot?.title?.title
-      if (typeof title === 'string' && title.trim().length > 0) return title.trim()
-    } catch {
-      // Missing title is fine.
-    }
+    const title = await storedTitle(ctx, sessionId)
+    if (title !== undefined) return title
     const base = typeof header?.cwd === 'string' && header.cwd.length > 0 ? basename(header.cwd) : tr('Session', 'Сессия')
     const date = typeof header?.createdAt === 'number'
       ? new Date(header.createdAt).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' })
       : ''
     return date.length > 0 ? `${base} · ${date}` : `${base} · ${String(sessionId).slice(-6)}`
-  }
-
-  /**
-   * Read the last assistant text from a session surface.
-   * @param sessionId - session id.
-   * @returns preview text.
-   */
-  async function lastAssistantText(sessionId) {
-    try {
-      const surface = await ctx.get('sessionQuery')?.readSurface(sessionId)
-      const events = surface?.events ?? []
-      for (let index = events.length - 1; index >= 0; index -= 1) {
-        const event = events[index]
-        if (event?.type !== 'assistant/message') continue
-        const message = event.data?.message ?? event.data
-        const content = Array.isArray(message?.content) ? message.content : []
-        const text = content.filter((block) => block?.type === 'text').map((block) => block.text).join('\n').trim()
-        if (text.length > 0) return text
-      }
-    } catch {
-      // Empty preview is fine.
-    }
-    return ''
-  }
-
-  /**
-   * Read the latest assistant messages from a session surface.
-   * @param sessionId - session id.
-   * @param limit - maximum number of messages.
-   * @returns newest-first assistant texts.
-   */
-  async function recentAssistantTexts(sessionId, limit) {
-    const texts = []
-    try {
-      const surface = await ctx.get('sessionQuery')?.readSurface(sessionId)
-      const events = surface?.events ?? []
-      for (let index = events.length - 1; index >= 0 && texts.length < limit; index -= 1) {
-        const event = events[index]
-        if (event?.type !== 'assistant/message') continue
-        const message = event.data?.message ?? event.data
-        const content = Array.isArray(message?.content) ? message.content : []
-        const text = content.filter((block) => block?.type === 'text').map((block) => block.text).join('\n').trim()
-        if (text.length > 0) texts.push(text)
-      }
-    } catch {
-      // Empty result is handled by the command.
-    }
-    return texts
-  }
-
-  /**
-   * The description a parent gave one of its subagents, from its catalog.
-   * @param parentId - parent session.
-   * @param childId - subagent session.
-   * @returns the label, or undefined.
-   */
-  async function subagentLabel(parentId, childId) {
-    if (typeof parentId !== 'string') return undefined
-    const children = await ctx.get('subagents')?.listChildren(parentId).catch(() => undefined)
-    const label = Array.isArray(children) ? children.find((child) => child.id === childId)?.label : undefined
-    return typeof label === 'string' && label.trim().length > 0 ? label.trim() : undefined
   }
 
   /**
@@ -4597,50 +4409,6 @@ export function apply(ctx, config) {
   }
 
   /**
-   * The `/agents` text for a session: its running and latest subagents with
-   * their state and the start of their last report. Read from DSH's durable
-   * catalogs and session logs, so it works for subagents of earlier runs.
-   * @param sessionId - the topic's session.
-   * @returns the reply text, or undefined when this DSH has no subagent service.
-   */
-  async function subagentsText(sessionId) {
-    const subagents = ctx.get('subagents')
-    if (typeof subagents?.listChildren !== 'function') return undefined
-    const agents = ctx.get('agents')
-    const isRunning = (id) => agents?.get(id)?.status === 'running'
-    const { rows, total } = await collectSubagents((id) => subagents.listChildren(id), sessionId, isRunning)
-    const now = Date.now()
-    const query = ctx.get('sessionQuery')
-    const detailed = await Promise.all(rows.map(async (row) => {
-      let timing
-      let model
-      let observation
-      try {
-        observation = await query?.observeSession(row.id)
-        const values = observation?.projections?.values
-        timing = values?.subagentTiming
-        const selection = values?.modelSelection
-        model = (selection?.next ?? selection?.pending ?? selection?.lastUsed)?.model
-      } catch {
-        // State falls back to what the live agent says.
-      } finally {
-        observation?.[Symbol.dispose]?.()
-      }
-      const live = agents?.get(row.id)
-      if (typeof live?.model?.current === 'function') model = live.model.current()?.model ?? model
-      let events = []
-      try {
-        events = (await query?.readSurface(row.id))?.events ?? []
-      } catch {
-        // No report preview.
-      }
-      const { state, elapsedMs } = childState({ status: live?.status, timing }, now)
-      return { ...row, label: row.label || `subagent ${String(row.id).slice(0, 8)}`, model, state, elapsedMs, report: reportOf(events) }
-    }))
-    return agentsListText(detailed, total, now, tr)
-  }
-
-  /**
    * Deliver a session preview into its topic.
    * @param record - topic mapping.
    * @param chatId - control chat.
@@ -4649,7 +4417,7 @@ export function apply(ctx, config) {
    */
   async function deliverSessionTopic(record, chatId, signal) {
     try {
-      const preview = await lastAssistantText(record.sessionId)
+      const preview = (await recentAssistantTexts(ctx, record.sessionId, 1))[0] ?? ''
       const title = await sessionTitle(record.sessionId)
       const delivered = await sendKeyboardMarkdown(
         chatId,
@@ -4872,7 +4640,7 @@ export function apply(ctx, config) {
     }
     const registry = ctx.get('workspaceRegistry')
     const workspace = workspaceRef === 'all' || workspaceRef === undefined ? undefined : registry?.get(workspaceRef)
-    const matching = await sessionsInWorkspace(workspace, signal, 12)
+    const matching = await sessionsInWorkspace(ctx, workspace, 12, signal)
     const rows = []
     if (workspace !== undefined) {
       rows.push([{ text: tr('➕ New session in this workspace', '➕ Новая сессия в этом workspace'), callback_data: `n:${workspace.id}` }])
@@ -4905,7 +4673,7 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    */
   async function showSessionPreview(chatId, threadId, sessionId, workspaceRef, signal, messageId) {
-    const preview = await lastAssistantText(sessionId)
+    const preview = (await recentAssistantTexts(ctx, sessionId, 1))[0] ?? ''
     const records = await ctx.get('sessionQuery')?.listSessions(signal)
     const record = records?.find((entry) => entry.header.id === sessionId)
     const title = await sessionTitle(sessionId, record?.header)
@@ -5328,37 +5096,6 @@ export function apply(ctx, config) {
     await sendMenu(chatState.chatId, chatState.threadId, chatState, signal)
   }
 
-  /** @returns the registered Workspaces, or an empty list. */
-  function listWorkspaces() {
-    try {
-      return ctx.get('workspaceRegistry')?.list() ?? []
-    } catch {
-      return []
-    }
-  }
-
-  /**
-   * List recent ordinary sessions that belong to one workspace.
-   * @param workspace - workspace record, or undefined for all sessions.
-   * @param signal - request lifetime.
-   * @param limit - maximum number of sessions.
-   * @returns newest-first session records.
-   */
-  async function sessionsInWorkspace(workspace, signal, limit) {
-    const query = ctx.get('sessionQuery')
-    if (query === undefined) return []
-    const archived = new Set(ctx.get('workspaceRegistry')?.archivedSessionIds ?? [])
-    const records = await query.listSessions(signal)
-    return records
-      .filter((record) => !archived.has(record.header.id))
-      .filter((record) => record.header?.origin !== 'subagent')
-      .filter((record) => workspace === undefined
-        || (workspace.sessionIds ?? []).includes(record.header.id)
-        || record.header.cwd === workspace.path)
-      .sort((left, right) => (right.header.createdAt ?? 0) - (left.header.createdAt ?? 0))
-      .slice(0, limit)
-  }
-
   /**
    * Ask which workspace an unbound topic (or /workspace) should use.
    * @param chatState - topic state.
@@ -5366,7 +5103,7 @@ export function apply(ctx, config) {
    * @param messageId - picker message to edit, if any.
    */
   async function showTopicWorkspacePicker(chatState, signal, messageId) {
-    const workspaces = listWorkspaces().slice(0, 10)
+    const workspaces = listWorkspaces(ctx).slice(0, 10)
     const currentCwd = typeof chatState.sessionId === 'string' ? chatState.cwd : undefined
     const rows = workspaces.map((workspace) => [{
       text: `${workspace.path === currentCwd ? '✅' : '📁'} ${shortLabel(workspace.title || basename(workspace.path), 44)}`,
@@ -5390,7 +5127,7 @@ export function apply(ctx, config) {
    * @param messageId - picker message to edit.
    */
   async function showTopicSessionPicker(chatState, workspace, signal, messageId) {
-    const records = await sessionsInWorkspace(workspace, signal, 8)
+    const records = await sessionsInWorkspace(ctx, workspace, 8, signal)
     const rows = [[{ text: tr('🆕 New session', '🆕 Новая сессия'), callback_data: `tn:${workspace.id}` }]]
     for (const record of records) {
       const id = record.header.id
@@ -5425,7 +5162,7 @@ export function apply(ctx, config) {
   async function askTopicBinding(chatState, prompt, signal) {
     chatState.bindPrompts ??= []
     if (prompt !== undefined) chatState.bindPrompts.push(prompt)
-    if (listWorkspaces().length === 0) {
+    if (listWorkspaces(ctx).length === 0) {
       await bindTopic(chatState, { cwd: defaultWorkspaceCwd() }, signal)
       return
     }
@@ -5813,7 +5550,7 @@ export function apply(ctx, config) {
       }
       const requested = Number.parseInt(parts[1] ?? '1', 10)
       const limit = Number.isFinite(requested) ? Math.min(5, Math.max(1, requested)) : 1
-      const texts = (await recentAssistantTexts(chatState.sessionId, limit))
+      const texts = (await recentAssistantTexts(ctx, chatState.sessionId, limit))
         .filter((text) => text.trim().length > 0)
       if (texts.length === 0) {
         await send(chat.id, tr('This session has no assistant messages yet.', 'В этой сессии пока нет ответов ассистента.'), signal, threadId)
@@ -5847,7 +5584,7 @@ export function apply(ctx, config) {
         await send(chat.id, tr('This topic is not bound to a session. /sessions.', 'Этот topic не привязан к сессии. /sessions.'), signal, threadId)
         return
       }
-      const listed = await subagentsText(chatState.sessionId)
+      const listed = await subagentsText(ctx, chatState.sessionId, tr)
       const body = listed ?? tr('This DSH has no subagent service.', 'В этом DSH нет сервиса субагентов.')
       await sendPlain(chat.id, body.length > MAX_TELEGRAM_TEXT ? `${body.slice(0, MAX_TELEGRAM_TEXT - 1)}…` : body, signal, threadId)
       return
@@ -7054,7 +6791,8 @@ export function apply(ctx, config) {
   }
 
   /** Requests written by `dsh-telegram-send` or any process with DSH home access. */
-  const outbox = createOutbox({
+  const outbox = createSpool({
+    dir: OUTBOX_DIR,
     handle: (request) => sendToTopic(request),
     ready: () => lifetime !== undefined && !bridgeAbort.signal.aborted,
     onError: (error) => reportError('outbox', error),
@@ -7065,12 +6803,12 @@ export function apply(ctx, config) {
   }, 'dsh-telegram-bot: outbox')
 
   // Subagents a topic's session starts share one status card at the bottom of
-  // the topic (src/agents.js).
+  // the topic (createAgentBoards in @soffits/dsh-channel-core).
   const agentBoards = createAgentBoards({
     parentOf: (id) => ctx.get('agents')?.get(id)?.session?.header?.parentSession,
     topicOf: (sessionId) => (lifetime === undefined ? undefined : chatForSession(sessionId)),
     showsTurn: (chat) => chat.busy && !chat.done,
-    labelOf: subagentLabel,
+    labelOf: (parentId, childId) => subagentLabel(ctx, parentId, childId),
     modelOf: async (id) => (await sessionModelOf(ctx, id).catch(() => undefined))?.model,
     post: postAgentStatus,
     edit: editAgentStatus,

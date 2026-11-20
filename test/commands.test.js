@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
-import { followupThroughGate } from './fake-dsh.js'
+import { followupThroughGate } from '@soffits/dsh-channel-core/testing'
 import { catalogKey } from '../src/models.js'
 
 function makeAgent(id, cwd, idleMs) {
@@ -23,7 +23,7 @@ function makeAgent(id, cwd, idleMs) {
     events,
     status: 'idle',
     received: [],
-    followup(message) { followupThroughGate(this, events, message) },
+    followup(message) { followupThroughGate(this, message, events.listeners('agent/pre-step')) },
     // A turn whose message was rejected before the model ends at once.
     whenIdle() {
       return new Promise((resolve) => setImmediate(resolve))

@@ -713,6 +713,23 @@ test('a goal round of a goal started elsewhere stays out of the topic while mirr
   }
 })
 
+test('a goal round of a goal started elsewhere is shown with its round number while mirroring is on', async () => {
+  const run = await start({ mirrorTurns: true })
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const agent = run.host.live.get('session-1')
+    const before = run.telegram.calls.length
+    const goal = { id: 'goal-msg-1', role: 'user', content: [{ type: 'text', text: '<goal_round>' }], source: { kind: 'goal', goalId: 'goal-web', revision: 1, round: 2 } }
+    await playExternalTurn(agent, 4, goal, 'web goal answer')
+    const shown = texts(run.telegram.calls.slice(before), 7001)
+    assert.ok(shown.some((text) => text.startsWith('🎯 Goal · 2:')), 'the round is labelled')
+    assert.ok(shown.some((text) => text.includes('web goal answer')))
+  } finally {
+    run.stop()
+  }
+})
+
 test('with busyMessages: queue, a Telegram message during a Web turn waits for that turn', async () => {
   const run = await start({ busyMessages: 'queue' })
   try {

@@ -2736,6 +2736,10 @@ export function apply(ctx, config) {
       label = mirrorLabel(source.principal)
     } else if (source?.kind === 'schedule') {
       label = tr('⏰ Scheduled task', '⏰ Задача по расписанию')
+    } else if (source?.kind === 'goal') {
+      // Goals started from a topic show through their own panel and round path.
+      if (goalIsTelegram(chat, source.goalId)) return
+      label = `${tr('🎯 Goal', '🎯 Цель')}${Number.isSafeInteger(source.round) ? ` · ${source.round}` : ''}`
     } else {
       // Context injected by plugins (time, runtime notes, replies) is not a
       // message anyone typed.

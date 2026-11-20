@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.0
+
+- Merged upstream 0.4.0. A round of a goal created outside Telegram is shown in the topic as `🎯 Goal · N` when `mirrorTurns` is on, with its answer; rounds of goals started from the topic keep their own panel. From upstream, ported onto the fork's mirror.
+
 ## 0.13.0
 
 - Action buttons: a topic send (`dsh-telegram-send --action <id>=<label> --action-event <channel>`, or `actions` on the `telegramTopics` service) puts inline buttons under its text, and the first press by an allowed person (only the `--action-user` ids when given, before `--action-expires`) is emitted for dsh-cron-jobs as that event with the sender's data, the button and who pressed as a `telegram-user` principal; the buttons then show the outcome. Buttons are kept in `$DSH_HOME/telegram/actions.json`, so a press works after a restart. Built beside the tool-approval buttons, which stay in memory because they belong to one running turn.

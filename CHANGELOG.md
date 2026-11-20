@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.1
+
+- The answer, silent marker, model, voice and sender logic now comes from `@soffits/dsh-channel-core`, the package shared with the Matrix bot, instead of a copy in each bot.
+
 ## 0.14.0
 
 - Merged upstream 0.4.0. A round of a goal created outside Telegram is shown in the topic as `🎯 Goal · N` when `mirrorTurns` is on, with its answer; rounds of goals started from the topic keep their own panel. From upstream, ported onto the fork's mirror.

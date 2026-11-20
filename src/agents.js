@@ -17,7 +17,7 @@
  * `/agents` lists a session's subagents from DSH's durable catalogs, so it
  * also works after a restart.
  */
-import { messageAnswer } from './final-text.js'
+import { messageAnswer } from '@soffits/dsh-channel-core'
 
 /** Pause that lets several starts or ends share one edit. */
 export const EDIT_DELAY_MS = 1500

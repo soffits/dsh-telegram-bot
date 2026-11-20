@@ -14,10 +14,32 @@ import {
   POST_SOURCE_KIND,
   RESTART_DEBOUNCE_MS,
   RETRY_DELAY_MS,
-  SILENT_REPLY,
   STATUS_DIR,
   name,
 } from './constants.js'
+import {
+  answerSegments,
+  createModelCatalog,
+  createPrincipalTagger,
+  cutSilent,
+  defaultModelOf,
+  effortChoices,
+  effortName,
+  findModel,
+  isGoneModel,
+  isInterjection,
+  messageAnswer,
+  modelName,
+  pickedSelection,
+  runProgram,
+  sameSelection,
+  selectSessionModel,
+  senderSession,
+  sessionModelOf,
+  transcribe,
+  transcriptNote,
+  turnAnswer,
+} from '@soffits/dsh-channel-core'
 import { classifyError } from './errors.js'
 import {
   clipHtml,
@@ -38,21 +60,20 @@ import {
 } from './formatting.js'
 import { admitText, promptRequestId } from './admission.js'
 import { STEER_REACTION, busyMode, clearTelegramInbox, hasPendingInput, steerPrompt } from './steer.js'
-import { createPrincipalTagger, postPrincipal, senderSession, telegramUserPrincipal } from './sender.js'
+import { postPrincipal, telegramUserPrincipal } from './sender.js'
 import { clientTimeZone, formatTelegramDate, resolveTimeZone } from './clock.js'
 import { loadState, STATE_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
-import { answerSegments, isInterjection, messageAnswer, turnAnswer } from './final-text.js'
 import { createOutbox } from './outbox.js'
 import { agentsListText, childState, collectSubagents, createAgentBoards, reportOf } from './agents.js'
 import { deliveredToTopic, isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, topicNameOf, topicTargetFor, uploadMethod } from './topics.js'
-import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.js'
+import { spokenMediaOf } from './voice.js'
 import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, describeForward, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference } from './message-context.js'
 import { createSentLog } from './sent-log.js'
 import { ACTION_PREFIX, actionKeyboard, checkActions, createActionStore, outcomeKeyboard, parseActionData, pressEvent } from './actions.js'
-import { catalogKey, createModelCatalog, defaultModelOf, effortChoices, effortName, findModel, isGoneModel, modelByKey, modelName, pageOf, pickedSelection, providerByKey, sameSelection, selectSessionModel, sessionModelOf } from './models.js'
+import { catalogKey, modelByKey, pageOf, providerByKey } from './models.js'
 import {
   allowedChatsOf,
   allowedUsersOf,
@@ -1157,7 +1178,7 @@ export function apply(ctx, config) {
     }
     return {
       block: { type: 'file', attachment },
-      note: { type: 'text', text: transcriptNote(media, outcome) },
+      note: { type: 'text', text: transcriptNote(media, outcome, 'Telegram') },
       name: media.name,
     }
   }
@@ -1451,26 +1472,9 @@ export function apply(ctx, config) {
    * @returns a bounded message body.
    */
   function renderChat(chat) {
-    const text = withoutSilentMarker(chat.text.trim(), true)
+    const { text } = cutSilent(chat.text, { streaming: true })
     if (text.length === 0) return ''
     return fitAnswerText(text)
-  }
-
-  /**
-   * Remove the silence marker from the end of an answer. A turn can hold
-   * several assistant messages (one per wake-up of the same turn), so the
-   * marker may follow real text instead of standing alone.
-   * @param text - trimmed answer text.
-   * @param streaming - also hold back a trailing part that may still become the marker.
-   * @returns the text to show.
-   */
-  function withoutSilentMarker(text, streaming = false) {
-    if (text.endsWith(SILENT_REPLY)) return text.slice(0, -SILENT_REPLY.length).trim()
-    if (streaming) {
-      const start = text.lastIndexOf('[')
-      if (start !== -1 && SILENT_REPLY.startsWith(text.slice(start))) return text.slice(0, start).trim()
-    }
-    return text
   }
 
   /** Pending inline approval prompts keyed by short callback id. */
@@ -2592,13 +2596,11 @@ export function apply(ctx, config) {
     if (toolId !== null) await deleteMessage(chat.chatId, chat.threadId, toolId)
     // A turn started elsewhere that produced no text adds nothing to the topic,
     // and neither does one that already answered with a sticker or file.
-    // A final answer of SILENT_REPLY means "post nothing more": it is cut from
-    // the end of the text (a turn may hold several assistant messages), and the
-    // model
-    // cannot end a turn with no text at all (DSH treats that as EMPTY_RESPONSE).
+    // A final answer ending in the silent marker means "post nothing more".
     const answeredInTopic = typeof turn === 'number' && chat.sentInTurn === turn
-    const silenced = text.endsWith(SILENT_REPLY)
-    text = withoutSilentMarker(text)
+    const cut = cutSilent(text)
+    const silenced = cut.silent
+    text = cut.text
     if (text.length === 0 && (silenced || answeredInTopic)) {
       // An empty answer placeholder would only add noise under the sticker.
       if (messageId !== null) await deleteMessage(chat.chatId, chat.threadId, messageId)
@@ -2676,7 +2678,7 @@ export function apply(ctx, config) {
     } else {
       text = answerSegments(chat.boundAgent?.session?.log, turn).at(-2) ?? ''
     }
-    text = withoutSilentMarker(text)
+    text = cutSilent(text).text
     const messageId = chat.messageId
     const thinkingId = chat.thinkingMessageId
     const toolId = chat.toolMessageId

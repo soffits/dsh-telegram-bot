@@ -75,11 +75,14 @@ const BOT_COMMANDS_RU = [
 const MAX_TELEGRAM_TEXT = 3800
 /** Host-local diagnostics directory; no secrets are written here. */
 const STATUS_DIR = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'telegram')
+/** File spool of sends from outside the Host process (`dsh-telegram-send`, jobs). */
+const OUTBOX_DIR = join(STATUS_DIR, 'outbox')
 
 
 export {
   BOT_COMMANDS,
   BOT_COMMANDS_RU,
   MAX_TELEGRAM_TEXT,
+  OUTBOX_DIR,
   STATUS_DIR,
 }

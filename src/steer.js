@@ -5,6 +5,7 @@
  * opens a new turn for it. Fork-only code, kept out of `app.js`.
  */
 import { randomUUID } from 'node:crypto'
+import { admitPrompt, removePending } from '@soffits/dsh-channel-core'
 import { promptRequestId } from './admission.js'
 
 /** Reaction that tells the sender a message reached the running turn. */
@@ -33,15 +34,6 @@ export function steerRequestId(chatId, messageId) {
     : `telegram-steer:${randomUUID()}`
 }
 
-/** @returns whether a pending or recorded message carries this request id. */
-function hasRequest(agent, requestId) {
-  const matches = (message) => message?.source?.kind === 'user' && message.source.rpcId === requestId
-  const inbox = agent?.inbox
-  if (inbox?.nextTurn?.some?.(matches) || inbox?.nextStep?.some?.(matches)) return true
-  if (typeof agent?.session?.snapshotEvents !== 'function') return false
-  return agent.session.snapshotEvents().some((event) => event?.type === 'user/message' && matches(event.data))
-}
-
 /**
  * Send one prompt into the session's running turn. Text goes through the
  * Session controller's `steer` mode, the Web UI's own path; attachments are
@@ -52,32 +44,21 @@ function hasRequest(agent, requestId) {
  * dropped. A request id already admitted is skipped, so it is never sent twice.
  * @param ctx - plugin context.
  * @param agent - the session's live agent.
- * @param prompt - `{ sessionId, chatId, messageId, text, attachments, principal,
- *   envelope, clientTimeZone }`; `principal` is the sender and `envelope` the
+ * @param prompt - `{ chatId, messageId, text, attachments, principal, envelope,
+ *   clientTimeZone }`; `principal` is the sender and `envelope` the
  *   send time, reply and forward, both recorded on the message's source, and
  *   `clientTimeZone` is the sender's zone, recorded on the source for DSH's
  *   clock context.
  * @param signal - request lifetime.
  * @param tagger - remembers the metadata of a prompt the session controller
  *   builds (see `createPrincipalTagger`).
- * @returns the request id, or `undefined` when this DSH cannot steer.
+ * @returns the request id, or `undefined` when nothing was handed over (an
+ *   empty prompt, or a DSH that cannot steer).
  */
-export async function steerPrompt(ctx, agent, { sessionId, chatId, messageId, text, attachments = [], principal, envelope, clientTimeZone }, signal, tagger) {
+export async function steerPrompt(ctx, agent, { chatId, messageId, text, attachments = [], principal, envelope, clientTimeZone }, signal, tagger) {
   const requestId = steerRequestId(chatId, messageId)
-  const content = [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments]
-  const controller = ctx.get('sessionController')
-  if (attachments.length === 0 && content.length > 0 && typeof controller?.prompt === 'function') {
-    tagger?.remember(requestId, { principal, envelope })
-    await controller.prompt({ sessionId, requestId, mode: 'steer', content, ...(clientTimeZone === undefined ? {} : { clientTimeZone }) }, signal)
-    return requestId
-  }
-  if (hasRequest(agent, requestId)) return requestId
-  tagger?.remember(requestId, { principal, envelope })
-  const message = { id: randomUUID(), role: 'user', content, source: { kind: 'user', rpcId: requestId, ...(clientTimeZone === undefined ? {} : { clientTimeZone }), ...(principal === undefined ? {} : { principal }), ...(envelope === undefined ? {} : { envelope }) } }
-  if (typeof agent?.steer === 'function') agent.steer(message)
-  else if (typeof agent?.send === 'function') agent.send(message, 'next-step', true)
-  else return undefined
-  return requestId
+  const outcome = await admitPrompt(ctx, agent, { requestId, text, attachments, mode: 'steer', principal, envelope, clientTimeZone }, signal, tagger)
+  return outcome === 'admitted' || outcome === 'known' ? requestId : undefined
 }
 
 /**
@@ -88,25 +69,6 @@ export async function steerPrompt(ctx, agent, { sessionId, chatId, messageId, te
  * @returns how many were removed.
  */
 export function clearTelegramInbox(agent, chatId) {
-  const inbox = agent?.inbox
-  if (typeof inbox?.remove !== 'function') return 0
   const prefix = `telegram:${chatId}:`
-  const ours = (message) => message?.source?.kind === 'user'
-    && typeof message.source.rpcId === 'string'
-    && (message.source.rpcId.startsWith(prefix) || message.source.rpcId.startsWith('telegram-steer:'))
-  const pending = [...(inbox.nextStep ?? []), ...(inbox.nextTurn ?? [])].filter(ours)
-  for (const message of pending) inbox.remove(message.id)
-  return pending.length
-}
-
-/**
- * Whether the agent still holds input it has not taken. DSH starts another
- * turn for it right after the current one ends.
- * @param agent - live agent.
- */
-export function hasPendingInput(agent) {
-  const inbox = agent?.inbox
-  if (inbox === undefined) return false
-  if (typeof inbox.hasPending === 'boolean') return inbox.hasPending
-  return (inbox.nextStep?.length ?? 0) > 0 || (inbox.nextTurn?.length ?? 0) > 0
+  return removePending(agent, (requestId) => requestId.startsWith(prefix) || requestId.startsWith('telegram-steer:'))
 }

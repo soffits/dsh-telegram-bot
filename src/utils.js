@@ -1,4 +1,5 @@
 /** Small dependency-free helpers. */
+import { readLive } from '@soffits/dsh-channel-core'
 import { DEFAULT_TOKEN_REF } from './constants.js'
 
 /**
@@ -37,24 +38,6 @@ function sleep(ms, signal) {
  */
 function normalizeEntry(value) {
   return String(value).trim().toLowerCase()
-}
-
-/**
- * Read a Config field that may be a plain value or a volatile live reference.
- * @param value - Config field or Volatile reference.
- * @param fallback - value used when the field is absent.
- * @returns the current value.
- */
-function readLive(value, fallback) {
-  if (value !== null && typeof value === 'object' && typeof value.get === 'function') {
-    try {
-      const current = value.get()
-      return current === undefined ? fallback : current
-    } catch {
-      return fallback
-    }
-  }
-  return value === undefined || value === null ? fallback : value
 }
 
 /** @returns the live credential reference for the bot token. */
@@ -128,7 +111,6 @@ export {
   messageOf,
   sleep,
   normalizeEntry,
-  readLive,
   tokenRefOf,
   isEnabled,
   allowedUsersOf,

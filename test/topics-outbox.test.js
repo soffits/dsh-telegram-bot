@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { enqueue, waitForResult } from '../src/outbox.js'
+import { enqueue, waitForResult } from '@soffits/dsh-channel-core'
 import { deliveredToTopic, isAutoCommandTopic, isTopicGone, resolveSendTarget, resolveTopicTarget, topicNameOf, topicTargetFor, uploadMethod } from '../src/topics.js'
 
 test('topic names are learned from creation and rename messages', () => {

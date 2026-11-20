@@ -8,7 +8,8 @@ import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
 import { followupThroughGate, makeAgentModel, makeTitleService } from './fake-dsh.js'
-import { enqueue, waitForResult } from '../src/outbox.js'
+import { enqueue, waitForResult } from '@soffits/dsh-channel-core'
+import { OUTBOX_DIR } from '../src/constants.js'
 import { isAutoCommandTopic, isPlaceholderTitle, isTopicGone, plannedTitle, resolveSendTarget, sessionTitleOf, titleTask, topicNameOf } from '../src/topics.js'
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -1125,11 +1126,11 @@ test('the agent tool and the file spool use the same path', async () => {
     assert.equal(agent.injected[0].source.principal.kind, 'dsh-session')
     const other = await tool.execute({ thread: '7100', text: 'from elsewhere' }, { agent: { id: 'session-other' } })
     assert.equal(other.recorded, true)
-    const id = await enqueue({ to: '7100', text: 'from cron', from: { label: 'cron' } })
-    const result = await waitForResult(id, 3000)
+    const id = await enqueue({ to: '7100', text: 'from cron', from: { label: 'cron' } }, OUTBOX_DIR)
+    const result = await waitForResult(id, 3000, OUTBOX_DIR)
     assert.equal(result?.ok, true, JSON.stringify(result))
     assert.equal(result.result.threadId, 7100)
-    const bad = await waitForResult(await enqueue({ to: '4242', text: 'x' }), 3000)
+    const bad = await waitForResult(await enqueue({ to: '4242', text: 'x' }, OUTBOX_DIR), 3000, OUTBOX_DIR)
     assert.equal(bad.ok, false)
     assert.match(bad.error, /Unknown thread id 4242/)
     assert.equal(agent.injected.length, 3)
@@ -1224,8 +1225,8 @@ test('a long send from a job is recorded with its sender, and a reply after /new
   try {
     const old = run.host.makeAgent('session-notify', '/tmp/default-workspace')
     const long = Array.from({ length: 900 }, (_, index) => `word${index}`).join(' ')
-    const id = await enqueue({ to: '7100', text: long, from: { job: 'Morning digest', sessionId: 'session-cron' } })
-    const result = (await waitForResult(id, 3000)).result
+    const id = await enqueue({ to: '7100', text: long, from: { job: 'Morning digest', sessionId: 'session-cron' } }, OUTBOX_DIR)
+    const result = (await waitForResult(id, 3000, OUTBOX_DIR)).result
     assert.ok(result.messageIds.length >= 2, 'split into several messages')
     assert.equal(result.recorded, true)
     assert.equal(old.received.length, 0, 'no turn is started')

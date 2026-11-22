@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.0
+
+- A goal started outside Telegram now gets the same goal panel as one started in the topic, posted when its first round is mirrored and edited in place as the goal changes. The round's driver prompt is no longer posted. From upstream 0.4.1, ported onto the fork's mirror.
+
 ## 0.14.2
 
 - Session handling (resolving, creating and claiming a topic's session, unarchiving, steering prompts, recording notes, reading answers, titles and workspaces), the outbox spool, the subagent status card and `/agents` now come from `@soffits/dsh-channel-core`, shared with the Matrix bot, instead of a copy.

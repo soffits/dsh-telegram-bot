@@ -134,8 +134,10 @@ function makeHost() {
     get reasoningEffort() { return defaults.selection.reasoningEffort },
   }
   const modelSelections = []
+  const goals = new Map()
   const services = {
     credentials: { resolve: async () => ({ value: 'TEST_TOKEN' }) },
+    goals: { get: (agent) => goals.get(agent?.id) },
     agentDefaultModel: defaults,
     agents: {
       get: (id) => live.get(id),
@@ -198,7 +200,7 @@ function makeHost() {
     on(name, fn) { hostEvents.on(name, fn); return () => hostEvents.off(name, fn) },
     effect(fn) { cleanups.push(fn()) },
   }
-  return { ctx, services, live, created, logs, makeAgent, sessionRecords, titleSnapshots, provided, tools, defaults, modelSelections, cleanup: () => { for (const fn of cleanups) fn?.() } }
+  return { ctx, services, goals, live, created, logs, makeAgent, sessionRecords, titleSnapshots, provided, tools, defaults, modelSelections, cleanup: () => { for (const fn of cleanups) fn?.() } }
 }
 
 /**
@@ -714,18 +716,25 @@ test('a goal round of a goal started elsewhere stays out of the topic while mirr
   }
 })
 
-test('a goal round of a goal started elsewhere is shown with its round number while mirroring is on', async () => {
+test('a goal started elsewhere gets the goal panel, not its driver prompt, while mirroring is on', async () => {
   const run = await start({ mirrorTurns: true })
   try {
     run.telegram.push({ message_thread_id: 1, text: 'hello' })
     await wait(200)
     const agent = run.host.live.get('session-1')
+    run.host.goals.set('session-1', { id: 'goal-web', objective: 'Test the WAN discovery path', phase: 'active', activation: 'armed', roundsStarted: 2, maxGoalRounds: 256 })
     const before = run.telegram.calls.length
-    const goal = { id: 'goal-msg-1', role: 'user', content: [{ type: 'text', text: '<goal_round>' }], source: { kind: 'goal', goalId: 'goal-web', revision: 1, round: 2 } }
+    const goal = { id: 'goal-msg-1', role: 'user', content: [{ type: 'text', text: '<goal_round>Continue working' }], source: { kind: 'goal', goalId: 'goal-web', revision: 1, round: 2 } }
     await playExternalTurn(agent, 4, goal, 'web goal answer')
     const shown = texts(run.telegram.calls.slice(before), 7001)
-    assert.ok(shown.some((text) => text.startsWith('🎯 Goal · 2:')), 'the round is labelled')
+    assert.ok(shown.some((text) => text.includes('🎯') && text.includes('Test the WAN discovery path')), 'the goal panel is posted')
+    assert.ok(!shown.some((text) => text.includes('<goal_round>') || text.includes('Continue working')), 'the driver prompt stays out of Telegram')
     assert.ok(shown.some((text) => text.includes('web goal answer')))
+    // The next round edits the same panel instead of posting another.
+    const panels = () => run.telegram.calls.filter((call) => call.method === 'sendMessage' && String(call.body.text).includes('Test the WAN discovery path')).length
+    const count = panels()
+    await playExternalTurn(agent, 5, { ...goal, id: 'goal-msg-2', source: { ...goal.source, round: 3 } }, 'second answer')
+    assert.equal(panels(), count, 'one panel message')
   } finally {
     run.stop()
   }

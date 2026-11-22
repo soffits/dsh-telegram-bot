@@ -1910,7 +1910,7 @@ export function apply(ctx, config) {
             if (goals === undefined) return
             try {
               const view = goals.get(agent)
-              if (view === undefined || !goalIsTelegram(chat, view.id)) await clearGoalPanel(chat, bridgeAbort.signal)
+              if (view === undefined || !goalHasPanel(chat, view.id)) await clearGoalPanel(chat, bridgeAbort.signal)
               else await renderGoalPanel(chat, view, bridgeAbort.signal, 'update-only')
             } catch (error) {
               reportError('goal-panel-change', error)
@@ -2667,9 +2667,15 @@ export function apply(ctx, config) {
     } else if (source?.kind === 'schedule') {
       label = tr('⏰ Scheduled task', '⏰ Задача по расписанию')
     } else if (source?.kind === 'goal') {
-      // Goals started from a topic show through their own panel and round path.
-      if (goalIsTelegram(chat, source.goalId)) return
-      label = `${tr('🎯 Goal', '🎯 Цель')}${Number.isSafeInteger(source.round) ? ` · ${source.round}` : ''}`
+      // Goals started from a topic show through their own panel and round
+      // path. A goal started elsewhere gets the same panel; its round prompt is
+      // a driver instruction for the model, so it is never posted.
+      if (!queued && !goalIsTelegram(chat, source.goalId)) {
+        chat.answerEdit = (chat.answerEdit ?? Promise.resolve())
+          .then(() => showMirrorGoalPanel(chat))
+          .catch((error) => reportError('mirror-goal-panel', error))
+      }
+      return
     } else {
       // Context injected by plugins (time, runtime notes, replies) is not a
       // message anyone typed.
@@ -6325,6 +6331,15 @@ export function apply(ctx, config) {
     return origin !== undefined && origin.sessionId === chatState.sessionId
   }
 
+  /**
+   * @returns whether the topic shows this goal's panel: a goal started in the
+   * topic, or one started elsewhere whose panel was posted while mirroring.
+   */
+  function goalHasPanel(chatState, goalId) {
+    if (goalIsTelegram(chatState, goalId)) return true
+    return readLive(config.mirrorTurns, true) === true && typeof state.goalPanels?.[chatState.key] === 'number'
+  }
+
   /** Remember that work on this goal started in a Telegram topic. */
   async function markTelegramGoal(chatState, view) {
     if (typeof view?.id !== 'string' || typeof chatState.sessionId !== 'string') return
@@ -6354,7 +6369,7 @@ export function apply(ctx, config) {
     try {
       const agent = ctx.get('agents')?.get(chatState.sessionId) ?? await ensureAgent(chatState)
       const view = goals.get(agent)
-      if (view === undefined || !goalIsTelegram(chatState, view.id)) {
+      if (view === undefined || !goalHasPanel(chatState, view.id)) {
         await clearGoalPanel(chatState, bridgeAbort.signal)
         return
       }
@@ -6362,6 +6377,15 @@ export function apply(ctx, config) {
     } catch (error) {
       warn(`goal panel before turn failed: ${messageOf(error)}`)
     }
+  }
+
+  /** Show the panel of a goal started outside Telegram when its round is mirrored. */
+  async function showMirrorGoalPanel(chatState) {
+    const goals = ctx.get('goals')
+    if (goals === undefined || typeof chatState.sessionId !== 'string') return
+    const agent = ctx.get('agents')?.get(chatState.sessionId) ?? await ensureAgent(chatState)
+    const view = goals.get(agent)
+    if (view !== undefined) await renderGoalPanel(chatState, view, bridgeAbort.signal)
   }
 
   /** Remove pins left by older plugin revisions; pinning is no longer used. */

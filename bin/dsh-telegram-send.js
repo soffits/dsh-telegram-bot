@@ -8,7 +8,7 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { parseArgs } from 'node:util'
-import { enqueue, waitForResult } from '@soffits/dsh-channel-core'
+import { enqueue, waitForResult } from '@soffits/dsh-plugin-sdk/channel'
 import { OUTBOX_DIR } from '../src/constants.js'
 
 const usage = `Usage: dsh-telegram-send --thread <thread-id> [--chat <chat-id>] [--file <path>]...

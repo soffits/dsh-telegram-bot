@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
-import { followupThroughGate } from '@soffits/dsh-channel-core/testing'
+import { followupThroughGate } from '@soffits/dsh-plugin-sdk/channel/testing'
 import { catalogKey } from '../src/models.js'
 
 function makeAgent(id, cwd, idleMs) {

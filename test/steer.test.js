@@ -1,7 +1,7 @@
 import './setup-home.js'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createPrincipalTagger, hasPendingInput } from '@soffits/dsh-channel-core'
+import { createPrincipalTagger, hasPendingInput } from '@soffits/dsh-plugin-sdk/channel'
 import { busyMode, clearTelegramInbox, steerPrompt } from '../src/steer.js'
 
 function fakeAgent(events = []) {

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.1
+
+- The shared helpers now come from `@soffits/dsh-plugin-sdk` (its `/channel` part), which replaced `@soffits/dsh-channel-core`; nothing else changed.
+
 ## 0.15.0
 
 - A goal started outside Telegram now gets the same goal panel as one started in the topic, posted when its first round is mirrored and edited in place as the goal changes. The round's driver prompt is no longer posted. From upstream 0.4.1, ported onto the fork's mirror.

@@ -1,5 +1,5 @@
 /** Small dependency-free helpers. */
-import { readLive } from '@soffits/dsh-channel-core'
+import { readLive } from '@soffits/dsh-plugin-sdk/channel'
 import { DEFAULT_TOKEN_REF } from './constants.js'
 
 /**

@@ -58,7 +58,7 @@ import {
   transcriptNote,
   turnAnswer,
   unarchive,
-} from '@soffits/dsh-channel-core'
+} from '@soffits/dsh-plugin-sdk/channel'
 import { classifyError } from './errors.js'
 import {
   clipHtml,
@@ -6827,7 +6827,7 @@ export function apply(ctx, config) {
   }, 'dsh-telegram-bot: outbox')
 
   // Subagents a topic's session starts share one status card at the bottom of
-  // the topic (createAgentBoards in @soffits/dsh-channel-core).
+  // the topic (createAgentBoards in @soffits/dsh-plugin-sdk/channel).
   const agentBoards = createAgentBoards({
     parentOf: (id) => ctx.get('agents')?.get(id)?.session?.header?.parentSession,
     topicOf: (sessionId) => (lifetime === undefined ? undefined : chatForSession(sessionId)),

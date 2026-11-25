@@ -5,7 +5,7 @@
  * opens a new turn for it. Fork-only code, kept out of `app.js`.
  */
 import { randomUUID } from 'node:crypto'
-import { admitPrompt, removePending } from '@soffits/dsh-channel-core'
+import { admitPrompt, removePending } from '@soffits/dsh-plugin-sdk/channel'
 import { promptRequestId } from './admission.js'
 
 /** Reaction that tells the sender a message reached the running turn. */

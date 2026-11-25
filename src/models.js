@@ -1,7 +1,7 @@
 /**
  * Telegram's side of the model picker: short callback keys for catalog
  * entries and phone-sized pages. Reading and switching a session's model and
- * the catalog itself are @soffits/dsh-channel-core's.
+ * the catalog itself are @soffits/dsh-plugin-sdk/channel's.
  */
 import { createHash } from 'node:crypto'
 

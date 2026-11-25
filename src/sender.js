@@ -2,9 +2,9 @@
  * Telegram's principals: the user who wrote a message in a topic, and the
  * sender of a post into a topic. The shared principal fields, the send
  * principal and the tagger that records them on prompts are
- * @soffits/dsh-channel-core's.
+ * @soffits/dsh-plugin-sdk/channel's.
  */
-import { nonEmpty, sendPrincipal } from '@soffits/dsh-channel-core'
+import { nonEmpty, sendPrincipal } from '@soffits/dsh-plugin-sdk/channel'
 
 /**
  * The Telegram user who wrote a message, and where.

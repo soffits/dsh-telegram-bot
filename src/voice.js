@@ -1,6 +1,6 @@
 /**
  * Speech in Telegram messages: voice messages, audio files and round video
- * messages. Decoding and transcription are @soffits/dsh-channel-core's.
+ * messages. Decoding and transcription are @soffits/dsh-plugin-sdk/channel's.
  */
 
 /** Telegram message fields that carry speech, with a default file extension. */
